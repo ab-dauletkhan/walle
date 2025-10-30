@@ -1,0 +1,4 @@
+#!/Users/edigeakimali/PycharmProjects/wall-e/stt/vosk-api/python/.venv/bin/python3
+# EASY-INSTALL-SCRIPT: 'srt==3.5.3','srt-deduplicate'
+__requires__ = 'srt==3.5.3'
+__import__('pkg_resources').run_script('srt==3.5.3', 'srt-deduplicate')

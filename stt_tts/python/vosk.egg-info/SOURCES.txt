@@ -1,0 +1,13 @@
+README.md
+setup.py
+vosk/__init__.py
+vosk.egg-info/PKG-INFO
+vosk.egg-info/SOURCES.txt
+vosk.egg-info/dependency_links.txt
+vosk.egg-info/entry_points.txt
+vosk.egg-info/not-zip-safe
+vosk.egg-info/requires.txt
+vosk.egg-info/top_level.txt
+vosk/transcriber/__init__.py
+vosk/transcriber/cli.py
+vosk/transcriber/transcriber.py
