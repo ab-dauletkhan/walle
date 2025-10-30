@@ -32,7 +32,9 @@ class State(Enum):
 
 class RocketAssistant:
     def __init__(self, wake_word="hey rocket", silence_timeout=3.0, 
-                 ollama_model="qwen3:4b", ollama_url="http://localhost:11434",
+                 ollama_model="qwen3:1.7b", ollama_url="http://localhost:11434",
+                 ollama_timeout=60, ollama_keep_alive="10m",
+                 ollama_num_thread=None, ollama_num_batch=512,
                  tts_url="http://localhost:59125", tts_voice="en_UK/apope_low",
                  enable_tts=True, system_prompt=None):
         self.start_time = time.time()
@@ -40,6 +42,10 @@ class RocketAssistant:
         self.silence_timeout = silence_timeout
         self.ollama_model = ollama_model
         self.ollama_url = ollama_url
+        self.ollama_timeout = ollama_timeout
+        self.ollama_keep_alive = ollama_keep_alive
+        self.ollama_num_thread = ollama_num_thread or os.cpu_count()
+        self.ollama_num_batch = ollama_num_batch
         self.tts_url = tts_url
         self.tts_voice = tts_voice
         self.enable_tts = enable_tts
@@ -56,6 +62,7 @@ class RocketAssistant:
         
         self.state = State.LISTENING_FOR_WAKE_WORD
         self.command_text = ""
+        self._last_chunk = ""
         self.last_speech_time = time.time()
         self.audio_queue = queue.Queue()
         self.awaiting_llm = False
@@ -63,6 +70,7 @@ class RocketAssistant:
         self.filler_thread = None
         self._last_filler_phrase = None
         self.play_lock = threading.Lock()
+        self.rec_lock = threading.Lock()
         self.is_playing_audio = False
         self._playback_generation = 0
         self._drain_thread = None
@@ -80,7 +88,6 @@ class RocketAssistant:
             "Alright, thinking it through.",
             "Hold on, connecting the dots.",
             "Let me recall the details.",
-            "Okay, crunching the numbers."
         ]
         
         # Initialize Vosk model
@@ -88,6 +95,20 @@ class RocketAssistant:
         self.model = Model(lang="en-us")
         print("✅ Model loaded!")
         
+        # Trigger background warm-up of the LLM to reduce first-token latency
+        threading.Thread(target=self._warm_llm_model, daemon=True).start()
+        
+    def _clean_chunk(self, text: str) -> str:
+        t = text.replace(self.wake_word, " ")
+        t = " ".join(t.split())
+        return t
+
+    def _sanitize_command(self, text: str) -> str:
+        # remove wake word anywhere and collapse whitespace
+        t = text.replace(self.wake_word, " ")
+        t = " ".join(t.split())
+        return t
+
     def audio_callback(self, indata, frames, time_info, status):
         """Called for each audio block from microphone"""
         if status:
@@ -105,9 +126,15 @@ class RocketAssistant:
                     "model": self.ollama_model,
                     "prompt": prompt,
                     "system": self.system_prompt,
-                    "stream": False
+                    "stream": False,
+                    "keep_alive": self.ollama_keep_alive,
+                    "options": {
+                        "num_thread": int(self.ollama_num_thread or 0),
+                        "num_batch": int(self.ollama_num_batch),
+                        "temperature": 0.2
+                    }
                 },
-                timeout=30
+                timeout=(5, self.ollama_timeout)
             )
             done_ts = time.time()
             try:
@@ -125,6 +152,32 @@ class RocketAssistant:
         except Exception as e:
             done_ts = time.time()
             return f"Error: {str(e)}", {"request_start": req_start, "first_token": done_ts, "done": done_ts}
+
+    def _warm_llm_model(self):
+        """Perform a tiny generate to force-load the model into memory."""
+        try:
+            self.log_event("llm_warm_start")
+            _ = requests.post(
+                f"{self.ollama_url}/api/generate",
+                json={
+                    "model": self.ollama_model,
+                    "prompt": "ok",
+                    "system": self.system_prompt,
+                    "stream": False,
+                    "keep_alive": self.ollama_keep_alive,
+                    "options": {
+                        "num_thread": int(self.ollama_num_thread or 0),
+                        "num_batch": int(self.ollama_num_batch),
+                        "num_predict": 1,
+                        "temperature": 0.0
+                    }
+                },
+                timeout=(3, min(15, self.ollama_timeout))
+            )
+            self.log_event("llm_warm_done")
+        except Exception:
+            # Warm-up is best-effort
+            pass
 
     def log_event(self, event, ts=None, **fields):
         """Structured event logger with relative timestamp."""
@@ -173,7 +226,8 @@ class RocketAssistant:
         # Reset recognizer partial state if available
         try:
             if hasattr(self, "rec") and self.rec is not None:
-                self.rec.Reset()
+                with self.rec_lock:
+                    self.rec.Reset()
         except Exception:
             pass
         # Start queue drain thread if not running
@@ -245,21 +299,32 @@ class RocketAssistant:
         
         if self.state == State.LISTENING_FOR_WAKE_WORD:
             # Check for exact wake word match
-            if text == self.wake_word:
+            if text == self.wake_word or self.wake_word in text:
                 print(f"\n🎤 Wake word detected! Listening for your command...")
                 self.state = State.COLLECTING_COMMAND
-                self.command_text = ""
+                # If wake word included more words, keep only the tail as initial command
+                if self.wake_word in text:
+                    tail = text.split(self.wake_word, maxsplit=1)[1].strip()
+                    self.command_text = self._clean_chunk(tail)
+                else:
+                    self.command_text = ""
+                self._last_speech_time = time.time()
                 self.last_speech_time = time.time()
                 self.play_wake_sound()
                 
         elif self.state == State.COLLECTING_COMMAND:
             # Collecting the command after wake word
             if text:
-                if self.command_text:
-                    self.command_text += " " + text
-                else:
-                    self.command_text = text
-                self.last_speech_time = time.time()
+                chunk = self._clean_chunk(text)
+                if chunk:
+                    # Skip duplicates: identical to last chunk or already present at the end
+                    if chunk != self._last_chunk and not self.command_text.endswith(chunk):
+                        if self.command_text:
+                            self.command_text += " " + chunk
+                        else:
+                            self.command_text = chunk
+                        self._last_chunk = chunk
+                        self.last_speech_time = time.time()
     
     def check_command_timeout(self):
         """Check if we should send the command to LLM due to silence"""
@@ -271,6 +336,8 @@ class RocketAssistant:
             # Only timeout if we have collected some command text
             # This prevents premature timeout when user is just starting to speak
             if self.command_text.strip() and silence_duration >= self.silence_timeout:
+                # Final sanitize before sending to LLM
+                self.command_text = self._sanitize_command(self.command_text)
                 print(f"\n{'='*60}")
                 print(f"🗣️  You: {self.command_text}")
                 print(f"{'='*60}")
@@ -319,13 +386,27 @@ class RocketAssistant:
                     data = self.audio_queue.get()
                     
                     # Process with Vosk
-                    if not self.is_playing_audio and self.rec.AcceptWaveform(data):
-                        # Final result (end of speech segment)
-                        result = json.loads(self.rec.Result())
-                        text = result.get("text", "")
-                        
-                        if text:
-                            self.process_final_result(text)
+                    if not self.is_playing_audio:
+                        try:
+                            with self.rec_lock:
+                                accepted = self.rec.AcceptWaveform(data)
+                                if accepted:
+                                    # Final result (end of speech segment)
+                                    result = json.loads(self.rec.Result())
+                        except Exception as e:
+                            print(f"⚠️  STT error: {e}", file=sys.stderr)
+                            # Attempt soft recovery by recreating recognizer
+                            try:
+                                with self.rec_lock:
+                                    self.rec = KaldiRecognizer(self.model, samplerate)
+                            except Exception:
+                                pass
+                            continue
+
+                        if 'result' in locals():
+                            text = result.get("text", "")
+                            if text:
+                                self.process_final_result(text)
                     
                     # Check for command timeout
                     self.check_command_timeout()
@@ -440,7 +521,7 @@ class RocketAssistant:
                 self._play_audio(arr, sr, wait=True)
                 if self.stop_filler_event.is_set():
                     break
-                time.sleep(random.uniform(0.6, 1.5))
+                time.sleep(random.uniform(2.0, 3.5))
         except Exception:
             pass
 
@@ -489,14 +570,37 @@ def main():
     parser.add_argument(
         "-m", "--model", 
         type=str, 
-        default="qwen3:4b",
-        help="Ollama model name (default: qwen3:4b)"
+        default="qwen3:1.7b",
+        help="Ollama model name (default: qwen3:1.7b)"
     )
     parser.add_argument(
         "-u", "--url", 
         type=str, 
         default="http://localhost:11434",
         help="Ollama API URL (default: http://localhost:11434)"
+    )
+    parser.add_argument(
+        "--llm-timeout",
+        type=int,
+        default=60,
+        help="Ollama read timeout in seconds (default: 60)"
+    )
+    parser.add_argument(
+        "--llm-keep-alive",
+        type=str,
+        default="10m",
+        help="How long Ollama should keep the model loaded (e.g. '10m', '-1')"
+    )
+    parser.add_argument(
+        "--llm-num-thread",
+        type=int,
+        help="Threads to use for Ollama inference (default: CPU count)"
+    )
+    parser.add_argument(
+        "--llm-num-batch",
+        type=int,
+        default=512,
+        help="Batch size for prompt processing (higher = faster prompt ingest)"
     )
     parser.add_argument(
         "-d", "--device", 
@@ -545,6 +649,10 @@ def main():
         silence_timeout=args.timeout,
         ollama_model=args.model,
         ollama_url=args.url,
+        ollama_timeout=args.llm_timeout,
+        ollama_keep_alive=args.llm_keep_alive,
+        ollama_num_thread=args.llm_num_thread,
+        ollama_num_batch=args.llm_num_batch,
         tts_url=args.tts_url,
         tts_voice=args.tts_voice,
         enable_tts=not args.no_tts,
