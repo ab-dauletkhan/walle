@@ -153,29 +153,58 @@ CRITICAL RULE: Use 'human' block to edit info ABOUT THE USER. Use 'persona' bloc
 
 
 class MemoryToolExecutor:
-    """Executes memory management tool calls"""
-    
+    """Executes memory management tool calls using a decorator-based registry.
+
+    This design allows new memory tool handlers to be registered without modifying
+    the execute() dispatch logic – enabling a mini plugin architecture.
+    """
+
+    # Class-level registry: function_name -> handler method
+    _registry: Dict[str, Any] = {}
+
+    @classmethod
+    def register(cls, name: str):
+        """Decorator to register a handler method under a tool name.
+
+        Usage:
+            @MemoryToolExecutor.register("core_memory_append")
+            def _core_memory_append(self, args): ...
+        """
+        def decorator(fn):
+            if name in cls._registry:
+                # Optional: warn or override silently; here we override.
+                pass
+            cls._registry[name] = fn
+            return fn
+        return decorator
+
     def __init__(self, memory: Memory, recall_memory: RecallMemory, archival_memory: ArchivalMemory):
         self.memory = memory
         self.recall_memory = recall_memory
         self.archival_memory = archival_memory
-    
+
+    def list_registered_tools(self) -> List[str]:
+        """Return a list of all registered tool names."""
+        return sorted(self._registry.keys())
+
+    def get_help(self) -> str:
+        """Return a help string enumerating available tools."""
+        tools = self.list_registered_tools()
+        if not tools:
+            return "No memory tools registered."
+        return "Available memory tools:\n" + "\n".join(f" - {t}" for t in tools)
+
     def execute(self, function_name: str, args: Dict[str, Any]) -> str:
-        """Execute a memory management function"""
-        
-        if function_name == "core_memory_append":
-            return self._core_memory_append(args)
-        elif function_name == "core_memory_replace":
-            return self._core_memory_replace(args)
-        elif function_name == "archival_memory_insert":
-            return self._archival_memory_insert(args)
-        elif function_name == "archival_memory_search":
-            return self._archival_memory_search(args)
-        elif function_name == "recall_memory_search":
-            return self._recall_memory_search(args)
-        else:
-            return f"❌ Unknown memory function: {function_name}"
-    
+        """Dispatch to the registered handler for the given function name."""
+        handler = self._registry.get(function_name)
+        if not handler:
+            return f"❌ Unknown memory function: {function_name}\n{self.get_help()}"
+        try:
+            return handler(self, args)
+        except Exception as e:
+            return f"❌ Exception in handler '{function_name}': {e}"
+
+    # ==================== Registered Handlers ====================
     def _core_memory_append(self, args: Dict) -> str:
         """Append content to a core memory block"""
         label = args.get("label")
@@ -255,5 +284,13 @@ class MemoryToolExecutor:
         for i, result in enumerate(results, 1):
             output += f"\n{i}. [{result['role']}] {result['timestamp']}\n"
             output += f"   {result['content'][:150]}...\n" if len(result['content']) > 150 else f"   {result['content']}\n"
-        
         return output
+
+# Register handlers after class definition
+MemoryToolExecutor._registry.update({
+    "core_memory_append": MemoryToolExecutor._core_memory_append,
+    "core_memory_replace": MemoryToolExecutor._core_memory_replace,
+    "archival_memory_insert": MemoryToolExecutor._archival_memory_insert,
+    "archival_memory_search": MemoryToolExecutor._archival_memory_search,
+    "recall_memory_search": MemoryToolExecutor._recall_memory_search,
+})

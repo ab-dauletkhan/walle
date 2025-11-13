@@ -445,6 +445,34 @@ class RobotControlExecutor:
         """
         self.serial_port = serial_port
         self.simulation_mode = serial_port is None
+        # Registry mapping tool name -> handler callable
+        # Each handler signature: handler(self, args: dict) -> str
+        self._registry = {}
+        self._register_default_handlers_deferred = False  # marker for deferred population
+
+    # ---------------- Registry Utilities ----------------
+    def register(self, name: str, handler):
+        """Register a robot control handler.
+        Args:
+            name: Tool/function name exposed to LLM
+            handler: Callable accepting (self, args) returning str result
+        """
+        if name in self._registry:
+            # Allow override but note in simulation output if enabled
+            if self.simulation_mode:
+                print(f"[SIM][RobotRegistry] Overriding handler for '{name}'")
+        self._registry[name] = handler
+
+    def list_registered(self):
+        """Return sorted list of registered robot tool names."""
+        return sorted(self._registry.keys())
+
+    def get_help(self):
+        """Return a help string enumerating available robot tool handlers."""
+        lines = ["Registered Robot Control Tools (" + str(len(self._registry)) + "):"]
+        for name in self.list_registered():
+            lines.append(f" - {name}")
+        return "\n".join(lines)
         
     def send_command(self, command: str) -> str:
         """
@@ -477,195 +505,226 @@ class RobotControlExecutor:
             Human-readable result message
         """
         
-        # ============= SERVO CONTROL =============
-        if fn_name == "set_head_rotation":
-            position = args.get("position", 50)
-            cmd = f"G{position}"
-            self.send_command(cmd)
-            direction = "left" if position < 40 else "right" if position > 60 else "center"
-            return f"🤖 Head rotated to {position}% ({direction})"
-        
-        elif fn_name == "set_neck_position":
-            top = args.get("top_position", 50)
-            bottom = args.get("bottom_position", 50)
-            self.send_command(f"N{top}")
-            self.send_command(f"M{bottom}")
-            return f"🤖 Neck positioned: top={top}%, bottom={bottom}%"
-        
-        elif fn_name == "set_both_eyes":
-            position = args.get("position", 50)
-            self.send_command(f"L{position}")
-            self.send_command(f"R{position}")
-            looking = "up" if position > 60 else "down" if position < 40 else "straight"
-            return f"👀 Eyes looking {looking} (position={position}%)"
-        
-        elif fn_name == "set_individual_eyes":
-            left = args.get("left_eye", 50)
-            right = args.get("right_eye", 50)
-            self.send_command(f"L{left}")
-            self.send_command(f"R{right}")
-            return f"👀 Eyes positioned: left={left}%, right={right}%"
-        
-        elif fn_name == "set_both_arms":
-            position = args.get("position", 50)
-            self.send_command(f"A{position}")
-            self.send_command(f"B{position}")
-            arm_pos = "raised" if position > 60 else "lowered" if position < 40 else "neutral"
-            return f"💪 Arms {arm_pos} (position={position}%)"
-        
-        elif fn_name == "set_individual_arms":
-            left = args.get("left_arm", 50)
-            right = args.get("right_arm", 50)
-            self.send_command(f"A{left}")
-            self.send_command(f"B{right}")
-            return f"💪 Arms positioned: left={left}%, right={right}%"
-        
-        elif fn_name == "look_at":
-            horizontal = args.get("horizontal", 50)
-            vertical = args.get("vertical", 50)
-            self.send_command(f"G{horizontal}")
-            self.send_command(f"N{vertical}")
-            h_dir = "left" if horizontal < 40 else "right" if horizontal > 60 else "straight"
-            v_dir = "up" if vertical > 60 else "down" if vertical < 40 else "level"
-            return f"🤖 Looking {h_dir} and {v_dir}"
-        
-        # ============= EMOTIONS =============
-        elif fn_name == "express_emotion":
-            emotion = args.get("emotion", "neutral")
-            emotion_map = {
-                "happy": [(80, 80), (60, 60), (70, 70)],  # eyes up, neck up, arms mid
-                "sad": [(20, 20), (40, 40), (20, 20)],     # eyes down, neck down, arms down
-                "surprised": [(100, 100), (80, 80), (50, 50)],  # eyes wide up, neck up
-                "neutral": [(50, 50), (50, 50), (40, 40)],
-                "curious": [(60, 70), (60, 60), (40, 40)],  # slightly asymmetric eyes
-                "confused": [(40, 60), (55, 55), (45, 45)]  # very asymmetric eyes
-            }
-            
-            if emotion in emotion_map:
-                eyes, neck, arms = emotion_map[emotion]
-                self.send_command(f"L{eyes[0]}")
-                self.send_command(f"R{eyes[1]}")
-                self.send_command(f"N{neck[0]}")
-                self.send_command(f"A{arms[0]}")
-                self.send_command(f"B{arms[1]}")
-                return f"😊 Expressing emotion: {emotion}"
-            return f"❌ Unknown emotion: {emotion}"
-        
-        elif fn_name == "wave_hello":
-            # Wave animation: raise right arm, move side to side, lower
-            for pos in [70, 80, 70, 80, 70, 40]:
-                self.send_command(f"B{pos}")
-            return f"👋 Waved hello!"
-        
-        elif fn_name == "reset_to_neutral":
-            self.send_command("G50")  # Head center
-            self.send_command("N50")  # Neck level
-            self.send_command("L50")  # Eyes center
-            self.send_command("R50")
-            self.send_command("A40")  # Arms down
-            self.send_command("B40")
-            return f"↺ Reset to neutral position"
-        
-        # ============= MOVEMENT =============
-        elif fn_name == "drive_forward":
-            speed = args.get("speed", 50)
-            duration = args.get("duration_ms", 0)
-            self.send_command(f"Y{speed}")
-            msg = f"🤖 Driving forward at {speed}% speed"
-            if duration > 0:
-                msg += f" for {duration}ms"
-            return msg
-        
-        elif fn_name == "drive_backward":
-            speed = args.get("speed", 50)
-            duration = args.get("duration_ms", 0)
-            self.send_command(f"Y{-speed}")
-            msg = f"🤖 Driving backward at {speed}% speed"
-            if duration > 0:
-                msg += f" for {duration}ms"
-            return msg
-        
-        elif fn_name == "turn_left":
-            speed = args.get("speed", 50)
-            duration = args.get("duration_ms", 0)
-            self.send_command(f"X{-speed}")
-            msg = f"🤖 Turning left at {speed}% speed"
-            if duration > 0:
-                msg += f" for {duration}ms"
-            return msg
-        
-        elif fn_name == "turn_right":
-            speed = args.get("speed", 50)
-            duration = args.get("duration_ms", 0)
-            self.send_command(f"X{speed}")
-            msg = f"🤖 Turning right at {speed}% speed"
-            if duration > 0:
-                msg += f" for {duration}ms"
-            return msg
-        
-        elif fn_name == "stop_movement":
-            self.send_command("q")
-            return f"🛑 All movement stopped"
-        
-        elif fn_name == "move_with_differential":
-            left = args.get("left_speed", 0)
-            right = args.get("right_speed", 0)
-            duration = args.get("duration_ms", 0)
-            # Convert to forward/turn commands
-            forward = (left + right) // 2
-            turn = (right - left) // 2
-            self.send_command(f"Y{forward}")
-            self.send_command(f"X{turn}")
-            msg = f"🤖 Differential drive: L={left}%, R={right}%"
-            if duration > 0:
-                msg += f" for {duration}ms"
-            return msg
-        
-        # ============= BEHAVIORS =============
-        elif fn_name == "scan_surroundings":
-            speed = args.get("speed", "normal")
-            delay_map = {"slow": 1500, "normal": 800, "fast": 400}
-            delay = delay_map.get(speed, 800)
-            
-            # Look left, center, right
-            for pos in [20, 50, 80, 50]:
-                self.send_command(f"G{pos}")
-            return f"👀 Scanned surroundings at {speed} speed"
-        
-        elif fn_name == "perform_greeting":
-            # Complex greeting sequence
-            self.send_command("G60")  # Look slightly right
-            self.send_command("N60")  # Look up
-            self.send_command("L80")  # Happy eyes
-            self.send_command("R80")
-            # Wave
-            for pos in [70, 80, 70, 80, 70, 40]:
-                self.send_command(f"B{pos}")
-            return f"👋 Performed greeting sequence"
-        
-        elif fn_name == "navigate_to_position":
-            distance = args.get("distance_cm", 0)
-            angle = args.get("angle_degrees", 0)
-            
-            messages = []
-            
-            # Turn first if needed
-            if angle != 0:
-                turn_cmd = f"X{abs(angle)//2}" if angle > 0 else f"X{-abs(angle)//2}"
-                self.send_command(turn_cmd)
-                messages.append(f"Turned {angle}°")
-            
-            # Then move
-            if distance != 0:
-                # Rough conversion: assume 1cm ≈ 1% speed for 100ms (needs calibration)
-                speed = min(abs(distance), 100)
-                move_cmd = f"Y{speed}" if distance > 0 else f"Y{-speed}"
-                self.send_command(move_cmd)
-                messages.append(f"Moved {distance}cm")
-            
-            return f"🤖 Navigation: {', '.join(messages)}"
-        
+        # Populate registry on first use if empty
+        if not self._registry and not self._register_default_handlers_deferred:
+            self._populate_registry_from_legacy()
+            self._register_default_handlers_deferred = True
+
+        handler = self._registry.get(fn_name)
+        if handler:
+            try:
+                return handler(self, args)
+            except Exception as e:
+                return f"❌ Handler error for {fn_name}: {e}"
         return f"❌ Unknown robot command: {fn_name}"
+
+    # ---------------- Legacy -> Registry Migration ----------------
+    def _populate_registry_from_legacy(self):
+        """Populate registry with handler methods extracted from legacy if/elif chain.
+        This provides backward compatibility until explicit handler methods are created.
+        """
+        # Register dedicated handler methods (new structure)
+        self.register("set_head_rotation", lambda s, a: s._handle_set_head_rotation(a))
+        self.register("set_neck_position", lambda s, a: s._handle_set_neck_position(a))
+        self.register("set_both_eyes", lambda s, a: s._handle_set_both_eyes(a))
+        self.register("set_individual_eyes", lambda s, a: s._handle_set_individual_eyes(a))
+        self.register("set_both_arms", lambda s, a: s._handle_set_both_arms(a))
+        self.register("set_individual_arms", lambda s, a: s._handle_set_individual_arms(a))
+        self.register("look_at", lambda s, a: s._handle_look_at(a))
+        self.register("express_emotion", lambda s, a: s._handle_express_emotion(a))
+        self.register("wave_hello", lambda s, a: s._handle_wave_hello(a))
+        self.register("reset_to_neutral", lambda s, a: s._handle_reset_to_neutral(a))
+        self.register("drive_forward", lambda s, a: s._handle_drive_forward(a))
+        self.register("drive_backward", lambda s, a: s._handle_drive_backward(a))
+        self.register("turn_left", lambda s, a: s._handle_turn_left(a))
+        self.register("turn_right", lambda s, a: s._handle_turn_right(a))
+        self.register("stop_movement", lambda s, a: s._handle_stop_movement(a))
+        self.register("move_with_differential", lambda s, a: s._handle_move_with_differential(a))
+        self.register("scan_surroundings", lambda s, a: s._handle_scan_surroundings(a))
+        self.register("perform_greeting", lambda s, a: s._handle_perform_greeting(a))
+        self.register("navigate_to_position", lambda s, a: s._handle_navigate_to_position(a))
+
+    # ---------------- Legacy Handler Implementations ----------------
+    # Each of these is a direct extraction of code from the original if/elif branches.
+    # ---------------- New Handler Methods ----------------
+    def _handle_set_head_rotation(self, args):
+        position = args.get("position", 50)
+        cmd = f"G{position}"
+        self.send_command(cmd)
+        direction = "left" if position < 40 else "right" if position > 60 else "center"
+        return f"🤖 Head rotated to {position}% ({direction})"
+
+    def _handle_set_neck_position(self, args):
+        top = args.get("top_position", 50)
+        bottom = args.get("bottom_position", 50)
+        self.send_command(f"N{top}")
+        self.send_command(f"M{bottom}")
+        return f"🤖 Neck positioned: top={top}%, bottom={bottom}%"
+
+    def _handle_set_both_eyes(self, args):
+        position = args.get("position", 50)
+        self.send_command(f"L{position}")
+        self.send_command(f"R{position}")
+        looking = "up" if position > 60 else "down" if position < 40 else "straight"
+        return f"👀 Eyes looking {looking} (position={position}%)"
+
+    def _handle_set_individual_eyes(self, args):
+        left = args.get("left_eye", 50)
+        right = args.get("right_eye", 50)
+        self.send_command(f"L{left}")
+        self.send_command(f"R{right}")
+        return f"👀 Eyes positioned: left={left}%, right={right}%"
+
+    def _handle_set_both_arms(self, args):
+        position = args.get("position", 50)
+        self.send_command(f"A{position}")
+        self.send_command(f"B{position}")
+        arm_pos = "raised" if position > 60 else "lowered" if position < 40 else "neutral"
+        return f"💪 Arms {arm_pos} (position={position}%)"
+
+    def _handle_set_individual_arms(self, args):
+        left = args.get("left_arm", 50)
+        right = args.get("right_arm", 50)
+        self.send_command(f"A{left}")
+        self.send_command(f"B{right}")
+        return f"💪 Arms positioned: left={left}%, right={right}%"
+
+    def _handle_look_at(self, args):
+        horizontal = args.get("horizontal", 50)
+        vertical = args.get("vertical", 50)
+        self.send_command(f"G{horizontal}")
+        self.send_command(f"N{vertical}")
+        h_dir = "left" if horizontal < 40 else "right" if horizontal > 60 else "straight"
+        v_dir = "up" if vertical > 60 else "down" if vertical < 40 else "level"
+        return f"🤖 Looking {h_dir} and {v_dir}"
+
+    def _handle_express_emotion(self, args):
+        emotion = args.get("emotion", "neutral")
+        emotion_map = {
+            "happy": [(80, 80), (60, 60), (70, 70)],
+            "sad": [(20, 20), (40, 40), (20, 20)],
+            "surprised": [(100, 100), (80, 80), (50, 50)],
+            "neutral": [(50, 50), (50, 50), (40, 40)],
+            "curious": [(60, 70), (60, 60), (40, 40)],
+            "confused": [(40, 60), (55, 55), (45, 45)]
+        }
+        if emotion in emotion_map:
+            eyes, neck, arms = emotion_map[emotion]
+            self.send_command(f"L{eyes[0]}")
+            self.send_command(f"R{eyes[1]}")
+            self.send_command(f"N{neck[0]}")
+            self.send_command(f"A{arms[0]}")
+            self.send_command(f"B{arms[1]}")
+            return f"😊 Expressing emotion: {emotion}"
+        return f"❌ Unknown emotion: {emotion}"
+
+    def _handle_wave_hello(self, args):
+        for pos in [70, 80, 70, 80, 70, 40]:
+            self.send_command(f"B{pos}")
+        return f"👋 Waved hello!"
+
+    def _handle_reset_to_neutral(self, args):
+        self.send_command("G50")
+        self.send_command("N50")
+        self.send_command("L50")
+        self.send_command("R50")
+        self.send_command("A40")
+        self.send_command("B40")
+        return f"↺ Reset to neutral position"
+
+    def _handle_drive_forward(self, args):
+        speed = args.get("speed", 50)
+        duration = args.get("duration_ms", 0)
+        self.send_command(f"Y{speed}")
+        msg = f"🤖 Driving forward at {speed}% speed"
+        if duration > 0:
+            msg += f" for {duration}ms"
+        return msg
+
+    def _handle_drive_backward(self, args):
+        speed = args.get("speed", 50)
+        duration = args.get("duration_ms", 0)
+        self.send_command(f"Y{-speed}")
+        msg = f"🤖 Driving backward at {speed}% speed"
+        if duration > 0:
+            msg += f" for {duration}ms"
+        return msg
+
+    def _handle_turn_left(self, args):
+        speed = args.get("speed", 50)
+        duration = args.get("duration_ms", 0)
+        self.send_command(f"X{-speed}")
+        msg = f"🤖 Turning left at {speed}% speed"
+        if duration > 0:
+            msg += f" for {duration}ms"
+        return msg
+
+    def _handle_turn_right(self, args):
+        speed = args.get("speed", 50)
+        duration = args.get("duration_ms", 0)
+        self.send_command(f"X{speed}")
+        msg = f"🤖 Turning right at {speed}% speed"
+        if duration > 0:
+            msg += f" for {duration}ms"
+        return msg
+
+    def _handle_stop_movement(self, args):
+        self.send_command("q")
+        return f"🛑 All movement stopped"
+
+    def _handle_move_with_differential(self, args):
+        left = args.get("left_speed", 0)
+        right = args.get("right_speed", 0)
+        duration = args.get("duration_ms", 0)
+        forward = (left + right) // 2
+        turn = (right - left) // 2
+        self.send_command(f"Y{forward}")
+        self.send_command(f"X{turn}")
+        msg = f"🤖 Differential drive: L={left}%, R={right}%"
+        if duration > 0:
+            msg += f" for {duration}ms"
+        return msg
+
+    def _handle_scan_surroundings(self, args):
+        speed = args.get("speed", "normal")
+        delay_map = {"slow": 1500, "normal": 800, "fast": 400}
+        delay = delay_map.get(speed, 800)
+        for pos in [20, 50, 80, 50]:
+            self.send_command(f"G{pos}")
+        return f"👀 Scanned surroundings at {speed} speed"
+
+    def _handle_perform_greeting(self, args):
+        self.send_command("G60")
+        self.send_command("N60")
+        self.send_command("L80")
+        self.send_command("R80")
+        for pos in [70, 80, 70, 80, 70, 40]:
+            self.send_command(f"B{pos}")
+        return f"👋 Performed greeting sequence"
+
+    def _handle_navigate_to_position(self, args):
+        distance = args.get("distance_cm", 0)
+        angle = args.get("angle_degrees", 0)
+        messages = []
+        if angle != 0:
+            turn_cmd = f"X{abs(angle)//2}" if angle > 0 else f"X{-abs(angle)//2}"
+            self.send_command(turn_cmd)
+            messages.append(f"Turned {angle}°")
+        if distance != 0:
+            speed = min(abs(distance), 100)
+            move_cmd = f"Y{speed}" if distance > 0 else f"Y{-speed}"
+            self.send_command(move_cmd)
+            messages.append(f"Moved {distance}cm")
+        return f"🤖 Navigation: {', '.join(messages)}"
+
+# External utility wrappers for introspection (similar to memory tools style)
+def list_registered_robot_tools(executor: RobotControlExecutor) -> list:
+    """Return list of registered robot tool names from given executor."""
+    return executor.list_registered()
+
+def get_robot_tools_help(executor: RobotControlExecutor) -> str:
+    """Return help text enumerating robot tools."""
+    return executor.get_help()
 
 
 # Example usage
@@ -695,6 +754,9 @@ if __name__ == "__main__":
     print("\n💡 Testing executor in simulation mode...")
     
     executor = RobotControlExecutor()  # Simulation mode
+    # Force registry population
+    executor.execute("set_head_rotation", {"position": 50})  # triggers populate if empty
+    print("\n" + executor.get_help())
     
     test_commands = [
         ("set_head_rotation", {"position": 75}),
