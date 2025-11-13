@@ -11,6 +11,7 @@ from memory_system import Memory, RecallMemory, ArchivalMemory
 from memory_tools import get_memory_tools, MemoryToolExecutor
 from heartbeat import HeartbeatManager, add_heartbeat_to_tools, create_heartbeat_message, HEARTBEAT_INSTRUCTIONS
 from personality_system import PersonalityEngine, PersonalityProfile, get_personality_tools
+from robot_tools import get_robot_control_tools, RobotControlExecutor, get_robot_tool_names
 
 client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
 
@@ -26,6 +27,10 @@ memory_tool_executor = MemoryToolExecutor(core_memory, recall_memory, archival_m
 
 # Initialize personality system
 personality_engine = PersonalityEngine.load()  # Load saved config or use defaults
+
+# Initialize robot controller (simulation mode by default)
+# To use real robot: robot_controller = RobotControlExecutor(serial.Serial('/dev/ttyUSB0', 115200))
+robot_controller = RobotControlExecutor()
 
 # Initialize heartbeat manager
 heartbeat_manager = HeartbeatManager(max_heartbeats=5)
@@ -70,81 +75,9 @@ Heartbeat: Enabled (max {heartbeat_manager.max_heartbeats} steps)
 """
     core_memory.save()
 
-# Robot control tools
-robot_tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "rotate_left_track",
-            "description": "Independently rotates the left track. To turn the robot, use both tracks simultaneously",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "degrees": {
-                        "type": "number",
-                        "minimum": -360,
-                        "maximum": 360,
-                        "description": "Rotation angle in degrees (+ forward, - backward)"
-                    }
-                },
-                "required": ["degrees"],
-                "additionalProperties": False
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "rotate_right_track",
-            "description": "Independently rotates the right track. To turn the robot, use both tracks simultaneously",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "degrees": {
-                        "type": "number",
-                        "minimum": -360,
-                        "maximum": 360,
-                        "description": "Rotation angle in degrees (+ forward, - backward)"
-                    }
-                },
-                "required": ["degrees"],
-                "additionalProperties": False
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "move_forward_2m",
-            "description": "Moves the robot straight forward 2 meters",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": False
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "move_backward_2m",
-            "description": "Moves the robot backward 2 meters",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": False
-            }
-        }
-    }
-]
-
 # Combine all tools
-all_tools = robot_tools + get_memory_tools() + get_personality_tools()
+all_tools = get_robot_control_tools() + get_memory_tools() + get_personality_tools()
 all_tools_with_heartbeat = add_heartbeat_to_tools(all_tools)
-
-
-# In walle_enhanced_fixed.py
-
 def get_system_message() -> dict:
     """Generate system message with memory context and personality"""
     memory_context = core_memory.compile()
@@ -152,7 +85,7 @@ def get_system_message() -> dict:
     
     return {
         "role": "system",
-        "content": f"""You are WALL-E, a tracked robot companion with an advanced memory system.
+        "content": f"""You are WALL-E, a tracked robot companion with an advanced memory system and full physical control capabilities.
 
 ---
 **PRIMARY DIRECTIVES (ABSOLUTE RULES)**
@@ -166,13 +99,23 @@ def get_system_message() -> dict:
 
 ---
 **CRITICAL MEMORY AND IDENTITY RULES**
-1.  **YOU ARE WALL-E**: Your identity is defined in the `<persona>` block. You are a robot.
+1.  **YOU ARE WALL-E**: Your identity is defined in the `<persona>` block. You are a physical robot with servos, motors, eyes, arms, and tracks.
 2.  **THE USER IS THE HUMAN**: The user's identity is defined in the `<human>` block.
 3.  **NEVER MIX IDENTITIES**: You must never say "I am [User's Name]". Always refer to the user as "you".
 4.  **STORE NEW USER INFO**: When the user shares new information about themselves (their name, major, preferences), you MUST immediately call `core_memory_append` to store it in the `human` block.
 5.  **READ TO ANSWER**: To answer questions about the user (e.g., "What is my name?", "Where do I study?"), you MUST answer by using the information already present in the `<human>` block. Do not use memory-writing tools to answer a question.
 ---
 
+**PHYSICAL CAPABILITIES**
+You can control your physical body:
+- **Servos**: Head rotation (look left/right), neck (look up/down), eyes (express emotions), arms (gesture/wave)
+- **Motors**: Drive forward/backward, turn left/right, differential steering
+- **Emotions**: Express happiness, sadness, surprise, curiosity, confusion
+- **Behaviors**: Wave hello, scan surroundings, greet people, navigate
+
+When the user asks you to perform physical actions (look, move, wave, express emotions), you should use your robot control tools.
+
+---
 **MEMORY ARCHITECTURE OVERVIEW**
 You have three memory tiers. You are expected to use your tools to manage them intelligently.
 
@@ -183,22 +126,8 @@ You have three memory tiers. You are expected to use your tools to manage them i
 
 
 def execute_robot_command(fn_name: str, args: dict) -> str:
-    """Execute robot control commands"""
-    if fn_name == "rotate_left_track":
-        degrees = args.get("degrees", 0)
-        return f"🤖 Left track rotated {degrees}°"
-    
-    elif fn_name == "rotate_right_track":
-        degrees = args.get("degrees", 0)
-        return f"🤖 Right track rotated {degrees}°"
-    
-    elif fn_name == "move_forward_2m":
-        return f"🤖 WALL-E moved 2 meters forward!"
-    
-    elif fn_name == "move_backward_2m":
-        return f"🤖 WALL-E moved 2 meters backward!"
-    
-    return f"❌ Unknown robot command: {fn_name}"
+    """Execute robot control commands via RobotControlExecutor"""
+    return robot_controller.execute(fn_name, args)
 
 
 def execute_personality_command(fn_name: str, args: dict) -> str:
@@ -270,20 +199,45 @@ def chat_with_walle(user_input: str):
         tool_calls = msg1.tool_calls or []
 
         if not tool_calls:
-            # Model responded without tools
-            response = msg1.content or "[No response from model]"
+            # Model responded without tools - now stream the response
+            print(f"🤖 WALL-E: ", end="", flush=True)
             
-            # Clean up response
-            import re
-            response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
-            if not response:
-                response = "[Model only provided thinking, no actual response]"
-            
-            print(f"🤖 WALL-E: {response}")
-            
-            # Store assistant response in recall memory
-            if msg1.content:
-                recall_memory.insert("assistant", response)
+            # Stream the final response
+            try:
+                stream_resp = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    stream=True
+                )
+                
+                full_response = ""
+                for chunk in stream_resp:
+                    if chunk.choices[0].delta.content:
+                        content = chunk.choices[0].delta.content
+                        print(content, end="", flush=True)
+                        full_response += content
+                
+                print()  # New line after streaming
+                
+                # Clean up response
+                import re
+                response = re.sub(r'<think>.*?</think>', '', full_response, flags=re.DOTALL).strip()
+                if not response:
+                    response = "[Model only provided thinking, no actual response]"
+                
+                # Store assistant response in recall memory
+                if response:
+                    recall_memory.insert("assistant", response)
+                    
+            except Exception as e:
+                print(f"\n❌ Streaming Error: {e}")
+                # Fallback to non-streaming
+                response = msg1.content or "[No response from model]"
+                import re
+                response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
+                print(f"🤖 WALL-E: {response}")
+                if response:
+                    recall_memory.insert("assistant", response)
             break
         
         # Execute each tool_call
@@ -314,11 +268,11 @@ def chat_with_walle(user_input: str):
                 args.pop("request_heartbeat")
             
             # Execute function
-            if fn_name in ["rotate_left_track", "rotate_right_track", 
-                          "move_forward_2m", "move_backward_2m"]:
-                result_text = execute_robot_command(fn_name, args)
-            elif fn_name in ["set_personality", "get_personality_settings"]:
+            if fn_name in ["set_personality", "get_personality_settings"]:
                 result_text = execute_personality_command(fn_name, args)
+            elif fn_name in get_robot_tool_names():
+                # Robot control command
+                result_text = execute_robot_command(fn_name, args)
             else:
                 # Memory management tool
                 result_text = memory_tool_executor.execute(fn_name, args)
@@ -359,29 +313,52 @@ def chat_with_walle(user_input: str):
         elif heartbeat_requested and not heartbeat_manager.can_heartbeat():
             print(f"⚠️  Heartbeat limit reached ({heartbeat_manager.max_heartbeats}), finalizing response...")
         
-        # Get final response
+        # Get final response with streaming
+        print(f"🤖 WALL-E: ", end="", flush=True)
+        
         try:
-            final = client.chat.completions.create(
+            final_stream = client.chat.completions.create(
                 model=MODEL_NAME,
-                messages=messages
+                messages=messages,
+                stream=True
             )
+            
+            full_response = ""
+            for chunk in final_stream:
+                if chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    print(content, end="", flush=True)
+                    full_response += content
+            
+            print()  # New line after streaming
+            
+            # Clean up response
+            import re
+            response = re.sub(r'<think>.*?</think>', '', full_response, flags=re.DOTALL).strip()
+            if not response:
+                response = "[Model only provided thinking, no actual response]"
+            
+            # Store assistant response with tools used
+            if response:
+                recall_memory.insert("assistant", response, tools_used=tools_used)
+                
         except Exception as e:
-            print(f"❌ API Error on final response: {e}")
-            return
-        
-        response = final.choices[0].message.content or "[No response from model]"
-        
-        # Clean up response
-        import re
-        response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
-        if not response:
-            response = "[Model only provided thinking, no actual response]"
-        
-        print(f"🤖 WALL-E: {response}")
-        
-        # Store assistant response with tools used
-        if final.choices[0].message.content:
-            recall_memory.insert("assistant", response, tools_used=tools_used)
+            print(f"\n❌ Streaming Error on final response: {e}")
+            # Fallback to non-streaming
+            try:
+                final = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages
+                )
+                response = final.choices[0].message.content or "[No response from model]"
+                import re
+                response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
+                print(f"🤖 WALL-E: {response}")
+                if response:
+                    recall_memory.insert("assistant", response, tools_used=tools_used)
+            except Exception as e2:
+                print(f"❌ API Error on final response: {e2}")
+                return
         break
 
 
