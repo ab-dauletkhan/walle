@@ -18,10 +18,23 @@ import requests
 import sounddevice as sd
 import numpy as np
 import io
+import difflib
 from scipy.io import wavfile
 from enum import Enum
 from vosk import Model, KaldiRecognizer, SetLogLevel
 import subprocess
+
+# Add project root/memory dir to import path and import WALL-E enhanced LLM
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
+MEMORY_DIR = os.path.join(ROOT_DIR, "memory")
+if MEMORY_DIR not in sys.path:
+    sys.path.insert(0, MEMORY_DIR)
+try:
+    import walle_enhanced as walle
+    _WALLE_IMPORT_ERROR = None
+except Exception as _e:
+    _WALLE_IMPORT_ERROR = str(_e)
+    walle = None
 
 # Disable Vosk debug logs for cleaner output
 SetLogLevel(-1)
@@ -98,6 +111,24 @@ class RocketAssistant:
         # Trigger background warm-up of the LLM to reduce first-token latency
         threading.Thread(target=self._warm_llm_model, daemon=True).start()
         
+    def _is_wake(self, text: str) -> bool:
+        """Robust wake word check with fuzzy and token-based matching."""
+        if not text:
+            return False
+        t = " ".join(text.lower().split())
+        w = " ".join(self.wake_word.lower().split())
+        if w in t:
+            return True
+        # Token presence of all wake words (order-insensitive)
+        tokens = set(t.split())
+        wake_tokens = set(w.split())
+        if wake_tokens.issubset(tokens):
+            return True
+        # Fuzzy similarity for minor misrecognitions
+        if difflib.SequenceMatcher(None, t, w).ratio() >= 0.82:
+            return True
+        return False
+
     def _clean_chunk(self, text: str) -> str:
         t = text.replace(self.wake_word, " ")
         t = " ".join(t.split())
@@ -117,64 +148,29 @@ class RocketAssistant:
         self.last_mic_frame_time = time.time()
     
     def query_ollama(self, prompt):
-        """Send prompt to Ollama and get response along with timing metadata."""
+        """Send prompt to WALL-E Enhanced LLM (with memory) and get response with timing metadata."""
         req_start = time.time()
         try:
-            response = requests.post(
-                f"{self.ollama_url}/api/generate",
-                json={
-                    "model": self.ollama_model,
-                    "prompt": prompt,
-                    "system": self.system_prompt,
-                    "stream": False,
-                    "keep_alive": self.ollama_keep_alive,
-                    "options": {
-                        "num_thread": int(self.ollama_num_thread or 0),
-                        "num_batch": int(self.ollama_num_batch),
-                        "temperature": 0.2
-                    }
-                },
-                timeout=(5, self.ollama_timeout)
-            )
+            if walle is None:
+                raise RuntimeError("Cannot import walle_enhanced. Check PYTHONPATH for 'memory' directory.")
+            text = walle.get_walle_response(prompt)
             done_ts = time.time()
-            try:
-                first_token_ts = req_start + float(response.elapsed.total_seconds())
-            except Exception:
-                first_token_ts = done_ts
-            if response.status_code == 200:
-                text = response.json().get("response", "").strip()
-            else:
-                text = f"Error: Ollama returned status {response.status_code}"
+            # We don't have token-level timing; approximate first_token as request start
+            first_token_ts = req_start
             return text, {"request_start": req_start, "first_token": first_token_ts, "done": done_ts}
-        except requests.exceptions.ConnectionError:
-            done_ts = time.time()
-            return "Error: Cannot connect to Ollama. Is it running? (ollama serve)", {"request_start": req_start, "first_token": done_ts, "done": done_ts}
         except Exception as e:
             done_ts = time.time()
             return f"Error: {str(e)}", {"request_start": req_start, "first_token": done_ts, "done": done_ts}
 
     def _warm_llm_model(self):
-        """Perform a tiny generate to force-load the model into memory."""
+        """Perform a tiny generate to warm up WALL-E Enhanced backend (best-effort)."""
         try:
-            self.log_event("llm_warm_start")
-            _ = requests.post(
-                f"{self.ollama_url}/api/generate",
-                json={
-                    "model": self.ollama_model,
-                    "prompt": "ok",
-                    "system": self.system_prompt,
-                    "stream": False,
-                    "keep_alive": self.ollama_keep_alive,
-                    "options": {
-                        "num_thread": int(self.ollama_num_thread or 0),
-                        "num_batch": int(self.ollama_num_batch),
-                        "num_predict": 1,
-                        "temperature": 0.0
-                    }
-                },
-                timeout=(3, min(15, self.ollama_timeout))
-            )
-            self.log_event("llm_warm_done")
+            if walle is not None:
+                self.log_event("llm_warm_start")
+                _ = walle.get_walle_response("ok")
+                self.log_event("llm_warm_done")
+            else:
+                self.log_event("llm_warm_skip", reason="walle_enhanced import failed")
         except Exception:
             # Warm-up is best-effort
             pass
@@ -299,7 +295,7 @@ class RocketAssistant:
         
         if self.state == State.LISTENING_FOR_WAKE_WORD:
             # Check for exact wake word match
-            if text == self.wake_word or self.wake_word in text:
+            if self._is_wake(text):
                 print(f"\n🎤 Wake word detected! Listening for your command...")
                 self.state = State.COLLECTING_COMMAND
                 # If wake word included more words, keep only the tail as initial command
@@ -349,31 +345,38 @@ class RocketAssistant:
                 self.start_thinking_filler()
                 threading.Thread(target=self._process_command_async, args=(self.command_text,), daemon=True).start()
     
-    def run(self, samplerate=16000, device=None):
+    def run(self, samplerate=16000, device=None, blocksize=4000):
         """Main loop"""
         print(f"\n{'='*60}")
         print(f"🚀 Rocket Assistant Started!")
         print(f"{'='*60}")
         print(f"Wake word: '{self.wake_word}'")
         print(f"Silence timeout: {self.silence_timeout}s")
-        print(f"Ollama model: {self.ollama_model}")
+        print(f"LLM backend: WALL-E Enhanced ({self.ollama_model})")
         print(f"TTS: {'Enabled' if self.enable_tts else 'Disabled'} ({self.tts_voice if self.enable_tts else 'N/A'})")
         print(f"{'='*60}\n")
         print("👂 Listening for 'hey rocket'... (Press Ctrl+C to stop)\n")
         
-        # Check if Ollama is running
-        try:
-            response = requests.get(f"{self.ollama_url}/api/tags", timeout=2)
-            if response.status_code != 200:
-                print("⚠️  Warning: Ollama might not be running properly")
-        except:
-            print("⚠️  Warning: Cannot connect to Ollama. Make sure it's running: 'ollama serve'")
-            print()
+        # Backend info
+        if walle is None:
+            detail = f" ({_WALLE_IMPORT_ERROR})" if _WALLE_IMPORT_ERROR else ""
+            print(f"⚠️  Warning: WALL-E Enhanced LLM module not available. Check import path and dependencies{detail}")
+        
+        # Mic watchdog (one-time warning if no frames arrive shortly after start)
+        def _mic_watchdog_once():
+            try:
+                time.sleep(5.0)
+                last = self.last_mic_frame_time
+                if last is None or (time.time() - last) > 5.0:
+                    print("⚠️  No microphone input detected. Use --list-devices to find IDs and pass --device <id>.")
+            except Exception:
+                pass
+        threading.Thread(target=_mic_watchdog_once, daemon=True).start()
         
         try:
             with sd.RawInputStream(
                 samplerate=samplerate, 
-                blocksize=8000,
+                blocksize=blocksize,
                 device=device,
                 dtype="int16", 
                 channels=1,
@@ -393,6 +396,13 @@ class RocketAssistant:
                                 if accepted:
                                     # Final result (end of speech segment)
                                     result = json.loads(self.rec.Result())
+                                else:
+                                    # Early wake-word detection on partial hypothesis
+                                    partial_json = self.rec.PartialResult()
+                                    try:
+                                        partial_obj = json.loads(partial_json) if partial_json else {}
+                                    except Exception:
+                                        partial_obj = {}
                         except Exception as e:
                             print(f"⚠️  STT error: {e}", file=sys.stderr)
                             # Attempt soft recovery by recreating recognizer
@@ -407,6 +417,22 @@ class RocketAssistant:
                             text = result.get("text", "")
                             if text:
                                 self.process_final_result(text)
+                            # Clear local 'result' for next iteration scope
+                            del result
+                        else:
+                            # Handle wake detection from partials while listening
+                            if self.state == State.LISTENING_FOR_WAKE_WORD and isinstance(partial_obj, dict):
+                                ptext = (partial_obj.get("partial") or "").strip().lower()
+                                if self._is_wake(ptext):
+                                    print(f"\n🎤 Wake word detected! Listening for your command...")
+                                    self.state = State.COLLECTING_COMMAND
+                                    # Seed any tail words after wake phrase if present
+                                    tail = ""
+                                    if self.wake_word in ptext:
+                                        tail = ptext.split(self.wake_word, maxsplit=1)[1].strip()
+                                    self.command_text = self._clean_chunk(tail)
+                                    self.last_speech_time = time.time()
+                                    self.play_wake_sound()
                     
                     # Check for command timeout
                     self.check_command_timeout()
@@ -634,6 +660,12 @@ def main():
         type=str,
         help="Custom system prompt for the LLM (default: short 3-4 sentence responses)"
     )
+    parser.add_argument(
+        "--blocksize",
+        type=int,
+        default=4000,
+        help="Microphone blocksize in samples (lower improves wake responsiveness; default: 4000)"
+    )
     
     args = parser.parse_args()
     
@@ -659,7 +691,7 @@ def main():
         system_prompt=args.system_prompt
     )
     
-    assistant.run(device=args.device)
+    assistant.run(device=args.device, blocksize=args.blocksize)
 
 if __name__ == "__main__":
     main()
