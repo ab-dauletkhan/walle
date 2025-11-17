@@ -19,3 +19,4 @@ comp_vision_diplomka/data
 comp_vision_diplomka/face_recognition
 comp_vision_diplomka/tracker_test_videos
 comp_vision_diplomka/docker-compose.yaml
+comp_vision_diplomka/models/w600k_r50.onnx
