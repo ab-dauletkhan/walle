@@ -13,3 +13,9 @@ personality_config.json
 walle_archival_memory.db
 walle_core_memory.db
 walle_recall_memory.db
+
+comp_vision_diplomka/__pycache__
+comp_vision_diplomka/data
+comp_vision_diplomka/face_recognition
+comp_vision_diplomka/tracker_test_videos
+comp_vision_diplomka/docker-compose.yaml
