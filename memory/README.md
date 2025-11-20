@@ -1,70 +1,97 @@
-# WALL-E: A MemGPT-Powered Robot Companion
+# WALL-E: MemGPT-Inspired Robot Brain 🤖
 
-This project is a Python-based robot companion, WALL-E, featuring an advanced memory system inspired by the MemGPT paper and a configurable personality engine.
+**WALL-E** is an autonomous agent framework designed for local execution. It transforms a standard LLM into a persistent personality with a "physical" body, featuring a three-tiered memory system (Core, Recall, Archival), a multi-modal context manager (simulating vision/sensors), and direct hardware control.
 
-## Core Features
+## 🌟 Key Features
 
-*   **Three-Tier Memory System:**
-    *   **Core Memory:** Always-on context for self-identity and user information.
-    *   **Recall Memory:** Searchable database of recent conversation history.
-    *   **Archival Memory:** Long-term storage for important facts and user preferences.
-*   **Autonomous Memory Management:** The AI uses a toolkit of functions to manage its own memory in real-time.
-*   **Configurable Personality:** Traits like Humor, Honesty, Sass, and Curiosity can be adjusted on-the-fly, directly influencing the robot's behavior.
-*   **Multi-Step Reasoning:** A "heartbeat" mechanism allows the robot to chain multiple actions to solve complex requests without user interruption.
-*   **Persistent State:** Core memory and personality settings are saved and loaded across sessions.
+* **🧠 Three-Tier Memory System**:
+    * **Core Memory**: Persistent instructions and persona residing *inside* the context window. Editable by the LLM.
+    * **Recall Memory**: Vector-backed conversation history (using `nomic-embed-text`).
+    * **Archival Memory**: Long-term storage for facts and deep history.
+* **💓 Heartbeat / Chain-of-Thought**: A mechanism allowing the robot to "think" or perform multiple actions (e.g., "Look left" -> "Scan" -> "Speak") without user interruption.
+* **👀 Context Awareness**: Simulates sensory inputs (Vision, Battery, Environment) injected dynamically into the prompt.
+* **🦾 Robotics Control**: Direct serial port integration for motor control, head rotation, and emotional expression.
+* **🌍 Internet Connected**: Tools to fetch real-time data (weather, news) using DuckDuckGo.
 
-## System Architecture
+## 🛠️ Prerequisites
 
-*   `walle_enhanced.py`: Main application entry point.
-*   `memory_system.py`: Implements the Core, Recall, and Archival memory tiers.
-*   `memory_tools.py`: Defines the functions the AI uses to interact with its memory.
-*   `personality_system.py`: Manages the TARS-inspired personality traits.
-*   `heartbeat.py`: Enables multi-step "chain of thought" reasoning.
-*   `context_manager.py`: (Future Integration) Designed for handling real-world sensor data.
+* **Python 3.10+**
+* **Ollama** running locally ([Download](https://ollama.ai)).
+* **Hardware (Optional)**: An Arduino/Serial robot. The system defaults to "Simulation Mode" if no device is found.
 
-## Setup & Installation
+## 🚀 Installation
 
-1.  **Install Ollama:** Follow the instructions at [https://ollama.ai](https://ollama.ai).
-
-2.  **Pull an AI Model:** This project is optimized for smaller models.
+1.  **Clone the repository**:
     ```bash
-    ollama pull qwen3:1.7b
+    git clone [https://github.com/ab-dauletkhan/walle](https://github.com/ab-dauletkhan/walle)
+    cd walle
     ```
 
-3.  **Install Python Dependencies:**
+2.  **Install Dependencies**:
     ```bash
-    pip install "openai>=1,<2"
+    pip install openai requests duckduckgo-search numpy
     ```
-    *Note: For optional semantic search, also run `pip install sentence-transformers`.*
 
-4.  **Configure the Model:** Open `walle_enhanced.py` and ensure the `MODEL_NAME` variable matches your pulled model (e.g., `"qwen3:1.7b"`).
+3.  **Setup Ollama Models**:
+    You need the base text model and the embedding model for memory search.
+    ```bash
+    ollama pull qwen3:4b
+    ollama pull nomic-embed-text
+    ```
 
-## Running the Robot
+4.  **Create the Custom Brain**:
+    Create a file named `Modelfile` (no extension) in your project folder:
+    ```dockerfile
+    FROM qwen3:4b
+    # Set context window to 4096 tokens (Low VRAM usage)
+    PARAMETER num_ctx 4096
+    # Set the system prompt permanently
+    SYSTEM "You are WALL-E, a helpful robot companion."
+    ```
+    Then build the model:
+    ```bash
+    ollama create walle-brain -f Modelfile
+    ```
 
-Ensure the Ollama service is running in the background, then execute the main script:
+## 🏃 Usage
 
+### Start the Brain
 ```bash
 python walle_enhanced.py
+````
+
+*This initializes the cognitive loop, connects to databases, and starts the simulation.*
+
+### Memory Inspector
+
+To see what is actually stored in the database (Core blocks, Recall vectors, etc.):
+
+```bash
+python memory_inspector.py
 ```
 
-## Usage
+## ⚙️ Configuration
 
-*   **Chat Naturally:** Interact with WALL-E using natural language.
-*   **Adjust Personality:**
-    *   `set humor to 90`
-    *   `set sass to 10`
-*   **View Settings:**
-    *   `show personality`
-*   **Exit:**
-    *   `exit` or `quit` (this will save the current memory and personality state).
+Edit `config.py` to adjust:
 
-## Utilities
+  * **`SERIAL_PORT`**: Set to your Arduino port (e.g., `COM3` or `/dev/ttyUSB0`) for hardware control.
+  * **`SEARCH_REGIONS`**: Customize DuckDuckGo search regions (default: `["wt-wt", "us-en"]`).
+  * **`RECALL_MEMORY_LIMIT`**: How many messages to keep before summarizing to archival.
 
-*   **Check Environment:** Run this script to verify your Ollama connection and see available models.
-    ```bash
-    python ollama_diagnostics.py
-    ```
-*   **Inspect Memory:** Run this script to view the contents of WALL-E's core, recall, and archival memory databases.
-    ```bash
-    python memory_inspector.py
-    ```
+## 🧪 Quick System Tests
+
+Run these steps to verify your installation:
+
+1.  **Configuration Check**:
+    Run `python config.py`. Expect no errors.
+
+2.  **Memory Write Test**:
+
+      * Start the bot: `python walle_enhanced.py`
+      * Say: *"My name is [Your Name]. I am a Python developer."*
+      * Exit and run `python memory_inspector.py`. Check the **Core Memory** section; the `<human>` block should now contain your name.
+
+3.  **Tool Use Test**:
+
+      * Ask: *"What is the price of Bitcoin?"* -\> Should trigger `consult_internet_for_facts`.
+      * Command: *"Look left and wave."* -\> Should trigger `set_head_rotation` and `wave_hello`.

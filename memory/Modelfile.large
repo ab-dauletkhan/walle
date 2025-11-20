@@ -1,0 +1,7 @@
+FROM qwen3:4b
+
+# Set context window to 4096 tokens (Low VRAM usage)
+PARAMETER num_ctx 4096
+
+# Set the system prompt permanently (optional, but good practice)
+SYSTEM "You are WALL-E, a helpful robot companion."
