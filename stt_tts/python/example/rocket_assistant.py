@@ -266,7 +266,7 @@ class RocketAssistant:
                     "text": text,
                     "voice": self.tts_voice
                 },
-                timeout=10
+                timeout=30
             )
             if response.status_code == 200:
                 audio_data = io.BytesIO(response.content)
