@@ -1,4 +1,4 @@
-FROM qwen3:4b
+FROM gemma3:1b
 
 # Set context window to 4096 tokens (Low VRAM usage)
 PARAMETER num_ctx 4096

@@ -35,14 +35,14 @@
 3.  **Setup Ollama Models**:
     You need the base text model and the embedding model for memory search.
     ```bash
-    ollama pull qwen3:4b
+    ollama pull gemma3:1b
     ollama pull nomic-embed-text
     ```
 
 4.  **Create the Custom Brain**:
     Create a file named `Modelfile` (no extension) in your project folder:
     ```dockerfile
-    FROM qwen3:4b
+    FROM gemma3:1b
     # Set context window to 4096 tokens (Low VRAM usage)
     PARAMETER num_ctx 4096
     # Set the system prompt permanently

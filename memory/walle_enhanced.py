@@ -259,6 +259,114 @@ def chat(user_input: str):
             session.add("assistant", final_content)
         break
 
+def get_walle_response(user_input: str) -> str:
+    """
+    Get WALL-E's response to user input without printing to stdout.
+    Returns the assistant's response text.
+    """
+    # 1. Context & Memory Setup
+    context_manager.update_interaction(InteractionContext(datetime.now(), recall_mem.get_count()))
+    
+    # Simulate sensor update occasionally
+    if recall_mem.get_count() % 5 == 0:
+        context_manager.update_environment(SensorSimulator.simulate_environment_context(battery=80 - recall_mem.get_count()))
+
+    memory_context = retrieve_relevant_context(user_input)
+    full_input = memory_context + user_input if memory_context else user_input
+    
+    recall_mem.insert("user", user_input)
+    session.add("user", full_input)
+    heartbeat.reset()
+    
+    # 2. Maintenance
+    if recall_mem.get_count() > conf.RECALL_MEMORY_LIMIT:
+        recall_mem.compress_old_memories(summarize_text, archival_mem)
+
+    # 3. Execution Loop (non-streaming version for API use)
+    iteration = 0
+    final_response = ""
+    
+    while iteration < 10:
+        iteration += 1
+        tools = get_robot_control_tools() + get_memory_tools() + get_personality_tools() + get_knowledge_tools()
+        tools = add_heartbeat_to_tools(tools)
+
+        messages = session.get_messages()
+        
+        try:
+            response = client.chat.completions.create(
+                model=conf.MODEL_NAME,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto"
+            )
+            
+            message = response.choices[0].message
+            content = message.content or ""
+            tool_calls = message.tool_calls or []
+            
+            if not tool_calls:
+                if content:
+                    recall_mem.insert("assistant", content)
+                    session.add("assistant", content)
+                    final_response = content
+                break
+
+            session.add("assistant", content or "Thinking...", tool_calls)
+            hb_req = False
+            
+            for tc in tool_calls:
+                name = tc.function.name
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except:
+                    args = {}
+
+                if args.pop("request_heartbeat", False): 
+                    hb_req = True
+                
+                try:
+                    if name == "consult_internet_for_facts":
+                        result = knowledge_exec.execute(name, args)
+                        hb_req = True
+                    elif name in get_robot_tool_names():
+                        result = robot.execute(name, args)
+                    elif name == "set_personality":
+                        if hasattr(personality.profile, args['trait']):
+                            setattr(personality.profile, args['trait'], args['value'])
+                            personality.save()
+                            result = "Personality updated."
+                    else:
+                        result = mem_exec.execute(name, args)
+                except Exception as e:
+                    result = f"Error: {e}"
+
+                session.add_tool_result(tc.id, name, str(result)[:1000])
+
+            if hb_req and heartbeat.can_heartbeat():
+                heartbeat.request_heartbeat()
+                continue
+            
+            # Final response after tool calls
+            final_resp = client.chat.completions.create(
+                model=conf.MODEL_NAME,
+                messages=session.get_messages(),
+                tools=[]
+            )
+            final_content = final_resp.choices[0].message.content or ""
+            if final_content:
+                recall_mem.insert("assistant", final_content, tools_used=[t.function.name for t in tool_calls])
+                session.add("assistant", final_content)
+                final_response = final_content
+            break
+            
+        except Exception as e:
+            final_response = f"Error generating response: {e}"
+            break
+    
+    return final_response
+
+
 def main():
     print("🤖 WALL-E Online v2.6 (Stable Single-Brain)")
     
