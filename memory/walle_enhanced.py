@@ -102,13 +102,16 @@ def retrieve_relevant_context(query: str) -> str:
 
 def get_system_prompt():
     context_str = context_manager.get_context_string()
-    return f"""You are WALL-E, a helpful robot companion. /no_think
+    return f"""You are WALL-E, a helpful robot companion.
+{personality.get_system_prompt_addition()}
 
 RULES:
 1. Your text = internal thought (user can't see)
 2. To reply to user: call send_message tool
 3. To remember info: call core_memory_append THEN send_message
-4. Keep it SHORT. Act fast, don't over-analyze.
+4. Keep thoughts SHORT. Act, don't over-analyze.
+
+IMPORTANT: Actually CALL the tools, don't just think about them!
 
 {context_str}
 {core_mem.compile()}
