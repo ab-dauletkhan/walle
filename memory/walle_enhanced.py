@@ -102,16 +102,13 @@ def retrieve_relevant_context(query: str) -> str:
 
 def get_system_prompt():
     context_str = context_manager.get_context_string()
-    return f"""You are WALL-E, a helpful robot companion.
-{personality.get_system_prompt_addition()}
+    return f"""You are WALL-E, a helpful robot companion. /no_think
 
 RULES:
 1. Your text = internal thought (user can't see)
 2. To reply to user: call send_message tool
 3. To remember info: call core_memory_append THEN send_message
-4. Keep thoughts SHORT. Act, don't over-analyze.
-
-IMPORTANT: Actually CALL the tools, don't just think about them!
+4. Keep it SHORT. Act fast, don't over-analyze.
 
 {context_str}
 {core_mem.compile()}
@@ -288,9 +285,8 @@ def chat(user_input: str):
                     print(f"🤖 WALL-E: {message}")
                     recall_mem.insert("assistant", message)
                     user_received_message = True
-                    if validated.request_heartbeat:
-                        hb_req = True
                     result = "Message delivered to user"
+                    # Note: ignore request_heartbeat for send_message - response is done
                 else:
                     result = "Message already sent (duplicate ignored)"
                 session.add_tool_result(tc.id, name, result)
@@ -315,14 +311,15 @@ def chat(user_input: str):
             if name == "consult_internet_for_facts":
                 print(f"   🌍 Search feedback loop active...")
 
+        # If user got a message, we're done - don't continue even with heartbeat
+        if user_received_message:
+            break
+
+        # Only continue for heartbeat if we haven't responded yet
         if hb_req and heartbeat.can_heartbeat():
             heartbeat.request_heartbeat()
             print("   💓 Thinking chain active...")
             continue
-
-        # If user got a message, we're done
-        if user_received_message:
-            break
 
         # Otherwise continue to get send_message
         print("   (Continuing for response...)")
