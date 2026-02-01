@@ -26,7 +26,7 @@
 ### 1. Clone and Install
 
 ```bash
-git clone <your-repo-url> memory
+git clone https://github.com/ab-dauletkhan/walle.git
 cd memory
 pip install -r requirements.txt
 ```
