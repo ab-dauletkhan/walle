@@ -461,7 +461,7 @@ class RecallMemory(FAISSIndexMixin):
             if self.faiss_manager and self.faiss_manager.is_available:
                 self.faiss_manager.add(embedding, row_id)
                 if self.faiss_manager.needs_save(threshold=10):
-                    self.faiss_manager.save()
+                    self.faiss_manager.save()  # Already in background, sync is fine
         except Exception as e:
             print(f"⚠️ Background embedding failed: {e}")
 
