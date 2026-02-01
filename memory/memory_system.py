@@ -6,6 +6,7 @@ Optimized for NVIDIA Jetson Orin Nano.
 
 import json
 import sqlite3
+import threading
 import numpy as np
 from datetime import datetime
 from typing import List, Dict, Optional, Any, Callable
@@ -112,6 +113,8 @@ class FAISSManager:
         self.index = None
         self.id_map = []  # Maps FAISS index position to database row ID
         self._insertions_since_save = 0
+        self._save_lock = threading.Lock()
+        self._save_in_progress = False
 
         if _faiss_available:
             self._load_or_create_index()
@@ -182,18 +185,38 @@ class FAISSManager:
         return results
 
     def save(self):
-        """Persist index to disk"""
+        """Persist index to disk (synchronous)"""
         if not _faiss_available or self.index is None or not self.index_path:
             return
 
+        with self._save_lock:
+            try:
+                faiss.write_index(self.index, self.index_path)
+                # Save id_map to companion file
+                with open(self.index_path + ".ids", 'w') as f:
+                    json.dump(self.id_map, f)
+                self._insertions_since_save = 0
+            except Exception as e:
+                print(f"⚠️ Failed to save FAISS index: {e}")
+
+    def save_async(self):
+        """Persist index to disk in background thread (non-blocking)"""
+        if not _faiss_available or self.index is None or not self.index_path:
+            return
+
+        # Skip if save already in progress
+        if self._save_in_progress:
+            return
+
+        self._save_in_progress = True
+        threading.Thread(target=self._save_async_impl, daemon=True).start()
+
+    def _save_async_impl(self):
+        """Background save implementation"""
         try:
-            faiss.write_index(self.index, self.index_path)
-            # Save id_map to companion file
-            with open(self.index_path + ".ids", 'w') as f:
-                json.dump(self.id_map, f)
-            self._insertions_since_save = 0
-        except Exception as e:
-            print(f"⚠️ Failed to save FAISS index: {e}")
+            self.save()
+        finally:
+            self._save_in_progress = False
 
     def rebuild_from_db(self, db_path: str, table: str = "recall_memory"):
         """Rebuild index from database embeddings"""
@@ -382,10 +405,21 @@ class RecallMemory(FAISSIndexMixin):
                 role TEXT, content TEXT, tools_used TEXT, metadata TEXT, embedding BLOB)""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON recall_memory(timestamp DESC)")
 
-    def insert(self, role: str, content: str, tools_used: List[str] = None, metadata: Dict = None):
-        embedding = get_embedding(content) if self.use_semantic else None
-        # Use Python timestamp for microsecond precision (SQLite CURRENT_TIMESTAMP is second-precision)
+    def insert(self, role: str, content: str, tools_used: List[str] = None, metadata: Dict = None, defer_embedding: bool = False):
+        """
+        Insert a message into recall memory.
+
+        Args:
+            defer_embedding: If True, generates embedding in background thread (faster TTFT)
+        """
+        # Use Python timestamp for microsecond precision
         timestamp = datetime.now().isoformat()
+
+        # Generate embedding synchronously or defer to background
+        if self.use_semantic and not defer_embedding:
+            embedding = get_embedding(content)
+        else:
+            embedding = None
 
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
@@ -395,12 +429,41 @@ class RecallMemory(FAISSIndexMixin):
             )
             row_id = cursor.lastrowid
 
-        # Add to FAISS index
+        # Add to FAISS index (sync path)
         if embedding and self.faiss_manager and self.faiss_manager.is_available:
             self.faiss_manager.add(embedding, row_id)
-            # Save periodically
             if self.faiss_manager.needs_save(threshold=10):
-                self.faiss_manager.save()
+                self.faiss_manager.save_async()  # Non-blocking save
+
+        # Deferred embedding - generate in background thread
+        if self.use_semantic and defer_embedding:
+            threading.Thread(
+                target=self._generate_embedding_async,
+                args=(row_id, content),
+                daemon=True
+            ).start()
+
+    def _generate_embedding_async(self, row_id: int, content: str):
+        """Generate embedding in background and update DB + FAISS."""
+        try:
+            embedding = get_embedding(content)
+            if not embedding:
+                return
+
+            # Update SQLite
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "UPDATE recall_memory SET embedding = ? WHERE id = ?",
+                    (embedding, row_id)
+                )
+
+            # Update FAISS index
+            if self.faiss_manager and self.faiss_manager.is_available:
+                self.faiss_manager.add(embedding, row_id)
+                if self.faiss_manager.needs_save(threshold=10):
+                    self.faiss_manager.save()
+        except Exception as e:
+            print(f"⚠️ Background embedding failed: {e}")
 
     def search(self, query: str = None, limit: int = 10) -> List[Dict]:
         """Search recall memory with FAISS-accelerated semantic search"""
@@ -538,7 +601,7 @@ class ArchivalMemory(FAISSIndexMixin):
         if embedding and self.faiss_manager and self.faiss_manager.is_available:
             self.faiss_manager.add(embedding, row_id)
             if self.faiss_manager.needs_save(threshold=10):
-                self.faiss_manager.save()
+                self.faiss_manager.save_async()  # Non-blocking save
 
     def search(self, query: str, limit: int = 5) -> List[Dict]:
         """Search archival memory with FAISS and importance decay"""
