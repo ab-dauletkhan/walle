@@ -4,6 +4,8 @@ Updated with blocking execution for realistic timing.
 Optimized for Jetson Orin Nano.
 """
 import time
+from base_executor import BaseToolExecutor
+
 try:
     import serial
     SERIAL_AVAILABLE = True
@@ -28,7 +30,10 @@ def get_robot_tool_names():
             "turn_right", "stop_movement", "express_emotion", "scan_surroundings",
             "wave_hello", "set_both_arms", "set_neck_position", "reset_to_neutral"]
 
-class RobotControlExecutor:
+class RobotControlExecutor(BaseToolExecutor):
+    """Executor for robot control tools."""
+    method_prefix = "_handle_"
+
     def __init__(self, serial_port=None, baud_rate=9600):
         """
         Initialize robot control executor.
@@ -77,12 +82,6 @@ class RobotControlExecutor:
         if self.serial_connection and self.serial_connection.is_open:
             self.serial_connection.close()
             print("🔌 Serial connection closed")
-
-    def execute(self, fn_name: str, args: dict) -> str:
-        method = getattr(self, f"_handle_{fn_name}", None)
-        if method:
-            return method(args)
-        return f"❌ Unknown command: {fn_name}"
 
     # --- Handlers with Blocking Time ---
     

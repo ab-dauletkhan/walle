@@ -3,6 +3,7 @@ Personality Engine
 """
 import json
 from dataclasses import dataclass
+from base_executor import BaseToolExecutor
 
 @dataclass
 class PersonalityProfile:
@@ -57,3 +58,22 @@ def get_personality_tools():
             }
         }
     }]
+
+
+class PersonalityToolExecutor(BaseToolExecutor):
+    """Executor for personality-related tools."""
+
+    def __init__(self, engine: PersonalityEngine):
+        self.engine = engine
+
+    def _set_personality(self, args: dict) -> str:
+        """Set a personality trait value."""
+        trait = args.get('trait')
+        value = args.get('value')
+
+        if not hasattr(self.engine.profile, trait):
+            return f"Unknown trait: {trait}"
+
+        setattr(self.engine.profile, trait, value)
+        self.engine.save()
+        return f"Personality trait '{trait}' set to {value}."

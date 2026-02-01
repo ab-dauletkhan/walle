@@ -344,7 +344,20 @@ class Memory:
     def compile(self) -> str:
         return "<memory_blocks>\n" + "\n".join(b.compile() for b in self.blocks) + "\n</memory_blocks>"
 
-class RecallMemory:
+class FAISSIndexMixin:
+    """Mixin for classes that use FAISS indexing."""
+    faiss_manager: FAISSManager = None
+    db_path: str = ""
+
+    def _ensure_faiss_index(self, table_name: str):
+        """Rebuild FAISS index from database if index is empty but DB has data."""
+        if self.faiss_manager and self.faiss_manager.is_available:
+            if self.faiss_manager.index.ntotal == 0 and self.get_count() > 0:
+                self.faiss_manager.rebuild_from_db(self.db_path, table_name)
+                self.faiss_manager.save()
+
+
+class RecallMemory(FAISSIndexMixin):
     """Recall Memory - Recent history with FAISS-accelerated vector search"""
 
     def __init__(self, db_path: str = "walle_recall_memory.db", use_semantic: bool = False):
@@ -360,11 +373,7 @@ class RecallMemory:
                 dimension=conf.FAISS_DIMENSION,
                 index_path=faiss_path
             )
-            # Rebuild index if empty but DB has data
-            if self.faiss_manager.is_available and self.faiss_manager.index.ntotal == 0:
-                if self.get_count() > 0:
-                    self.faiss_manager.rebuild_from_db(self.db_path, "recall_memory")
-                    self.faiss_manager.save()
+            self._ensure_faiss_index("recall_memory")
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -491,7 +500,7 @@ class RecallMemory:
             
             return len(rows)
 
-class ArchivalMemory:
+class ArchivalMemory(FAISSIndexMixin):
     """Archival Memory - Long term storage with FAISS search and importance decay"""
 
     def __init__(self, db_path: str = "walle_archival_memory.db", use_semantic: bool = False):
@@ -507,11 +516,7 @@ class ArchivalMemory:
                 dimension=conf.FAISS_DIMENSION,
                 index_path=faiss_path
             )
-            # Rebuild index if empty but DB has data
-            if self.faiss_manager.is_available and self.faiss_manager.index.ntotal == 0:
-                if self.get_count() > 0:
-                    self.faiss_manager.rebuild_from_db(self.db_path, "archival_memory")
-                    self.faiss_manager.save()
+            self._ensure_faiss_index("archival_memory")
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -529,10 +534,11 @@ class ArchivalMemory:
             )
             row_id = cursor.lastrowid
 
-        # Add to FAISS index
+        # Add to FAISS index (use threshold-based save like RecallMemory)
         if embedding and self.faiss_manager and self.faiss_manager.is_available:
             self.faiss_manager.add(embedding, row_id)
-            self.faiss_manager.save()
+            if self.faiss_manager.needs_save(threshold=10):
+                self.faiss_manager.save()
 
     def search(self, query: str, limit: int = 5) -> List[Dict]:
         """Search archival memory with FAISS and importance decay"""

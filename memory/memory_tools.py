@@ -3,6 +3,7 @@ Memory management tools for LLM interaction
 """
 from typing import Dict, List, Any
 from memory_system import Memory, RecallMemory, ArchivalMemory
+from base_executor import BaseToolExecutor
 
 def get_memory_tools() -> List[Dict]:
     return [
@@ -69,16 +70,13 @@ def get_memory_tools() -> List[Dict]:
         }
     ]
 
-class MemoryToolExecutor:
+class MemoryToolExecutor(BaseToolExecutor):
+    """Executor for memory-related tools."""
+
     def __init__(self, memory: Memory, recall: RecallMemory, archival: ArchivalMemory):
         self.memory = memory
         self.recall = recall
         self.archival = archival
-
-    def execute(self, name: str, args: dict) -> str:
-        method = getattr(self, f"_{name}", None)
-        if method: return method(args)
-        return f"Unknown tool: {name}"
 
     def _core_memory_append(self, args):
         block = self.memory.get_block(args['label'])

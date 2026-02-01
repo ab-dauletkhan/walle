@@ -15,7 +15,7 @@ from config import conf
 # Import subsystems
 from memory_system import Memory, RecallMemory, ArchivalMemory
 from memory_tools import get_memory_tools, MemoryToolExecutor
-from personality_system import PersonalityEngine, get_personality_tools
+from personality_system import PersonalityEngine, get_personality_tools, PersonalityToolExecutor
 from robot_tools import get_robot_control_tools, RobotControlExecutor, get_robot_tool_names
 from heartbeat import HeartbeatManager, add_heartbeat_to_tools
 from knowledge_tools import get_knowledge_tools, KnowledgeToolExecutor
@@ -33,6 +33,7 @@ recall_mem = RecallMemory(use_semantic=conf.USE_SEMANTIC_SEARCH)
 archival_mem = ArchivalMemory(use_semantic=conf.USE_SEMANTIC_SEARCH)
 mem_exec = MemoryToolExecutor(core_mem, recall_mem, archival_mem)
 personality = PersonalityEngine.load()
+personality_exec = PersonalityToolExecutor(personality)
 robot = RobotControlExecutor(serial_port=conf.SERIAL_PORT, baud_rate=conf.BAUD_RATE)
 heartbeat = HeartbeatManager()
 knowledge_exec = KnowledgeToolExecutor()
@@ -185,7 +186,10 @@ def stream_chat_response(messages, tools, max_retries=2):
 
 def chat(user_input: str):
     # 1. Context & Memory Setup
-    context_manager.update_interaction(InteractionContext(datetime.now(), recall_mem.get_count()))
+    context_manager.update_interaction(InteractionContext(
+        last_interaction=datetime.now(),
+        interaction_count=recall_mem.get_count()
+    ))
     
     # Simulate sensor update occasionally
     if recall_mem.get_count() % 5 == 0:
@@ -224,8 +228,8 @@ def chat(user_input: str):
             name = tc.function.name
             try:
                 args = json.loads(tc.function.arguments or "{}")
-            except:
-                print(f"   ⚠️ JSON Error in args")
+            except json.JSONDecodeError as e:
+                print(f"   ⚠️ JSON Error in args: {e}")
                 args = {}
 
             if args.pop("request_heartbeat", False): hb_req = True
@@ -238,10 +242,7 @@ def chat(user_input: str):
                 elif name in get_robot_tool_names():
                     result = robot.execute(name, args)
                 elif name == "set_personality":
-                    if hasattr(personality.profile, args['trait']):
-                        setattr(personality.profile, args['trait'], args['value'])
-                        personality.save()
-                        result = "Personality updated."
+                    result = personality_exec.execute(name, args)
                 else:
                     result = mem_exec.execute(name, args)
             except Exception as e:

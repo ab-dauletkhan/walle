@@ -1,5 +1,7 @@
 import json
 import re
+from base_executor import BaseToolExecutor
+
 try:
     from duckduckgo_search import DDGS
 except ImportError:
@@ -29,11 +31,12 @@ def get_knowledge_tools():
         }
     ]
 
-class KnowledgeToolExecutor:
-    def execute(self, fn_name: str, args: dict) -> str:
-        if fn_name == "consult_internet_for_facts":
-            return self._search_web(args.get("query"))
-        return f"❌ Unknown knowledge tool: {fn_name}"
+class KnowledgeToolExecutor(BaseToolExecutor):
+    """Executor for knowledge/search tools."""
+
+    def _consult_internet_for_facts(self, args: dict) -> str:
+        """Search the internet for facts."""
+        return self._search_web(args.get("query"))
 
     def _is_english_result(self, result: dict) -> bool:
         """
