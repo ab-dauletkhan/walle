@@ -101,3 +101,7 @@ class MemoryToolExecutor:
     def _recall_memory_search(self, args):
         res = self.recall.search(args.get('query'), args.get('limit', 5))
         return f"Results: {res}"
+
+    def get_tool_schemas(self) -> List[Dict]:
+        """Return tool schemas in OpenAI format"""
+        return get_memory_tools()

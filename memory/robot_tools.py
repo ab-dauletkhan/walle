@@ -1,8 +1,16 @@
 """
 WALL-E Robot Control Tools
 Updated with blocking execution for realistic timing.
+Optimized for Jetson Orin Nano.
 """
 import time
+try:
+    import serial
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
+    print("⚠️ pyserial not installed. Robot control simulation mode only.")
+    print("   Install with: pip install pyserial")
 
 def get_robot_control_tools():
     # (Schema definitions same as before, omitted for brevity but assume full JSON list here)
@@ -21,18 +29,54 @@ def get_robot_tool_names():
             "wave_hello", "set_both_arms", "set_neck_position", "reset_to_neutral"]
 
 class RobotControlExecutor:
-    def __init__(self, serial_port=None):
-        self.serial_port = serial_port
-        self.simulation = serial_port is None
+    def __init__(self, serial_port=None, baud_rate=9600):
+        """
+        Initialize robot control executor.
+
+        Args:
+            serial_port: Serial port path (e.g., '/dev/ttyUSB0') or None for simulation
+            baud_rate: Baud rate for serial communication
+        """
+        self.serial_connection = None
+        self.simulation = True
+
+        if serial_port and SERIAL_AVAILABLE:
+            try:
+                self.serial_connection = serial.Serial(
+                    port=serial_port,
+                    baudrate=baud_rate,
+                    timeout=1
+                )
+                self.simulation = False
+                print(f"✅ Connected to robot on {serial_port}")
+            except Exception as e:
+                print(f"⚠️ Failed to connect to {serial_port}: {e}")
+                print("   Running in simulation mode")
+                self.simulation = True
+        else:
+            print("🔌 Running in simulation mode (no serial port specified)")
+            self.simulation = True
 
     def send_command(self, cmd: str):
+        """Send command to robot via serial or simulate."""
         if self.simulation:
             print(f"🔌 [SERIAL SIM] >> {cmd}")
         else:
             try:
-                self.serial_port.write(f"{cmd}\n".encode())
+                if self.serial_connection and self.serial_connection.is_open:
+                    self.serial_connection.write(f"{cmd}\n".encode())
+                    self.serial_connection.flush()
+                else:
+                    print(f"⚠️ Serial connection closed, simulating: {cmd}")
             except Exception as e:
+                print(f"⚠️ Serial Error: {e}")
                 return f"Serial Error: {e}"
+
+    def close(self):
+        """Close serial connection properly."""
+        if self.serial_connection and self.serial_connection.is_open:
+            self.serial_connection.close()
+            print("🔌 Serial connection closed")
 
     def execute(self, fn_name: str, args: dict) -> str:
         method = getattr(self, f"_handle_{fn_name}", None)

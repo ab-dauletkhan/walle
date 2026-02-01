@@ -1,6 +1,11 @@
 import json
 import re
-from ddgs import DDGS
+try:
+    from duckduckgo_search import DDGS
+except ImportError:
+    print("⚠️ duckduckgo_search not installed. Web search disabled.")
+    print("   Install with: pip install duckduckgo-search")
+    DDGS = None
 from config import conf
 
 def get_knowledge_tools():
@@ -60,9 +65,12 @@ class KnowledgeToolExecutor:
         return True
 
     def _search_web(self, query: str) -> str:
+        if DDGS is None:
+            return "❌ SYSTEM: Web search not available. Install duckduckgo-search package."
+
         # Logic: Only append 'english' if the query is long enough to likely return foreign results.
         # Short financial/weather queries usually work better raw.
-        
+
         clean_query = query.replace("2025", "").strip()
         
         # Heuristic: If it's about 'price', 'weather', or 'time', DON'T add 'english'

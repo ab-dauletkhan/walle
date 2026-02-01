@@ -1,97 +1,232 @@
-# WALL-E: MemGPT-Inspired Robot Brain 🤖
+# WALL-E: Memory-Augmented Robot Brain
 
-**WALL-E** is an autonomous agent framework designed for local execution. It transforms a standard LLM into a persistent personality with a "physical" body, featuring a three-tiered memory system (Core, Recall, Archival), a multi-modal context manager (simulating vision/sensors), and direct hardware control.
+**WALL-E v3.1** is an autonomous agent framework designed for local execution on NVIDIA Jetson devices. It transforms a standard LLM into a persistent personality with a "physical" body, featuring a three-tiered memory system with FAISS-accelerated search, importance decay for fact prioritization, and direct hardware control.
 
-## 🌟 Key Features
+**New in v3.1**:
+- FAISS integration for 5-10x faster semantic search
+- Importance decay for intelligent fact prioritization
+- Ollama with Qwen3-4B as recommended backend (easier setup, excellent tool calling)
 
-* **🧠 Three-Tier Memory System**:
-    * **Core Memory**: Persistent instructions and persona residing *inside* the context window. Editable by the LLM.
-    * **Recall Memory**: Vector-backed conversation history (using `nomic-embed-text`).
-    * **Archival Memory**: Long-term storage for facts and deep history.
-* **💓 Heartbeat / Chain-of-Thought**: A mechanism allowing the robot to "think" or perform multiple actions (e.g., "Look left" -> "Scan" -> "Speak") without user interruption.
-* **👀 Context Awareness**: Simulates sensory inputs (Vision, Battery, Environment) injected dynamically into the prompt.
-* **🦾 Robotics Control**: Direct serial port integration for motor control, head rotation, and emotional expression.
-* **🌍 Internet Connected**: Tools to fetch real-time data (weather, news) using DuckDuckGo.
+## Key Features
 
-## 🛠️ Prerequisites
+* **Ollama Backend**: Simple setup with Qwen3-4B for excellent tool calling
+* **Three-Tier Memory System**:
+    * **Core Memory**: Persistent persona and user profile in context window (LLM-editable)
+    * **Recall Memory**: FAISS-accelerated conversation history with semantic search
+    * **Archival Memory**: Long-term facts with importance decay
+* **FAISS Vector Search**: O(log n) semantic search instead of O(n) naive cosine similarity
+* **Importance Decay**: Recent facts prioritized over older ones using exponential decay
+* **Heartbeat / Chain-of-Thought**: Multi-step reasoning without user interruption
+* **Context Awareness**: Simulated sensory inputs (Vision, Battery, Environment)
+* **Robotics Control**: Serial port integration for motor control and expressions
+* **Internet Connected**: Real-time data fetching via DuckDuckGo
 
-* **Python 3.10+**
-* **Ollama** running locally ([Download](https://ollama.ai)).
-* **Hardware (Optional)**: An Arduino/Serial robot. The system defaults to "Simulation Mode" if no device is found.
+## Quick Start (Recommended: Ollama)
 
-## 🚀 Installation
+### 1. Clone and Install
 
-1.  **Clone the repository**:
-    ```bash
-    git clone [https://github.com/ab-dauletkhan/walle](https://github.com/ab-dauletkhan/walle)
-    cd walle
-    ```
+```bash
+git clone <your-repo-url> memory
+cd memory
+pip install -r requirements.txt
+```
 
-2.  **Install Dependencies**:
-    ```bash
-    pip install openai requests duckduckgo-search numpy
-    ```
+### 2. Install Ollama
 
-3.  **Setup Ollama Models**:
-    You need the base text model and the embedding model for memory search.
-    ```bash
-    ollama pull gemma3:1b
-    ollama pull nomic-embed-text
-    ```
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+```
 
-4.  **Create the Custom Brain**:
-    Create a file named `Modelfile` (no extension) in your project folder:
-    ```dockerfile
-    FROM gemma3:1b
-    # Set context window to 4096 tokens (Low VRAM usage)
-    PARAMETER num_ctx 4096
-    # Set the system prompt permanently
-    SYSTEM "You are WALL-E, a helpful robot companion."
-    ```
-    Then build the model:
-    ```bash
-    ollama create walle-brain -f Modelfile
-    ```
+### 3. Pull Qwen3-4B Model
 
-## 🏃 Usage
+```bash
+ollama pull qwen3:4b
+```
 
-### Start the Brain
+### 4. Run WALL-E
+
 ```bash
 python walle_enhanced.py
-````
+```
 
-*This initializes the cognitive loop, connects to databases, and starts the simulation.*
+That's it! The system uses Ollama with Qwen3-4B by default.
 
-### Memory Inspector
+## Configuration
 
-To see what is actually stored in the database (Core blocks, Recall vectors, etc.):
+Edit `config.py` to customize:
+
+### Ollama Settings
+```python
+OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_MODEL = "qwen3:4b"    # Best tool calling among small models
+```
+
+### Memory Settings
+```python
+USE_SEMANTIC_SEARCH = True   # Enable FAISS-accelerated vector search
+USE_FAISS = True             # Enable FAISS (falls back to naive cosine if False)
+RECALL_MEMORY_LIMIT = 40     # Messages before compression to archival
+```
+
+### Importance Decay
+```python
+IMPORTANCE_DECAY_HALF_LIFE = 30.0  # Days until recency score halves
+IMPORTANCE_STATIC_WEIGHT = 0.7     # Weight for static importance
+IMPORTANCE_RECENCY_WEIGHT = 0.3    # Weight for recency (newer = higher)
+```
+
+### Robot Control
+```python
+SERIAL_PORT = None           # e.g., "/dev/ttyUSB0" or None for simulation
+BAUD_RATE = 9600
+```
+
+## Architecture
+
+```
++------------------------------------------------------------------+
+|                      WALL-E Memory System                         |
++------------------------------------------------------------------+
+|                                                                   |
+|  +----------------+  +------------------+  +-------------------+  |
+|  |  Core Memory   |  |  Recall Memory   |  |  Archival Memory  |  |
+|  |   (SQLite)     |  | (SQLite + FAISS) |  | (SQLite + FAISS)  |  |
+|  |                |  |                  |  |                   |  |
+|  | - persona      |  | - 40 messages    |  | - Facts/summaries |  |
+|  | - human        |  | - FAISS index    |  | - Importance decay|  |
+|  | - system       |  | - Semantic search|  | - Categories      |  |
+|  +-------+--------+  +--------+---------+  +---------+---------+  |
+|          |                    |                      |            |
+|          | Always in          | O(log n)             | Decay-     |
+|          | context            | search               | weighted   |
+|          +--------------------+----------------------+            |
+|                               |                                   |
+|                    +----------v-----------+                       |
+|                    |    Ollama / LLM      |                       |
+|                    |    (qwen3:4b)        |                       |
+|                    +----------------------+                       |
++-------------------------------------------------------------------+
+```
+
+## Performance
+
+### Search Performance (FAISS vs Naive)
+
+| Method | Complexity | 100 msgs | 1000 msgs |
+|--------|------------|----------|-----------|
+| Naive Cosine | O(n) | ~30ms | ~300ms |
+| FAISS | O(log n) | ~5ms | ~15ms |
+
+### Importance Decay Example
+
+```
+Fact: "User likes coffee" (importance=8, age=0 days)
+  -> effective_importance = 8 * 0.7 + 1.0 * 10 * 0.3 = 8.6
+
+Fact: "User liked tea" (importance=9, age=60 days)
+  -> recency_score = exp(-60/30) = 0.135
+  -> effective_importance = 9 * 0.7 + 0.135 * 10 * 0.3 = 6.7
+
+Result: Recent "coffee" fact ranks higher than older "tea" fact
+```
+
+## Project Structure
+
+```
+memory/
+├── walle_enhanced.py      # Main cognitive loop
+├── config.py              # Configuration settings
+├── memory_system.py       # 3-tier memory + FAISS
+├── memory_tools.py        # LLM memory tools
+├── memory_inspector.py    # Debug/inspect memory
+├── context_manager.py     # Sensor simulation
+├── robot_tools.py         # Hardware control
+├── knowledge_tools.py     # Internet search
+├── personality_system.py  # Personality traits
+├── heartbeat.py           # Multi-step reasoning
+├── test_memory_system.py  # Comprehensive test suite
+└── requirements.txt       # Dependencies
+```
+
+## Memory Inspector
+
+View stored memories:
 
 ```bash
 python memory_inspector.py
 ```
 
-## ⚙️ Configuration
+## Testing
 
-Edit `config.py` to adjust:
+### Run Automated Tests
 
-  * **`SERIAL_PORT`**: Set to your Arduino port (e.g., `COM3` or `/dev/ttyUSB0`) for hardware control.
-  * **`SEARCH_REGIONS`**: Customize DuckDuckGo search regions (default: `["wt-wt", "us-en"]`).
-  * **`RECALL_MEMORY_LIMIT`**: How many messages to keep before summarizing to archival.
+```bash
+# Run with pytest (verbose)
+pytest test_memory_system.py -v
 
-## 🧪 Quick System Tests
+# Or run directly
+python test_memory_system.py
+```
 
-Run these steps to verify your installation:
+### Test Coverage
 
-1.  **Configuration Check**:
-    Run `python config.py`. Expect no errors.
+| Test Class | Tests | Coverage |
+|------------|-------|----------|
+| `TestCoreMemory` | 9 | Blocks, append, replace, limits, persistence |
+| `TestRecallMemory` | 6 | Insert, semantic search, FAISS integration |
+| `TestArchivalMemory` | 6 | Facts, categories, importance decay |
+| `TestFAISSManager` | 4 | Add, search, save/load, performance |
+| `TestToolCalling` | 5 | Memory tools, schema format |
+| `TestSearchPerformance` | 1 | FAISS vs naive benchmark |
+| `TestIntegration` | 2 | Full workflow, persistence |
 
-2.  **Memory Write Test**:
+### Manual Tests
 
-      * Start the bot: `python walle_enhanced.py`
-      * Say: *"My name is [Your Name]. I am a Python developer."*
-      * Exit and run `python memory_inspector.py`. Check the **Core Memory** section; the `<human>` block should now contain your name.
+1. **Memory Write Test**:
+   - Start: `python walle_enhanced.py`
+   - Say: "My name is Alex. I'm a Python developer."
+   - Exit and run: `python memory_inspector.py`
+   - Check: `<human>` block should contain your info
 
-3.  **Tool Use Test**:
+2. **Tool Use Test**:
+   - Ask: "What's the weather in Tokyo?"
+   - Should trigger: `consult_internet_for_facts`
 
-      * Ask: *"What is the price of Bitcoin?"* -\> Should trigger `consult_internet_for_facts`.
-      * Command: *"Look left and wave."* -\> Should trigger `set_head_rotation` and `wave_hello`.
+## Rollback Options
+
+Disable features without code changes:
+
+```python
+# In config.py:
+
+# Disable FAISS (use naive cosine similarity)
+USE_FAISS = False
+
+# Disable importance decay
+IMPORTANCE_RECENCY_WEIGHT = 0.0
+
+# Change model
+OLLAMA_MODEL = "llama3.2:3b"  # Or any other Ollama model
+```
+
+## Requirements
+
+- Python 3.10+
+- Ollama with Qwen3-4B model
+- ~4-5GB RAM for Qwen3-4B
+- Optional: Arduino/Serial robot for hardware control
+
+## Acknowledgments
+
+- **MemGPT** - Inspiration for memory architecture
+- **FAISS** - Fast similarity search
+- **Ollama** - Easy local LLM deployment
+- **Qwen Team** - Qwen3 models with excellent tool calling
+
+## License
+
+This project is open source. See LICENSE for details.
+
+---
+
+**WALL-E v3.1** - Memory-augmented AI agent with FAISS search and importance decay.

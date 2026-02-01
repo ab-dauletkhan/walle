@@ -1,6 +1,7 @@
 """
-WALL-E v2.6 - Stable Single Brain (No Routing)
-Features: Streaming, Metrics, Robust Search, Context
+WALL-E v3.1 - Memory-Augmented Robot Brain
+Features: Ollama/Qwen3 Backend, FAISS Search, Importance Decay, Streaming
+Optimized for NVIDIA Jetson Orin Nano (8GB VRAM)
 """
 import json
 import re
@@ -8,7 +9,6 @@ import time
 import sys
 from collections import deque
 from datetime import datetime
-from openai import OpenAI
 
 from config import conf
 
@@ -21,16 +21,19 @@ from heartbeat import HeartbeatManager, add_heartbeat_to_tools
 from knowledge_tools import get_knowledge_tools, KnowledgeToolExecutor
 from context_manager import ContextManager, EnvironmentContext, InteractionContext, SensorSimulator
 
-# Initialize Client
+# Initialize Client - Ollama is the recommended backend
+from openai import OpenAI
+print(f"🚀 Initializing Ollama backend with {conf.OLLAMA_MODEL}...")
 client = OpenAI(base_url=f"{conf.OLLAMA_BASE_URL}/v1", api_key="ollama")
+MODEL_NAME = conf.OLLAMA_MODEL
 
 # Initialize Systems
 core_mem = Memory()
-recall_mem = RecallMemory()
-archival_mem = ArchivalMemory()
+recall_mem = RecallMemory(use_semantic=conf.USE_SEMANTIC_SEARCH)
+archival_mem = ArchivalMemory(use_semantic=conf.USE_SEMANTIC_SEARCH)
 mem_exec = MemoryToolExecutor(core_mem, recall_mem, archival_mem)
 personality = PersonalityEngine.load()
-robot = RobotControlExecutor(serial_port=conf.SERIAL_PORT)
+robot = RobotControlExecutor(serial_port=conf.SERIAL_PORT, baud_rate=conf.BAUD_RATE)
 heartbeat = HeartbeatManager()
 knowledge_exec = KnowledgeToolExecutor()
 context_manager = ContextManager()
@@ -66,7 +69,7 @@ class PerformanceTimer:
 def summarize_text(text: str) -> str:
     try:
         resp = client.chat.completions.create(
-            model=conf.MODEL_NAME,
+            model=MODEL_NAME,
             messages=[{"role": "user", "content": f"Summarize this concisely:\n{text}"}],
             max_tokens=200
         )
@@ -129,7 +132,7 @@ def stream_chat_response(messages, tools, max_retries=2):
             timer.start() 
             
             stream = client.chat.completions.create(
-                model=conf.MODEL_NAME, # Uses the single model from config
+                model=MODEL_NAME,
                 messages=messages,
                 tools=tools,
                 tool_choice="auto",
@@ -259,132 +262,35 @@ def chat(user_input: str):
             session.add("assistant", final_content)
         break
 
-def get_walle_response(user_input: str) -> str:
-    """
-    Get WALL-E's response to user input without printing to stdout.
-    Returns the assistant's response text.
-    """
-    # 1. Context & Memory Setup
-    context_manager.update_interaction(InteractionContext(datetime.now(), recall_mem.get_count()))
-    
-    # Simulate sensor update occasionally
-    if recall_mem.get_count() % 5 == 0:
-        context_manager.update_environment(SensorSimulator.simulate_environment_context(battery=80 - recall_mem.get_count()))
-
-    memory_context = retrieve_relevant_context(user_input)
-    full_input = memory_context + user_input if memory_context else user_input
-    
-    recall_mem.insert("user", user_input)
-    session.add("user", full_input)
-    heartbeat.reset()
-    
-    # 2. Maintenance
-    if recall_mem.get_count() > conf.RECALL_MEMORY_LIMIT:
-        recall_mem.compress_old_memories(summarize_text, archival_mem)
-
-    # 3. Execution Loop (non-streaming version for API use)
-    iteration = 0
-    final_response = ""
-    
-    while iteration < 10:
-        iteration += 1
-        tools = get_robot_control_tools() + get_memory_tools() + get_personality_tools() + get_knowledge_tools()
-        tools = add_heartbeat_to_tools(tools)
-
-        messages = session.get_messages()
-        
-        try:
-            response = client.chat.completions.create(
-                model=conf.MODEL_NAME,
-                messages=messages,
-                tools=tools,
-                tool_choice="auto"
-            )
-            
-            message = response.choices[0].message
-            content = message.content or ""
-            tool_calls = message.tool_calls or []
-            
-            if not tool_calls:
-                if content:
-                    recall_mem.insert("assistant", content)
-                    session.add("assistant", content)
-                    final_response = content
-                break
-
-            session.add("assistant", content or "Thinking...", tool_calls)
-            hb_req = False
-            
-            for tc in tool_calls:
-                name = tc.function.name
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except:
-                    args = {}
-
-                if args.pop("request_heartbeat", False): 
-                    hb_req = True
-                
-                try:
-                    if name == "consult_internet_for_facts":
-                        result = knowledge_exec.execute(name, args)
-                        hb_req = True
-                    elif name in get_robot_tool_names():
-                        result = robot.execute(name, args)
-                    elif name == "set_personality":
-                        if hasattr(personality.profile, args['trait']):
-                            setattr(personality.profile, args['trait'], args['value'])
-                            personality.save()
-                            result = "Personality updated."
-                    else:
-                        result = mem_exec.execute(name, args)
-                except Exception as e:
-                    result = f"Error: {e}"
-
-                session.add_tool_result(tc.id, name, str(result)[:1000])
-
-            if hb_req and heartbeat.can_heartbeat():
-                heartbeat.request_heartbeat()
-                continue
-            
-            # Final response after tool calls
-            final_resp = client.chat.completions.create(
-                model=conf.MODEL_NAME,
-                messages=session.get_messages(),
-                tools=[]
-            )
-            final_content = final_resp.choices[0].message.content or ""
-            if final_content:
-                recall_mem.insert("assistant", final_content, tools_used=[t.function.name for t in tool_calls])
-                session.add("assistant", final_content)
-                final_response = final_content
-            break
-            
-        except Exception as e:
-            final_response = f"Error generating response: {e}"
-            break
-    
-    return final_response
-
-
 def main():
-    print("🤖 WALL-E Online v2.6 (Stable Single-Brain)")
-    
+    print(f"🤖 WALL-E Online v3.1 - Ollama ({conf.OLLAMA_MODEL})")
+    print(f"   Memory: {'Semantic' if conf.USE_SEMANTIC_SEARCH else 'Text'} Search | Embedding: {conf.EMBEDDING_MODEL}")
+
     if not conf.validate():
-        print("⚠️ System checks failed. Please check config.py or run 'ollama serve'")
+        print(f"⚠️ System checks failed. Please check Ollama configuration.")
+        print(f"   Make sure Ollama is running: ollama serve")
+        print(f"   And model is pulled: ollama pull {conf.OLLAMA_MODEL}")
         x = input("Continue anyway? (y/n): ")
         if x.lower() != 'y': return
 
     context_manager.update_environment(SensorSimulator.simulate_environment_context())
     
-    while True:
-        try:
-            u = input("\nYou: ").strip()
-            if not u: continue
-            if u.lower() in ['exit', 'quit']: break
-            chat(u)
-        except KeyboardInterrupt:
-            break
+    try:
+        while True:
+            try:
+                u = input("\nYou: ").strip()
+                if not u: continue
+                if u.lower() in ['exit', 'quit']:
+                    print("\n👋 Shutting down WALL-E...")
+                    break
+                chat(u)
+            except KeyboardInterrupt:
+                print("\n\n👋 Keyboard interrupt received. Shutting down...")
+                break
+    finally:
+        # Cleanup resources
+        robot.close()
+        print("✅ WALL-E shutdown complete")
 
 if __name__ == "__main__":
     main()
