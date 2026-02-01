@@ -19,9 +19,11 @@ class HeartbeatManager:
         self.count += 1
 
 def add_heartbeat_to_tools(tools: List[Dict]) -> List[Dict]:
+    """Add heartbeat parameter to tools. Uses deep copy to avoid mutating originals."""
+    import copy
     new_tools = []
     for t in tools:
-        tc = t.copy()
+        tc = copy.deepcopy(t)  # Deep copy to avoid mutating original tool schemas
         props = tc['function']['parameters']['properties']
         props['request_heartbeat'] = {
             "type": "boolean",

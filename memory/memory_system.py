@@ -114,6 +114,7 @@ class FAISSManager:
         self.id_map = []  # Maps FAISS index position to database row ID
         self._insertions_since_save = 0
         self._save_lock = threading.Lock()
+        self._index_lock = threading.RLock()  # RLock for index operations (allows nested calls)
         self._save_in_progress = False
 
         if _faiss_available:
@@ -149,7 +150,7 @@ class FAISSManager:
         self.id_map = []
 
     def add(self, embedding_bytes: bytes, row_id: int):
-        """Add single embedding to index"""
+        """Add single embedding to index (thread-safe)"""
         if not _faiss_available or self.index is None:
             return
 
@@ -157,13 +158,14 @@ class FAISSManager:
         # Normalize (embeddings should already be normalized, but ensure it)
         faiss.normalize_L2(vec)
 
-        self.index.add(vec)
-        self.id_map.append(row_id)
-        self._insertions_since_save += 1
+        with self._index_lock:
+            self.index.add(vec)
+            self.id_map.append(row_id)
+            self._insertions_since_save += 1
 
     def search(self, query_embedding_bytes: bytes, k: int = 10) -> List[tuple]:
         """
-        Search for k nearest neighbors.
+        Search for k nearest neighbors (thread-safe).
         Returns: List of (row_id, score) tuples, sorted by score descending
         """
         if not _faiss_available or self.index is None or self.index.ntotal == 0:
@@ -172,15 +174,17 @@ class FAISSManager:
         q_vec = np.frombuffer(query_embedding_bytes, dtype=np.float32).reshape(1, -1)
         faiss.normalize_L2(q_vec)
 
-        # Limit k to available vectors
-        k = min(k, self.index.ntotal)
-
-        distances, indices = self.index.search(q_vec, k)
+        with self._index_lock:
+            # Limit k to available vectors
+            k = min(k, self.index.ntotal)
+            distances, indices = self.index.search(q_vec, k)
+            # Copy id_map reference while holding lock
+            id_map_snapshot = list(self.id_map)
 
         results = []
         for i, idx in enumerate(indices[0]):
-            if 0 <= idx < len(self.id_map):
-                results.append((self.id_map[idx], float(distances[0][i])))
+            if 0 <= idx < len(id_map_snapshot):
+                results.append((id_map_snapshot[idx], float(distances[0][i])))
 
         return results
 
@@ -219,11 +223,14 @@ class FAISSManager:
             self._save_in_progress = False
 
     def rebuild_from_db(self, db_path: str, table: str = "recall_memory"):
-        """Rebuild index from database embeddings"""
+        """Rebuild index from database embeddings (thread-safe)"""
         if not _faiss_available:
             return
 
-        self._create_new_index()
+        # Validate table name to prevent SQL injection
+        allowed_tables = {"recall_memory", "archival_memory"}
+        if table not in allowed_tables:
+            raise ValueError(f"Invalid table name: {table}. Allowed: {allowed_tables}")
 
         with sqlite3.connect(db_path) as conn:
             cursor = conn.execute(f"SELECT id, embedding FROM {table} WHERE embedding IS NOT NULL")
@@ -233,16 +240,21 @@ class FAISSManager:
             return
 
         embeddings = []
+        new_id_map = []
         for row_id, emb_bytes in rows:
             vec = np.frombuffer(emb_bytes, dtype=np.float32)
             embeddings.append(vec)
-            self.id_map.append(row_id)
+            new_id_map.append(row_id)
 
         embeddings_array = np.array(embeddings, dtype=np.float32)
         faiss.normalize_L2(embeddings_array)
-        self.index.add(embeddings_array)
 
-        self._insertions_since_save = 0
+        with self._index_lock:
+            self._create_new_index()
+            self.index.add(embeddings_array)
+            self.id_map = new_id_map
+            self._insertions_since_save = 0
+
         print(f"✅ FAISS index rebuilt: {len(rows)} vectors from {table}")
 
     def needs_save(self, threshold: int = 10) -> bool:
@@ -660,8 +672,12 @@ class ArchivalMemory(FAISSIndexMixin):
             if timestamp:
                 try:
                     if isinstance(timestamp, str):
-                        # Parse ISO format timestamp
-                        ts = datetime.fromisoformat(timestamp.replace('Z', '+00:00').replace('+00:00', ''))
+                        # Parse ISO format timestamp (strip timezone suffix for naive comparison)
+                        # Handle: "2024-01-01T12:00:00", "...Z", "...+00:00", "...+05:00"
+                        clean_ts = timestamp.replace('Z', '')
+                        if '+' in clean_ts[10:]:  # Only check after date part
+                            clean_ts = clean_ts.rsplit('+', 1)[0]
+                        ts = datetime.fromisoformat(clean_ts)
                     else:
                         ts = timestamp
                     age_days = (current_time - ts).total_seconds() / 86400

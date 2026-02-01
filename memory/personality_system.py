@@ -39,8 +39,19 @@ class PersonalityEngine:
             return cls()
 
     def save(self):
-        with open("personality.json", "w") as f:
-            json.dump(self.profile.__dict__, f)
+        """Atomic save - write to temp file then rename to prevent corruption."""
+        import os
+        import tempfile
+
+        temp_fd, temp_path = tempfile.mkstemp(suffix='.json', dir='.')
+        try:
+            with os.fdopen(temp_fd, 'w') as f:
+                json.dump(self.profile.__dict__, f)
+            os.replace(temp_path, "personality.json")  # Atomic on POSIX
+        except Exception:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
 
 def get_personality_tools():
     return [{

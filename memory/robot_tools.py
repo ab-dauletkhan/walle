@@ -62,20 +62,23 @@ class RobotControlExecutor(BaseToolExecutor):
             print("🔌 Running in simulation mode (no serial port specified)")
             self.simulation = True
 
-    def send_command(self, cmd: str):
-        """Send command to robot via serial or simulate."""
+    def send_command(self, cmd: str) -> str:
+        """Send command to robot via serial or simulate. Always returns status string."""
         if self.simulation:
             print(f"🔌 [SERIAL SIM] >> {cmd}")
-        else:
-            try:
-                if self.serial_connection and self.serial_connection.is_open:
-                    self.serial_connection.write(f"{cmd}\n".encode())
-                    self.serial_connection.flush()
-                else:
-                    print(f"⚠️ Serial connection closed, simulating: {cmd}")
-            except Exception as e:
-                print(f"⚠️ Serial Error: {e}")
-                return f"Serial Error: {e}"
+            return "OK (simulated)"
+
+        try:
+            if self.serial_connection and self.serial_connection.is_open:
+                self.serial_connection.write(f"{cmd}\n".encode())
+                self.serial_connection.flush()
+                return "OK"
+            else:
+                print(f"⚠️ Serial connection closed, simulating: {cmd}")
+                return "OK (connection closed, simulated)"
+        except Exception as e:
+            print(f"⚠️ Serial Error: {e}")
+            return f"Serial Error: {e}"
 
     def close(self):
         """Close serial connection properly."""

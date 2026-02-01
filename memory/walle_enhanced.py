@@ -241,12 +241,13 @@ def chat(user_input: str):
             try:
                 args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError as e:
-                print(f"   ⚠️ JSON Error in args: {e}")
-                args = {}
+                print(f"   ⚠️ JSON Error in args for {name}: {e}")
+                session.add_tool_result(tc.id, name, f"Error: Invalid JSON arguments - {e}")
+                continue  # Skip this tool call, don't execute with empty args
 
             if args.pop("request_heartbeat", False): hb_req = True
             print(f"   ⚙️ Tool: {name}")
-            
+
             try:
                 if name == "consult_internet_for_facts":
                     result = knowledge_exec.execute(name, args)
