@@ -21,6 +21,7 @@ from robot_tools import get_robot_control_tools, RobotControlExecutor, get_robot
 from heartbeat import HeartbeatManager, add_heartbeat_to_tools
 from knowledge_tools import get_knowledge_tools, KnowledgeToolExecutor
 from context_manager import ContextManager, EnvironmentContext, InteractionContext, SensorSimulator
+from communication_tools import get_communication_tools, CommunicationExecutor, SendMessageArgs
 
 # Initialize Client - Ollama is the recommended backend
 from openai import OpenAI
@@ -39,6 +40,7 @@ robot = RobotControlExecutor(serial_port=conf.SERIAL_PORT, baud_rate=conf.BAUD_R
 heartbeat = HeartbeatManager()
 knowledge_exec = KnowledgeToolExecutor()
 context_manager = ContextManager()
+comm_exec = CommunicationExecutor()
 
 # --- TIMER CLASS ---
 class PerformanceTimer:
@@ -100,18 +102,18 @@ def retrieve_relevant_context(query: str) -> str:
 
 def get_system_prompt():
     context_str = context_manager.get_context_string()
-    return f"""You are WALL-E, a helpful robot companion with internet access.
+    return f"""You are WALL-E, a helpful robot companion.
 {personality.get_system_prompt_addition()}
 
-**PROTOCOL:**
-1. **SEARCH**: Use `consult_internet_for_facts` for current news, prices, weather, or specific facts (2024-2025).
-2. **MEMORY**: Use internal knowledge for history, math, coding, or general conversation.
-3. **ROBOT**: You can control your body. Use movement tools to express emotion.
+RULES:
+1. Your text = internal thought (user can't see)
+2. To reply to user: call send_message tool
+3. To remember info: call core_memory_append THEN send_message
+4. Keep thoughts SHORT. Act, don't over-analyze.
 
-**CONTEXT:**
+IMPORTANT: Actually CALL the tools, don't just think about them!
+
 {context_str}
-
-**MEMORY:**
 {core_mem.compile()}
 """
 
@@ -132,16 +134,20 @@ class ChatSession:
 
 session = ChatSession()
 
-def stream_chat_response(messages, tools, max_retries=2):
-    """Stream response with Performance Metrics"""
-    timer = PerformanceTimer() 
-    
+def stream_chat_response(messages, tools, max_retries=2, show_inner_thoughts=True):
+    """
+    Stream response with inner monologue support.
+
+    In MemGPT style:
+    - Raw content is inner thoughts (shown with 💭 prefix if show_inner_thoughts=True)
+    - User only sees send_message tool outputs
+    """
+    timer = PerformanceTimer()
+
     for attempt in range(max_retries):
         try:
-            print("🤖 WALL-E: ", end="", flush=True)
-            
-            timer.start() 
-            
+            timer.start()
+
             stream = client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=messages,
@@ -149,19 +155,28 @@ def stream_chat_response(messages, tools, max_retries=2):
                 tool_choice="auto",
                 stream=True
             )
-            
+
             full_content = ""
             tool_calls_map = {}
-            
+            has_tool_calls = False
+            inner_thought_started = False
+
             for chunk in stream:
-                timer.mark_first_token() 
-                
+                timer.mark_first_token()
+
                 delta = chunk.choices[0].delta
                 if delta.content:
-                    print(delta.content, end="", flush=True)
                     full_content += delta.content
-                    timer.token_count += 1 
+                    timer.token_count += 1
+                    # Show inner thoughts with prefix (debug mode)
+                    if show_inner_thoughts:
+                        if not inner_thought_started:
+                            print("   💭 ", end="", flush=True)
+                            inner_thought_started = True
+                        print(delta.content, end="", flush=True)
+
                 if delta.tool_calls:
+                    has_tool_calls = True
                     for tc in delta.tool_calls:
                         idx = tc.index
                         if idx not in tool_calls_map:
@@ -169,10 +184,13 @@ def stream_chat_response(messages, tools, max_retries=2):
                         if tc.id: tool_calls_map[idx]["id"] += tc.id
                         if tc.function.name: tool_calls_map[idx]["func"]["name"] += tc.function.name
                         if tc.function.arguments: tool_calls_map[idx]["func"]["args"] += tc.function.arguments
-            
-            timer.stop() 
-            timer.report() 
-            
+
+            if inner_thought_started:
+                print()  # Newline after inner thoughts
+
+            timer.stop()
+            timer.report()
+
             # Reconstruct Tools
             tool_calls_list = []
             for idx in sorted(tool_calls_map.keys()):
@@ -184,13 +202,13 @@ def stream_chat_response(messages, tools, max_retries=2):
                     function=Function(name=t["func"]["name"], arguments=t["func"]["args"]),
                     type="function"
                 ))
-            
+
             return full_content, tool_calls_list
-            
+
         except Exception as e:
             print(f"\n⚠️ Stream interrupted (Attempt {attempt+1}/{max_retries}): {e}")
             time.sleep(1)
-    
+
     print("❌ Failed to generate response.")
     return "", []
 
@@ -218,24 +236,32 @@ def chat(user_input: str):
     if recall_mem.get_count() > conf.RECALL_MEMORY_LIMIT:
         recall_mem.compress_old_memories(summarize_text, archival_mem)
 
-    # 3. Execution Loop
+    # 3. Execution Loop (MemGPT-style inner monologue)
     iteration = 0
+    user_received_message = False
+
     while iteration < 10:
         iteration += 1
-        tools = get_robot_control_tools() + get_memory_tools() + get_personality_tools() + get_knowledge_tools()
+        # Include send_message as FIRST tool - it's the primary way to respond
+        tools = get_communication_tools() + get_robot_control_tools() + get_memory_tools() + get_personality_tools() + get_knowledge_tools()
         tools = add_heartbeat_to_tools(tools)
 
         content, tool_calls = stream_chat_response(session.get_messages(), tools)
-        
+
+        # No tool calls = just inner thought, need to prompt for send_message
         if not tool_calls:
             if content:
-                recall_mem.insert("assistant", content)
+                # Inner thought without action - save but don't show
                 session.add("assistant", content)
+                # If no message was sent to user, we need another turn
+                if not user_received_message:
+                    print("   ⚠️ No send_message called, prompting...")
+                    continue
             break
 
-        session.add("assistant", content or "Thinking...", tool_calls)
+        session.add("assistant", content or "", tool_calls)
         hb_req = False
-        
+
         for tc in tool_calls:
             name = tc.function.name
             try:
@@ -243,9 +269,33 @@ def chat(user_input: str):
             except json.JSONDecodeError as e:
                 print(f"   ⚠️ JSON Error in args for {name}: {e}")
                 session.add_tool_result(tc.id, name, f"Error: Invalid JSON arguments - {e}")
-                continue  # Skip this tool call, don't execute with empty args
+                continue
 
-            if args.pop("request_heartbeat", False): hb_req = True
+            if args.pop("request_heartbeat", False):
+                hb_req = True
+
+            # Handle send_message - THIS is what user sees
+            if name == "send_message":
+                try:
+                    validated = SendMessageArgs.model_validate(args)
+                    message = validated.message
+                except Exception as e:
+                    print(f"   ⚠️ Validation error: {e}")
+                    session.add_tool_result(tc.id, name, f"Validation error: {e}")
+                    continue
+
+                if message and not user_received_message:  # Only first message
+                    print(f"🤖 WALL-E: {message}")
+                    recall_mem.insert("assistant", message)
+                    user_received_message = True
+                    if validated.request_heartbeat:
+                        hb_req = True
+                    result = "Message delivered to user"
+                else:
+                    result = "Message already sent (duplicate ignored)"
+                session.add_tool_result(tc.id, name, result)
+                continue
+
             print(f"   ⚙️ Tool: {name}")
 
             try:
@@ -262,19 +312,20 @@ def chat(user_input: str):
                 result = f"Error: {e}"
 
             session.add_tool_result(tc.id, name, str(result)[:1000])
-            if name == "consult_internet_for_facts": print(f"   🌍 Search feedback loop active...")
+            if name == "consult_internet_for_facts":
+                print(f"   🌍 Search feedback loop active...")
 
         if hb_req and heartbeat.can_heartbeat():
             heartbeat.request_heartbeat()
             print("   💓 Thinking chain active...")
             continue
-        
-        print("   (Finalizing...)")
-        final_content, _ = stream_chat_response(session.get_messages(), tools=[])
-        if final_content:
-            recall_mem.insert("assistant", final_content, tools_used=[t.function.name for t in tool_calls])
-            session.add("assistant", final_content)
-        break
+
+        # If user got a message, we're done
+        if user_received_message:
+            break
+
+        # Otherwise continue to get send_message
+        print("   (Continuing for response...)")
 
 def main():
     print(f"🤖 WALL-E Online v3.1 - Ollama ({conf.OLLAMA_MODEL})")

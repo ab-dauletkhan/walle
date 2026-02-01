@@ -16,40 +16,48 @@ from dataclasses import dataclass, field
 from config import conf
 
 # Lazy load embedding model to save memory
+import threading
+
 _embedding_model = None
 _embedding_device = None
+_embedding_lock = threading.Lock()
 
 def get_embedding_model():
-    """Lazy load sentence-transformer model"""
+    """Lazy load sentence-transformer model (thread-safe)"""
     global _embedding_model, _embedding_device
 
-    if _embedding_model is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-            import torch
+    if _embedding_model is not None:
+        return _embedding_model
 
-            # Determine device
-            _embedding_device = conf.EMBEDDING_DEVICE if torch.cuda.is_available() else "cpu"
+    with _embedding_lock:
+        # Double-check after acquiring lock
+        if _embedding_model is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                # torch is already imported at module level (before faiss)
 
-            print(f"🔧 Loading embedding model: {conf.EMBEDDING_MODEL} on {_embedding_device}...")
-            _embedding_model = SentenceTransformer(
-                conf.EMBEDDING_MODEL,
-                device=_embedding_device
-            )
+                # Determine device
+                _embedding_device = conf.EMBEDDING_DEVICE if torch.cuda.is_available() else "cpu"
 
-            # Optimize for inference
-            if _embedding_device == "cuda":
-                _embedding_model.half()  # Use FP16 for GPU efficiency
+                print(f"🔧 Loading embedding model: {conf.EMBEDDING_MODEL} on {_embedding_device}...")
+                _embedding_model = SentenceTransformer(
+                    conf.EMBEDDING_MODEL,
+                    device=_embedding_device
+                )
 
-            print(f"✅ Embedding model loaded")
+                # Optimize for inference
+                if _embedding_device == "cuda":
+                    _embedding_model.half()  # Use FP16 for GPU efficiency
 
-        except ImportError:
-            print("⚠️ sentence-transformers not installed. Embeddings disabled.")
-            print("   Install with: pip install sentence-transformers")
-            return None
-        except Exception as e:
-            print(f"⚠️ Failed to load embedding model: {e}")
-            return None
+                print(f"✅ Embedding model loaded")
+
+            except ImportError:
+                print("⚠️ sentence-transformers not installed. Embeddings disabled.")
+                print("   Install with: pip install sentence-transformers")
+                return None
+            except Exception as e:
+                print(f"⚠️ Failed to load embedding model: {e}")
+                return None
 
     return _embedding_model
 
@@ -94,6 +102,9 @@ def get_embedding(text: str) -> Optional[bytes]:
 
 _faiss_available = False
 try:
+    # IMPORTANT: Import torch BEFORE faiss to avoid OpenMP segfault on macOS
+    # This is a known compatibility issue between PyTorch and FAISS
+    import torch
     import faiss
     _faiss_available = True
 except ImportError:

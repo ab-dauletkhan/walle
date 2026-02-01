@@ -7,7 +7,7 @@ from pathlib import Path
 class Config:
     # --- Ollama Settings (Recommended Backend) ---
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "qwen2.5:3B"  # Best tool calling among small models
+    OLLAMA_MODEL: str = "qwen3:4b"  # Best tool calling among small models
 
     # --- Embedding Model (Lightweight for Jetson) ---
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"  # 80MB model
