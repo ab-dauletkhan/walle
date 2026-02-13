@@ -31,7 +31,7 @@ def get_communication_tools():
             "type": "function",
             "function": {
                 "name": "send_message",
-                "description": "Send a message to the user. You MUST use this tool to communicate. Your text output is internal thought - user can't see it.",
+                "description": "Send a message to the user. ONLY way to communicate. Keep messages to 1-3 sentences (TTS output). Your raw text is invisible internal thought.",
                 "parameters": SendMessageArgs.model_json_schema()
             }
         }

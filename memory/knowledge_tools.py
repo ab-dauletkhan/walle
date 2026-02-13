@@ -82,7 +82,9 @@ class KnowledgeToolExecutor(BaseToolExecutor):
         else:
             search_query = f"{clean_query} english" if "english" not in clean_query.lower() else clean_query
             
-        print(f"   🌍 Searching: '{search_query}'...")
+        from config import conf
+        if conf.RUN_MODE == "debug":
+            print(f"   🌍 Searching: '{search_query}'...")
 
         best_results = []
 
@@ -105,7 +107,8 @@ class KnowledgeToolExecutor(BaseToolExecutor):
                             break 
                             
                     except Exception as e:
-                        print(f"   ⚠️ Region {region} failed: {e}")
+                        if conf.RUN_MODE == "debug":
+                            print(f"   ⚠️ Region {region} failed: {e}")
                         continue
             
             if not best_results:
@@ -115,9 +118,10 @@ class KnowledgeToolExecutor(BaseToolExecutor):
             for i, res in enumerate(best_results, 1):
                 formatted += f"\n[{i}] {res['title']}\n    Source: {res.get('href', 'N/A')}\n    Summary: {res['body']}\n"
             
-            formatted += "\n[INSTRUCTION: Answer the user using these facts. Use [1] for citations.]"
+            formatted += "\n[Use these facts to answer in 1-3 sentences. Cite with [1].]"
             return formatted
             
         except Exception as e:
-            print(f"❌ Search Error: {e}")
-            return f"❌ Search failed: {str(e)}"
+            if conf.RUN_MODE == "debug":
+                print(f"❌ Search Error: {e}")
+            return f"Search failed: {str(e)}"

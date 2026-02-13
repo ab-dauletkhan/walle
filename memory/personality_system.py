@@ -12,11 +12,7 @@ class PersonalityProfile:
     sass: int = 20
     
     def get_system_prompt_addition(self):
-        return f"""PERSONALITY SETTINGS:
-        - Humor: {self.humor}%
-        - Honesty: {self.honesty}%
-        - Sass: {self.sass}%
-        Adjust your tone and responsiveness to reflect these traits naturally."""
+        return f"Personality: humor={self.humor}%, honesty={self.honesty}%, sass={self.sass}%. Reflect these in tone."
 
 class PersonalityEngine:
     def __init__(self, profile=None):
