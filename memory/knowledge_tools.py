@@ -8,7 +8,7 @@ except ImportError:
     print("⚠️ duckduckgo_search not installed. Web search disabled.")
     print("   Install with: pip install duckduckgo-search")
     DDGS = None
-from config import conf
+from config import conf, debug_print
 
 def get_knowledge_tools():
     return [
@@ -82,9 +82,7 @@ class KnowledgeToolExecutor(BaseToolExecutor):
         else:
             search_query = f"{clean_query} english" if "english" not in clean_query.lower() else clean_query
             
-        from config import conf
-        if conf.RUN_MODE == "debug":
-            print(f"   🌍 Searching: '{search_query}'...")
+        debug_print(f"   🌍 Searching: '{search_query}'...")
 
         best_results = []
 
@@ -107,8 +105,7 @@ class KnowledgeToolExecutor(BaseToolExecutor):
                             break 
                             
                     except Exception as e:
-                        if conf.RUN_MODE == "debug":
-                            print(f"   ⚠️ Region {region} failed: {e}")
+                        debug_print(f"   ⚠️ Region {region} failed: {e}")
                         continue
             
             if not best_results:
@@ -122,6 +119,5 @@ class KnowledgeToolExecutor(BaseToolExecutor):
             return formatted
             
         except Exception as e:
-            if conf.RUN_MODE == "debug":
-                print(f"❌ Search Error: {e}")
+            debug_print(f"❌ Search Error: {e}")
             return f"Search failed: {str(e)}"

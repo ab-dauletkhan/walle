@@ -11,7 +11,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
-from config import conf
+from config import conf, debug_print
 
 # Import subsystems
 from memory_system import Memory, RecallMemory, ArchivalMemory
@@ -25,8 +25,7 @@ from communication_tools import get_communication_tools, CommunicationExecutor, 
 
 # Initialize Client - Ollama is the recommended backend
 from openai import OpenAI
-if conf.RUN_MODE == "debug":
-    print(f"🚀 Initializing Ollama backend with {conf.OLLAMA_MODEL}...")
+debug_print(f"🚀 Initializing Ollama backend with {conf.OLLAMA_MODEL}...")
 client = OpenAI(base_url=f"{conf.OLLAMA_BASE_URL}/v1", api_key="ollama")
 MODEL_NAME = conf.OLLAMA_MODEL
 
@@ -44,9 +43,6 @@ context_manager = ContextManager()
 comm_exec = CommunicationExecutor()
 
 # --- TIMER CLASS ---
-def is_debug():
-    return conf.RUN_MODE == "debug"
-
 def is_test():
     return conf.RUN_MODE == "test"
 
@@ -59,8 +55,7 @@ class PerformanceTimer:
 
     def start(self):
         self.start_time = time.perf_counter()
-        if is_debug():
-            print(f"\n⏱️  [Timer Started]", end="", flush=True)
+        debug_print(f"\n⏱️  [Timer Started]", end="", flush=True)
 
     def mark_first_token(self):
         if self.first_token_time == 0:
@@ -76,8 +71,7 @@ class PerformanceTimer:
         ttft = self.first_token_time - self.start_time if self.first_token_time > 0 else total_duration
         tps = self.token_count / total_duration if total_duration > 0 else 0
 
-        if is_debug():
-            print(f"\n   [⏱️ Metrics: TTFT: {ttft*1000:.0f}ms | Total: {total_duration:.2f}s | Speed: {tps:.1f} tok/s]")
+        debug_print(f"\n   [⏱️ Metrics: TTFT: {ttft*1000:.0f}ms | Total: {total_duration:.2f}s | Speed: {tps:.1f} tok/s]")
 
 def summarize_text(text: str) -> str:
     try:
@@ -168,7 +162,7 @@ def stream_chat_response(messages, tools, max_retries=2):
                 if delta.content:
                     full_content += delta.content
                     timer.token_count += 1
-                    if is_debug():
+                    if conf.RUN_MODE == "debug":
                         if not inner_thought_started:
                             print("   💭 ", end="", flush=True)
                             inner_thought_started = True
@@ -205,12 +199,10 @@ def stream_chat_response(messages, tools, max_retries=2):
             return full_content, tool_calls_list
 
         except Exception as e:
-            if is_debug():
-                print(f"\n⚠️ Stream interrupted (Attempt {attempt+1}/{max_retries}): {e}")
+            debug_print(f"\n⚠️ Stream interrupted (Attempt {attempt+1}/{max_retries}): {e}")
             time.sleep(1)
 
-    if is_debug():
-        print("❌ Failed to generate response.")
+    debug_print("❌ Failed to generate response.")
     return "", []
 
 def chat(user_input: str):
@@ -254,8 +246,7 @@ def chat(user_input: str):
             if content:
                 session.add("assistant", content)
                 if not user_received_message:
-                    if is_debug():
-                        print("   ⚠️ No send_message called, prompting...")
+                    debug_print("   ⚠️ No send_message called, prompting...")
                     continue
             break
 
@@ -267,8 +258,7 @@ def chat(user_input: str):
             try:
                 args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError as e:
-                if is_debug():
-                    print(f"   ⚠️ JSON Error in args for {name}: {e}")
+                debug_print(f"   ⚠️ JSON Error in args for {name}: {e}")
                 session.add_tool_result(tc.id, name, f"Error: Invalid JSON arguments - {e}")
                 continue
 
@@ -281,15 +271,13 @@ def chat(user_input: str):
                     validated = SendMessageArgs.model_validate(args)
                     message = validated.message
                 except Exception as e:
-                    if is_debug():
-                        print(f"   ⚠️ Validation error: {e}")
+                    debug_print(f"   ⚠️ Validation error: {e}")
                     session.add_tool_result(tc.id, name, f"Validation error: {e}")
                     continue
 
                 if message and not user_received_message:
-                    if is_debug():
-                        print(f"🤖 WALL-E: {message}")
-                    elif is_test():
+                    debug_print(f"🤖 WALL-E: {message}")
+                    if is_test():
                         print(message)
                     recall_mem.insert("assistant", message)
                     user_received_message = True
@@ -299,8 +287,7 @@ def chat(user_input: str):
                 session.add_tool_result(tc.id, name, result)
                 continue
 
-            if is_debug():
-                print(f"   ⚙️ Tool: {name}")
+            debug_print(f"   ⚙️ Tool: {name}")
 
             try:
                 if name == "consult_internet_for_facts":
@@ -316,8 +303,8 @@ def chat(user_input: str):
                 result = f"Error: {e}"
 
             session.add_tool_result(tc.id, name, str(result)[:1000])
-            if is_debug() and name == "consult_internet_for_facts":
-                print(f"   🌍 Search feedback loop active...")
+            if name == "consult_internet_for_facts":
+                debug_print(f"   🌍 Search feedback loop active...")
 
         # If user got a message, we're done - don't continue even with heartbeat
         if user_received_message:
@@ -326,25 +313,21 @@ def chat(user_input: str):
         # Only continue for heartbeat if we haven't responded yet
         if hb_req and heartbeat.can_heartbeat():
             heartbeat.request_heartbeat()
-            if is_debug():
-                print("   💓 Thinking chain active...")
+            debug_print("   💓 Thinking chain active...")
             continue
 
-        if is_debug():
-            print("   (Continuing for response...)")
+        debug_print("   (Continuing for response...)")
 
 def main():
-    if is_debug():
-        print(f"🤖 WALL-E Online v3.1 - Ollama ({conf.OLLAMA_MODEL}) [DEBUG MODE]")
-        print(f"   Memory: {'Semantic' if conf.USE_SEMANTIC_SEARCH else 'Text'} Search | Embedding: {conf.EMBEDDING_MODEL}")
-    elif is_test():
+    debug_print(f"🤖 WALL-E Online v3.1 - Ollama ({conf.OLLAMA_MODEL}) [DEBUG MODE]")
+    debug_print(f"   Memory: {'Semantic' if conf.USE_SEMANTIC_SEARCH else 'Text'} Search | Embedding: {conf.EMBEDDING_MODEL}")
+    if is_test():
         print(f"[WALL-E v3.1 | TEST MODE | {conf.OLLAMA_MODEL}]")
 
     if not conf.validate():
-        if is_debug():
-            print(f"⚠️ System checks failed. Please check Ollama configuration.")
-            print(f"   Make sure Ollama is running: ollama serve")
-            print(f"   And model is pulled: ollama pull {conf.OLLAMA_MODEL}")
+        debug_print(f"⚠️ System checks failed. Please check Ollama configuration.")
+        debug_print(f"   Make sure Ollama is running: ollama serve")
+        debug_print(f"   And model is pulled: ollama pull {conf.OLLAMA_MODEL}")
         x = input("Continue anyway? (y/n): ")
         if x.lower() != 'y': return
 
@@ -356,18 +339,15 @@ def main():
                 u = input("\nYou: ").strip()
                 if not u: continue
                 if u.lower() in ['exit', 'quit']:
-                    if is_debug():
-                        print("\n👋 Shutting down WALL-E...")
+                    debug_print("\n👋 Shutting down WALL-E...")
                     break
                 chat(u)
             except KeyboardInterrupt:
-                if is_debug():
-                    print("\n\n👋 Keyboard interrupt received. Shutting down...")
+                debug_print("\n\n👋 Keyboard interrupt received. Shutting down...")
                 break
     finally:
         robot.close()
-        if is_debug():
-            print("✅ WALL-E shutdown complete")
+        debug_print("✅ WALL-E shutdown complete")
 
 if __name__ == "__main__":
     main()

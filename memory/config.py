@@ -74,3 +74,8 @@ class Config:
         return cls()
 
 conf = Config.load()
+
+def debug_print(*args, **kwargs):
+    """Print only in debug mode. Drop-in replacement for print()."""
+    if conf.RUN_MODE == "debug":
+        print(*args, **kwargs)
