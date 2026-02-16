@@ -302,7 +302,7 @@ def chat(user_input: str):
             except Exception as e:
                 result = f"Error: {e}"
 
-            session.add_tool_result(tc.id, name, str(result)[:1000])
+            session.add_tool_result(tc.id, name, str(result))
             if name == "consult_internet_for_facts":
                 debug_print(f"   🌍 Search feedback loop active...")
 

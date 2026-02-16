@@ -402,6 +402,38 @@ class FAISSIndexMixin:
                 self.faiss_manager.rebuild_from_db(self.db_path, table_name)
                 self.faiss_manager.save()
 
+    def _faiss_search(self, query: str, limit: int, sql_template: str) -> Optional[List[tuple]]:
+        """
+        Common FAISS search: embed query → FAISS lookup → fetch rows from SQLite.
+        Returns raw rows or None if FAISS unavailable/no results (caller should fallback).
+
+        sql_template must contain {placeholders} for IN clause, e.g.:
+            "SELECT id, content FROM table WHERE id IN ({placeholders})"
+        """
+        if not (self.use_semantic and query and self.faiss_manager and self.faiss_manager.is_available):
+            return None
+
+        q_emb = get_embedding(query)
+        if not q_emb:
+            return None
+
+        faiss_results = self.faiss_manager.search(q_emb, limit)
+        if not faiss_results:
+            return None
+
+        ids = [r[0] for r in faiss_results]
+        placeholders = ','.join('?' * len(ids))
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                sql_template.format(placeholders=placeholders), ids
+            ).fetchall()
+
+        if not rows:
+            return None
+
+        # Return (rows, faiss_results) so caller can preserve ranking
+        return rows, faiss_results
+
 
 class RecallMemory(FAISSIndexMixin):
     """Recall Memory - Recent history with FAISS-accelerated vector search"""
@@ -463,7 +495,7 @@ class RecallMemory(FAISSIndexMixin):
             threading.Thread(
                 target=self._generate_embedding_async,
                 args=(row_id, content),
-                daemon=True
+                daemon=False
             ).start()
 
     def _generate_embedding_async(self, row_id: int, content: str):
@@ -491,35 +523,20 @@ class RecallMemory(FAISSIndexMixin):
     def search(self, query: str = None, limit: int = 10) -> List[Dict]:
         """Search recall memory with FAISS-accelerated semantic search"""
 
-        # FAISS-accelerated semantic search (O(log n) instead of O(n))
-        if self.use_semantic and query and self.faiss_manager and self.faiss_manager.is_available:
-            q_emb = get_embedding(query)
-            if q_emb:
-                faiss_results = self.faiss_manager.search(q_emb, limit)
-
-                if faiss_results:
-                    # Fetch full records by IDs from SQLite
-                    ids = [r[0] for r in faiss_results]
-                    with sqlite3.connect(self.db_path) as conn:
-                        placeholders = ','.join('?' * len(ids))
-                        rows = conn.execute(
-                            f"SELECT id, timestamp, role, content FROM recall_memory WHERE id IN ({placeholders})",
-                            ids
-                        ).fetchall()
-
-                    # Create lookup and preserve FAISS ranking order
-                    row_map = {r[0]: r for r in rows}
-                    results = []
-                    for row_id, score in faiss_results:
-                        if row_id in row_map:
-                            r = row_map[row_id]
-                            results.append({
-                                "role": r[2],
-                                "content": r[3],
-                                "timestamp": r[1],
-                                "score": round(score, 4)
-                            })
-                    return results
+        # FAISS-accelerated semantic search (O(log n))
+        result = self._faiss_search(
+            query, limit,
+            "SELECT id, timestamp, role, content FROM recall_memory WHERE id IN ({placeholders})"
+        )
+        if result:
+            rows, faiss_results = result
+            row_map = {r[0]: r for r in rows}
+            results = []
+            for row_id, score in faiss_results:
+                if row_id in row_map:
+                    r = row_map[row_id]
+                    results.append({"role": r[2], "content": r[3], "timestamp": r[1], "score": round(score, 4)})
+            return results
 
         # Fallback: Naive semantic search (if FAISS unavailable)
         with sqlite3.connect(self.db_path) as conn:
@@ -631,24 +648,13 @@ class ArchivalMemory(FAISSIndexMixin):
         fetch_limit = limit * 3  # Fetch more for decay filtering
 
         # FAISS-accelerated semantic search
-        if self.use_semantic and self.faiss_manager and self.faiss_manager.is_available:
-            q_emb = get_embedding(query)
-            if q_emb:
-                faiss_results = self.faiss_manager.search(q_emb, fetch_limit)
-
-                if faiss_results:
-                    ids = [r[0] for r in faiss_results]
-                    with sqlite3.connect(self.db_path) as conn:
-                        placeholders = ','.join('?' * len(ids))
-                        rows = conn.execute(
-                            f"SELECT id, category, content, importance, timestamp FROM archival_memory WHERE id IN ({placeholders})",
-                            ids
-                        ).fetchall()
-
-                    # Only return if we found matching rows, otherwise fall back to text search
-                    if rows:
-                        results = self._apply_importance_decay(rows)
-                        return results[:limit]
+        result = self._faiss_search(
+            query, fetch_limit,
+            "SELECT id, category, content, importance, timestamp FROM archival_memory WHERE id IN ({placeholders})"
+        )
+        if result:
+            rows, _ = result
+            return self._apply_importance_decay(rows)[:limit]
 
         # Fallback: Text search with decay
         with sqlite3.connect(self.db_path) as conn:
@@ -660,9 +666,7 @@ class ArchivalMemory(FAISSIndexMixin):
         if not rows:
             return []
 
-        # Apply importance decay
-        results = self._apply_importance_decay(rows)
-        return results[:limit]
+        return self._apply_importance_decay(rows)[:limit]
 
     def _apply_importance_decay(self, rows: List[tuple]) -> List[Dict]:
         """
