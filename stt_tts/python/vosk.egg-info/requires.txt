@@ -1,5 +1,0 @@
-cffi>=1.0
-requests
-tqdm
-srt
-websockets

@@ -1,2 +1,0 @@
-[console_scripts]
-vosk-transcriber = vosk.transcriber.cli:main
