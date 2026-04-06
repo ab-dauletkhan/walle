@@ -1,0 +1,214 @@
+"""
+Use this program to scan a singel person. Scanning means to use the face detector to extract a 96*96 img of the persons face.
+The images are saved in one folder as png and in an other folder as numpy array. The png's are only for visual inspection.
+For default values in "recognize_face.py" you need to get at least 20 pictures per person.
+
+Important: For each new person, increase the variable "str(person_number)" in main() by 1. This "str(person_number)" will define the foldername
+where the images of the scanned person will be saved.
+
+Adjust the variable "camera.rotation" to fit your configuration
+
+If you do not have an Edge TPU or you want to see the performance difference, change the
+variable ifEdgeTPU_1_else_0 in main() to 0.
+"""
+
+import io
+import re
+import time
+import os
+import shutil
+from tflite_runtime.interpreter import load_delegate
+
+from annotation import Annotator
+
+import numpy as np
+
+
+from PIL import Image
+from tflite_runtime.interpreter import Interpreter
+
+import cv2
+
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 960
+
+
+def main():
+    
+  ifEdgeTPU_1_else_0 = 1
+  
+  labels = load_labels('coco_labels.txt')
+  
+  #get interpreter for face detection model
+  if ifEdgeTPU_1_else_0 == 1:
+      interpreter = Interpreter(model_path = 'models/ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite',
+        experimental_delegates=[load_delegate('libedgetpu.so.1.0')])
+  else:
+      interpreter = Interpreter(model_path = 'models/ssd_mobilenet_v2_face_quant_postprocess.tflite')
+  
+  interpreter.allocate_tensors()
+  _, input_height, input_width, _ = interpreter.get_input_details()[0]['shape']
+  
+  
+  
+  person_number = 2 # Change the number of the person you scan. It will create a new number for that person
+  count_images_saved = 0
+  
+  if os.path.isdir('scanned_people') == False:
+    os.mkdir('scanned_people')
+      
+  if os.path.isdir('scanned_people/' + str(person_number)) == False:
+    os.mkdir('scanned_people/' + str(person_number))
+    os.mkdir('scanned_people/' + str(person_number) + '/png')
+    os.mkdir('scanned_people/' + str(person_number) + '/npy')
+  else:
+    shutil.rmtree('scanned_people/' + str(person_number))
+    os.mkdir('scanned_people/' + str(person_number))
+    os.mkdir('scanned_people/' + str(person_number) + '/png')
+    os.mkdir('scanned_people/' + str(person_number) + '/npy')
+  
+  cap = cv2.VideoCapture(0)  # 0 = default camera, change if needed
+  cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+  cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+  cap.set(cv2.CAP_PROP_FPS, 30)
+  try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to grab frame")
+            break
+
+        # Rotate 270 degrees (equivalent to camera.rotation=270)
+        #frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        # Convert BGR (OpenCV) to RGB (PIL), then resize for inference
+        image_large = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        image = image_large.resize((input_width, input_height), Image.LANCZOS)
+
+        start_time = time.monotonic()
+        results = detect_objects(interpreter, image, 0.9)
+        elapsed_ms = (time.monotonic() - start_time) * 1000
+
+        # Draw annotations using OpenCV instead of Annotator
+        annotate_objects(frame, results, labels, CAMERA_WIDTH, CAMERA_HEIGHT)
+        cv2.putText(frame, '%.1fms' % elapsed_ms, (5, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.imshow('Object Detection', frame)
+
+        ymin, xmin, ymax, xmax, score = get_best_box_param(results, CAMERA_WIDTH, CAMERA_HEIGHT)
+
+        if score > 0.85:
+            img = np.array(image_large)
+            img_cut = img[ymin:ymax, xmin:xmax, :]
+            print(img_cut.shape)
+            img_cut = cv2.resize(img_cut, dsize=(96, 96),
+                                 interpolation=cv2.INTER_CUBIC).astype('uint8')
+            img_cut_pil = Image.fromarray(img_cut)
+            img_cut_pil.save('scanned_people/' + str(person_number) + '/png/img_' + str(count_images_saved) + '.png')
+            np.save('scanned_people/' + str(person_number) + '/npy/img_' + str(count_images_saved), img_cut)
+            count_images_saved += 1
+
+        # Press 'q' to quit
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+  finally:
+      cap.release()
+      cv2.destroyAllWindows()
+
+
+def load_labels(path):
+  #Loads the labels file. Supports files with or without index numbers.
+  with open(path, 'r', encoding='utf-8') as f:
+    lines = f.readlines()
+    labels = {}
+    for row_number, content in enumerate(lines):
+      pair = re.split(r'[:\s]+', content.strip(), maxsplit=1)
+      if len(pair) == 2 and pair[0].strip().isdigit():
+        labels[int(pair[0])] = pair[1].strip()
+      else:
+        labels[row_number] = pair[0].strip()
+  return labels
+
+
+def set_input_tensor(interpreter, image):
+  #Sets the input tensor.
+  tensor_index = interpreter.get_input_details()[0]['index']
+  input_tensor = interpreter.tensor(tensor_index)()[0]
+  input_tensor[:, :] = image
+
+
+def get_output_tensor(interpreter, index):
+  #Returns the output tensor at the given index.
+  output_details = interpreter.get_output_details()[index]
+  tensor = np.squeeze(interpreter.get_tensor(output_details['index']))
+  return tensor
+
+
+def detect_objects(interpreter, image, threshold):
+  #Returns a list of detection results, each a dictionary of object info.
+  set_input_tensor(interpreter, image)
+  interpreter.invoke()
+
+  # Get all output details
+  boxes = get_output_tensor(interpreter, 0)
+  classes = get_output_tensor(interpreter, 1)
+  scores = get_output_tensor(interpreter, 2)
+  count = int(get_output_tensor(interpreter, 3))
+
+  results = []
+  for i in range(count):
+    if scores[i] >= threshold:
+      result = {
+          'bounding_box': boxes[i],
+          'class_id': classes[i],
+          'score': scores[i]
+      }
+      results.append(result)
+  return results
+
+def get_best_box_param(results,CAMERA_WIDTH, CAMERA_HEIGHT):
+    #Returns the box parameters for the box with the highest score
+    best_boxvalue = 0
+    xmin = 0
+    xmax = 1
+    ymin = 0
+    ymax = 1
+    for obj in results:
+        if obj['score'] > best_boxvalue:
+            best_boxvalue = obj['score']
+            ymin, xmin, ymax, xmax = obj['bounding_box']
+            if xmin < 0:
+                xmin = 0
+            if xmax > 1:
+                xmax = 1
+            if ymin < 0:
+                ymin = 0
+            if ymax > 1:
+                ymax = 1
+            xmin = int(xmin * CAMERA_WIDTH)
+            xmax = int(xmax * CAMERA_WIDTH)
+            ymin = int(ymin * CAMERA_HEIGHT)
+            ymax = int(ymax * CAMERA_HEIGHT)
+    #print("score: ", best_boxvalue)
+    return ymin, xmin, ymax, xmax, best_boxvalue
+
+
+def annotate_objects(frame, results, labels, CAMERA_WIDTH, CAMERA_HEIGHT):
+    for obj in results:
+        ymin, xmin, ymax, xmax = obj['bounding_box']
+        xmin = int(xmin * CAMERA_WIDTH)
+        xmax = int(xmax * CAMERA_WIDTH)
+        ymin = int(ymin * CAMERA_HEIGHT)
+        ymax = int(ymax * CAMERA_HEIGHT)
+
+        cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
+        cv2.putText(frame, '%s %.2f' % (labels[obj['class_id']], obj['score']),
+                    (xmin, ymin - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+
+
+if __name__ == '__main__':
+  main()
+
