@@ -1,0 +1,103 @@
+[project]
+name = "walle"
+version = "0.1.0"
+description = "WALL-E robot companion — MemGPT-style LLM brain on Jetson Orin Nano"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+
+dependencies = [
+    # Core / LLM
+    "openai>=1.0",
+    "pydantic>=2.0",
+    "requests>=2.28",
+
+    # Memory
+    "numpy>=1.24",
+
+    # Serial / Arduino
+    "pyserial>=3.5",
+
+    # Web API
+    "flask>=3.0",
+    "werkzeug>=3.0",
+
+    # Search
+    "duckduckgo-search>=6.0",
+]
+
+[project.optional-dependencies]
+# Semantic search (FAISS + sentence-transformers)
+embeddings = [
+    "sentence-transformers>=2.0",
+    "faiss-cpu>=1.7",
+]
+
+# Vision — CPU backend (YOLO + InsightFace ArcFace)
+vision-cpu = [
+    "opencv-python>=4.8",
+    "ultralytics>=8.0",
+    "onnxruntime>=1.15",
+    "pillow>=10.0",
+]
+
+# Vision — Coral TPU backend
+vision-coral = [
+    "opencv-python>=4.8",
+    "pillow>=10.0",
+    # tflite-runtime and pycoral installed separately (platform-specific wheels)
+]
+
+# Voice — STT + TTS
+voice = [
+    "sounddevice>=0.4",
+    "scipy>=1.10",
+    "moonshine-voice>=0.0.40",
+]
+
+# TTS server (Mimic3)
+tts = [
+    "mycroft-mimic3-tts>=0.2.4",
+]
+
+# ML / Torch ecosystem (CPU — Jetson has its own CUDA build)
+ml = [
+    "torch>=2.0",
+    "transformers>=4.30",
+    "accelerate>=0.20",
+    "safetensors>=0.3",
+    "tokenizers>=0.13",
+    "huggingface-hub>=0.16",
+    "scikit-learn>=1.2",
+]
+
+# Development
+dev = [
+    "pytest>=8.0",
+]
+
+# Everything except Jetson-specific torch
+all = [
+    "walle[embeddings,vision-cpu,voice,tts,ml,dev]",
+]
+
+# Jetson minimal (no torch — pre-installed on Jetson)
+jetson = [
+    "walle[embeddings,vision-coral,voice]",
+]
+
+[project.scripts]
+walle = "walle.startup:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["walle"]
