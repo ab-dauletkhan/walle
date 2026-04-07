@@ -109,11 +109,16 @@ def build_app(args) -> tuple:
         context_manager=context_manager,
     )
 
-    # -- Register shutdown hooks (reverse order of startup) --
-    lifecycle.register("memory-compression", chat_loop.wait_for_compression)
-    lifecycle.register("robot-neutral", lambda: robot_exec.execute("reset_to_neutral", {}))
-    lifecycle.register("faiss-save", lambda: _save_faiss(recall_mem, archival_mem))
+    # -- Register shutdown hooks --
+    # LifecycleManager executes in REVERSE order, so register in reverse
+    # of desired shutdown sequence:
+    #   api → vision → compression-wait → robot-neutral → faiss → embeddings → personality → serial
+    # Serial and personality are already registered above (first), so they run last.
+    # The remaining hooks from last-to-run to first-to-run:
     lifecycle.register("embeddings", recall_mem.shutdown)
+    lifecycle.register("faiss-save", lambda: _save_faiss(recall_mem, archival_mem))
+    lifecycle.register("robot-neutral", lambda: robot_exec.execute("reset_to_neutral", {}))
+    lifecycle.register("memory-compression", chat_loop.wait_for_compression)
 
     # -- Build orchestrator (thin facade) --
     # Import here to avoid circular — walle_main imports from startup
@@ -351,11 +356,44 @@ def _text_mode_repl(orchestrator, shutdown_event: threading.Event):
         print("\n")
 
 
-def _run_voice_mode(orchestrator, robot_exec, args, lifecycle: LifecycleManager):
-    from stt_tts.main import VoiceAssistant, ROBOT_INTENTS, Mimic3TTSEngine, ConsoleTTSEngine, ModelArch
-    from walle_main import RobotBridge
+class _RobotBridge:
+    """Maps voice intent actions to RobotControlExecutor tool calls.
 
-    robot_bridge = RobotBridge(robot_exec)
+    Defined here (not in walle_main.py) because it needs BaseRobotController
+    from stt_tts.main which pulls heavy audio deps. This class is only
+    instantiated in voice mode after those deps are lazy-loaded.
+    """
+
+    ACTION_MAP = {
+        "forward":  ("drive_forward",   {"speed": 50, "duration_ms": 1000}),
+        "backward": ("drive_backward",  {"speed": 50, "duration_ms": 1000}),
+        "left":     ("turn_left",       {"speed": 50, "duration_ms": 500}),
+        "right":    ("turn_right",      {"speed": 50, "duration_ms": 500}),
+        "stop":     ("stop_movement",   {}),
+        "wave":     ("wave_hello",      {}),
+        "dance":    ("express_emotion", {"emotion": "happy"}),
+    }
+
+    def __init__(self, robot_exec):
+        self._robot = robot_exec
+
+    def execute(self, action: str, utterance: str, confidence: float) -> None:
+        mapping = self.ACTION_MAP.get(action)
+        if mapping:
+            tool_name, args = mapping
+            _log.debug("RobotBridge: %s -> %s (confidence=%.0f%%)", action, tool_name, confidence * 100)
+            self._robot.execute(tool_name, args)
+        else:
+            _log.warning("RobotBridge: unknown action '%s'", action)
+
+    def close(self) -> None:
+        pass
+
+
+def _run_voice_mode(orchestrator, robot_exec, args, lifecycle: LifecycleManager):
+    from stt_tts.main import VoiceAssistant, ROBOT_INTENTS, Mimic3TTSEngine, ConsoleTTSEngine, ModelArch, BaseRobotController
+
+    robot_bridge = _RobotBridge(robot_exec)
     tts = ConsoleTTSEngine() if args.no_tts else Mimic3TTSEngine(url=args.tts_url, voice=args.tts_voice)
 
     stt_arch_map = {
