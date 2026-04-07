@@ -4,7 +4,7 @@ Memory management tools for LLM interaction
 from typing import Dict, List, Any
 
 from walle.memory.memory_system import Memory, RecallMemory, ArchivalMemory
-from walle.memory.base_executor import BaseToolExecutor
+from walle.tools.base_executor import BaseToolExecutor
 
 def get_memory_tools() -> List[Dict]:
     return [

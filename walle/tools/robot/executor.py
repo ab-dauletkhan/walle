@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import time
 
-from walle.memory.base_executor import BaseToolExecutor
+from walle.tools.base_executor import BaseToolExecutor
 from walle.tools.robot.catalog import RobotRuntime, build_default_robot_registry
 
 _log = logging.getLogger("walle.robot")

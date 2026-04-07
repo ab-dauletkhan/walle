@@ -7,7 +7,7 @@ import os
 import threading
 from dataclasses import dataclass
 
-from walle.memory.base_executor import BaseToolExecutor
+from walle.tools.base_executor import BaseToolExecutor
 from walle.memory.config import MEMORY_DIR
 
 _log = logging.getLogger("walle.personality")

@@ -2,7 +2,7 @@ import json
 import logging
 import re
 
-from walle.memory.base_executor import BaseToolExecutor
+from walle.tools.base_executor import BaseToolExecutor
 from walle.memory.config import conf
 
 _log = logging.getLogger("walle.knowledge")

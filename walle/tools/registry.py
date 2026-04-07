@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from walle.tools.communication import SendMessageArgs
+from walle.tools.communication import SendMessageArgs, get_communication_tools
 from walle.memory.heartbeat import add_heartbeat_to_tools
 
 _log = logging.getLogger("walle.orchestrator.support")
