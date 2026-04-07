@@ -5,6 +5,7 @@ Integration support objects for the WALL-E orchestrator.
 from __future__ import annotations
 
 import logging
+from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -14,7 +15,7 @@ from memory.heartbeat import add_heartbeat_to_tools
 from memory.knowledge_tools import get_knowledge_tools
 from memory.memory_tools import get_memory_tools
 from memory.personality_system import get_personality_tools
-from memory.robot_tools import get_robot_control_tools, get_robot_tool_names
+from memory.robot_tools import get_robot_control_tools
 from vision_service import get_capture_image_tools
 
 _log = logging.getLogger("walle.orchestrator.support")
@@ -27,10 +28,129 @@ class ToolExecutionResult:
     heartbeat_requested: bool = False
 
 
-@dataclass(frozen=True)
-class ToolBinding:
-    execute: Callable[[str, dict], str]
-    request_heartbeat_after: bool = False
+class ToolProvider(ABC):
+    """Extensible interface for a group of tool schemas plus execution logic."""
+
+    @abstractmethod
+    def get_schemas(self) -> list[dict]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def handles(self, name: str) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    def execute(
+        self,
+        name: str,
+        args: dict,
+        *,
+        user_message_already_sent: bool,
+    ) -> ToolExecutionResult:
+        raise NotImplementedError
+
+
+class CommunicationToolProvider(ToolProvider):
+    def __init__(self, communication_executor):
+        self._communication_executor = communication_executor
+
+    def get_schemas(self) -> list[dict]:
+        return get_communication_tools()
+
+    def handles(self, name: str) -> bool:
+        return name == "send_message"
+
+    def execute(
+        self,
+        name: str,
+        args: dict,
+        *,
+        user_message_already_sent: bool,
+    ) -> ToolExecutionResult:
+        heartbeat_requested = bool(args.pop("request_heartbeat", False))
+
+        try:
+            validated = SendMessageArgs.model_validate(args)
+        except Exception as exc:
+            return ToolExecutionResult(tool_result=f"Validation error: {exc}")
+
+        if not validated.message:
+            return ToolExecutionResult(tool_result="Error: message cannot be empty")
+        if user_message_already_sent:
+            return ToolExecutionResult(tool_result="Message already sent (duplicate ignored)")
+
+        result = self._communication_executor.execute(name, args)
+        return ToolExecutionResult(
+            tool_result=f"{result}: {validated.message}",
+            user_message=validated.message,
+            heartbeat_requested=heartbeat_requested or validated.request_heartbeat,
+        )
+
+
+class SchemaExecutorToolProvider(ToolProvider):
+    def __init__(
+        self,
+        schema_factory: Callable[[], list[dict]],
+        executor,
+        *,
+        request_heartbeat_after: bool = False,
+    ):
+        self._schema_factory = schema_factory
+        self._executor = executor
+        self._request_heartbeat_after = request_heartbeat_after
+
+    def get_schemas(self) -> list[dict]:
+        return self._schema_factory()
+
+    def handles(self, name: str) -> bool:
+        return any(schema["function"]["name"] == name for schema in self.get_schemas())
+
+    def execute(
+        self,
+        name: str,
+        args: dict,
+        *,
+        user_message_already_sent: bool,
+    ) -> ToolExecutionResult:
+        del user_message_already_sent
+        heartbeat_requested = bool(args.pop("request_heartbeat", False))
+
+        try:
+            result = self._executor.execute(name, args)
+        except Exception as exc:
+            _log.error("Tool %s failed: %s", name, exc)
+            result = f"Error executing {name}: {exc}"
+
+        return ToolExecutionResult(
+            tool_result=str(result),
+            heartbeat_requested=heartbeat_requested or self._request_heartbeat_after,
+        )
+
+
+class ToolRegistry:
+    """Registry of tool providers used by the orchestrator."""
+
+    def __init__(self):
+        self._providers: list[ToolProvider] = []
+
+    def register(self, provider: ToolProvider) -> None:
+        self._providers.append(provider)
+
+    def get_schemas(self) -> list[dict]:
+        schemas = []
+        for provider in self._providers:
+            schemas.extend(provider.get_schemas())
+        return add_heartbeat_to_tools(schemas)
+
+    def execute(self, name: str, args: dict, *, user_message_already_sent: bool) -> ToolExecutionResult:
+        for provider in self._providers:
+            if provider.handles(name):
+                return provider.execute(
+                    name,
+                    args,
+                    user_message_already_sent=user_message_already_sent,
+                )
+        return ToolExecutionResult(tool_result=f"Unknown tool: {name}")
 
 
 class SystemPromptBuilder:
@@ -102,87 +222,56 @@ class ToolSuiteFacade:
         self._personality_executor = personality_executor
         self._knowledge_executor = knowledge_executor
         self._capture_image_executor = capture_image_executor
-        self._bindings = self._build_bindings()
+        self._registry = self._build_registry()
 
     def set_capture_image_executor(self, capture_image_executor) -> None:
         self._capture_image_executor = capture_image_executor
-        self._bindings = self._build_bindings()
+        self._registry = self._build_registry()
 
     def build_schemas(self) -> list[dict]:
-        tools = (
-            get_communication_tools()
-            + get_robot_control_tools()
-            + get_memory_tools()
-            + get_personality_tools()
-            + get_knowledge_tools()
-        )
-        if self._capture_image_executor is not None:
-            tools += get_capture_image_tools()
-        return add_heartbeat_to_tools(tools)
+        return self._registry.get_schemas()
 
     def execute_tool(self, name: str, args: dict, user_message_already_sent: bool) -> ToolExecutionResult:
-        heartbeat_requested = bool(args.pop("request_heartbeat", False))
-
-        if name == "send_message":
-            try:
-                validated = SendMessageArgs.model_validate(args)
-            except Exception as exc:
-                return ToolExecutionResult(tool_result=f"Validation error: {exc}")
-
-            if not validated.message:
-                return ToolExecutionResult(tool_result="Error: message cannot be empty")
-            if user_message_already_sent:
-                return ToolExecutionResult(tool_result="Message already sent (duplicate ignored)")
-
-            result = self._communication_executor.execute(name, args)
-            return ToolExecutionResult(
-                tool_result=f"{result}: {validated.message}",
-                user_message=validated.message,
-                heartbeat_requested=heartbeat_requested or validated.request_heartbeat,
-            )
-
-        binding = self._bindings.get(name)
-        if binding is None:
-            return ToolExecutionResult(tool_result=f"Unknown tool: {name}", heartbeat_requested=heartbeat_requested)
-
-        try:
-            result = binding.execute(name, args)
-        except Exception as exc:
-            _log.error("Tool %s failed: %s", name, exc)
-            result = f"Error executing {name}: {exc}"
-
-        return ToolExecutionResult(
-            tool_result=str(result),
-            heartbeat_requested=heartbeat_requested or binding.request_heartbeat_after,
+        return self._registry.execute(
+            name,
+            args,
+            user_message_already_sent=user_message_already_sent,
         )
 
-    def _build_bindings(self) -> dict[str, ToolBinding]:
-        bindings: dict[str, ToolBinding] = {}
-
-        for tool_name in get_robot_tool_names():
-            bindings[tool_name] = ToolBinding(self._robot_executor.execute)
-
-        for schema in get_memory_tools():
-            tool_name = schema["function"]["name"]
-            bindings[tool_name] = ToolBinding(self._memory_executor.execute)
-
-        for schema in get_personality_tools():
-            tool_name = schema["function"]["name"]
-            bindings[tool_name] = ToolBinding(self._personality_executor.execute)
-
-        for schema in get_knowledge_tools():
-            tool_name = schema["function"]["name"]
-            bindings[tool_name] = ToolBinding(
-                self._knowledge_executor.execute,
+    def _build_registry(self) -> ToolRegistry:
+        registry = ToolRegistry()
+        registry.register(CommunicationToolProvider(self._communication_executor))
+        registry.register(
+            SchemaExecutorToolProvider(
+                get_robot_control_tools,
+                self._robot_executor,
+            )
+        )
+        registry.register(
+            SchemaExecutorToolProvider(
+                get_memory_tools,
+                self._memory_executor,
+            )
+        )
+        registry.register(
+            SchemaExecutorToolProvider(
+                get_personality_tools,
+                self._personality_executor,
+            )
+        )
+        registry.register(
+            SchemaExecutorToolProvider(
+                get_knowledge_tools,
+                self._knowledge_executor,
                 request_heartbeat_after=True,
             )
-
+        )
         if self._capture_image_executor is not None:
-            for schema in get_capture_image_tools():
-                tool_name = schema["function"]["name"]
-                bindings[tool_name] = ToolBinding(
-                    self._capture_image_executor.execute,
+            registry.register(
+                SchemaExecutorToolProvider(
+                    get_capture_image_tools,
+                    self._capture_image_executor,
                     request_heartbeat_after=True,
                 )
-
-        return bindings
+            )
+        return registry

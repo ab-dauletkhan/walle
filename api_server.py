@@ -50,7 +50,7 @@ def create_app(serial_manager, llm_client=None, vision_service=None):
         if not _chat_lock.acquire(timeout=60):
             return jsonify({"error": "Chat is busy, try again later"}), 429
         try:
-            response = llm_client._run_chat_loop(text)
+            response = llm_client.chat(text)
             return jsonify({"response": response or "(no response)"})
         except Exception:
             _log.exception("Chat error")

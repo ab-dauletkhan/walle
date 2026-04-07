@@ -335,6 +335,16 @@ class VisionService:
         # Auto-detect backend
         self._backend = self._create_backend()
 
+    @property
+    def is_active(self) -> bool:
+        return self._backend is not None and self._running and self._cap is not None
+
+    @property
+    def backend_name(self) -> str:
+        if self._backend is None:
+            return "none"
+        return self._backend.__class__.__name__.replace("VisionBackend", "").lower()
+
     def _create_backend(self) -> Optional[VisionBackend]:
         """Try Coral first, fall back to CPU."""
         try:

@@ -5,9 +5,9 @@ Integrates with memory system to provide rich context to LLM
 """
 
 from typing import Dict, List, Optional, Any
+import copy
 from dataclasses import dataclass, field
 from datetime import datetime
-import json
 import threading
 
 
@@ -197,28 +197,30 @@ class ContextManager:
     
     def get_observations(self) -> List[str]:
         """Get list of observations for personality system"""
-        observations = []
-        
-        if self.visual and self.visual.objects_detected:
-            for obj in self.visual.objects_detected[:3]:
-                observations.append(f"I see a {obj['object']}")
-        
-        if self.environment:
-            if self.environment.battery_level and self.environment.battery_level < 30:
-                observations.append("My battery is getting low")
-            if self.environment.obstacles_nearby:
-                observations.append("There are obstacles around me")
-        
-        return observations
+        with self._lock:
+            observations = []
+
+            if self.visual and self.visual.objects_detected:
+                for obj in self.visual.objects_detected[:3]:
+                    observations.append(f"I see a {obj['object']}")
+
+            if self.environment:
+                if self.environment.battery_level and self.environment.battery_level < 30:
+                    observations.append("My battery is getting low")
+                if self.environment.obstacles_nearby:
+                    observations.append("There are obstacles around me")
+
+            return observations
     
     def to_dict(self) -> Dict[str, Any]:
         """Serialize context for storage"""
-        return {
-            'visual': self.visual.__dict__ if self.visual else None,
-            'environment': self.environment.__dict__ if self.environment else None,
-            'interaction': self.interaction.__dict__ if self.interaction else None,
-            'observations': self.spontaneous_observations
-        }
+        with self._lock:
+            return {
+                'visual': copy.deepcopy(self.visual.__dict__) if self.visual else None,
+                'environment': copy.deepcopy(self.environment.__dict__) if self.environment else None,
+                'interaction': copy.deepcopy(self.interaction.__dict__) if self.interaction else None,
+                'observations': list(self.spontaneous_observations),
+            }
 
 
 # Sensor simulation helpers (for testing without actual hardware)
@@ -256,76 +258,3 @@ class SensorSimulator:
             user_mood=None,
             interaction_count=0
         )
-
-
-# Example usage in main chat loop:
-"""
-# In walle_enhanced.py, add:
-
-context_manager = ContextManager()
-
-# Before each chat interaction:
-def chat_with_walle(user_input: str, context_manager: ContextManager = None):
-    system_msg = get_system_message()
-    
-    # Add context if available
-    context_string = ""
-    if context_manager:
-        context_string = context_manager.get_context_string()
-    
-    user_msg = {
-        "role": "user", 
-        "content": context_string + user_input if context_string else user_input
-    }
-    
-"""
-
-
-def demo_context_system():
-    """Demonstrate the context system"""
-    print("🔍 Context System Demo\n")
-    
-    # Create context manager
-    cm = ContextManager()
-    
-    # Simulate visual input
-    visual = VisualContext(
-        faces_detected=[
-            {'name': 'Sarah', 'confidence': 0.95, 'location': 'center'}
-        ],
-        objects_detected=[
-            {'object': 'coffee mug', 'confidence': 0.92, 'location': 'table'},
-            {'object': 'laptop', 'confidence': 0.88, 'location': 'desk'},
-            {'object': 'book', 'confidence': 0.85, 'location': 'shelf'}
-        ],
-        scene_description="cozy home office"
-    )
-    cm.update_visual(visual)
-    
-    # Simulate environment
-    env = EnvironmentContext(
-        location="home office",
-        lighting="bright",
-        battery_level=45,
-        temperature=21.5,
-        obstacles_nearby=False
-    )
-    cm.update_environment(env)
-    
-    # Simulate interaction
-    interaction = InteractionContext(
-        user_name="Sarah",
-        user_mood="focused",
-        last_interaction=datetime(2025, 10, 22, 14, 30)
-    )
-    cm.update_interaction(interaction)
-    
-    # Display context
-    print(cm.get_context_string())
-    print("\n📝 Observations:")
-    for obs in cm.get_observations():
-        print(f"  • {obs}")
-
-
-if __name__ == "__main__":
-    demo_context_system()

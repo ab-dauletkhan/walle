@@ -210,6 +210,11 @@ class FAISSManager:
 
         return results
 
+    def get_indexed_ids(self) -> List[int]:
+        """Return a stable snapshot of indexed database row IDs."""
+        with self._index_lock:
+            return list(self.id_map)
+
     def save(self):
         """Persist index to disk (synchronous)"""
         if not _faiss_available or self.index is None or not self.index_path:
@@ -428,8 +433,7 @@ class FAISSIndexMixin:
         if table_name not in self._ALLOWED_TABLES:
             raise ValueError(f"Invalid table name: {table_name}")
 
-        with self.faiss_manager._index_lock:
-            faiss_ids = set(self.faiss_manager.id_map)
+        faiss_ids = set(self.faiss_manager.get_indexed_ids())
 
         with _connect_db(self.db_path) as conn:
             rows = conn.execute(

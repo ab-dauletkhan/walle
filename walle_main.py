@@ -140,6 +140,8 @@ class WallELLMClient(LLMClient):
             knowledge_executor=self.knowledge_exec,
         )
         self._compression_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_complete = False
 
         _log.info("Orchestrator initialized: %s via Ollama", self.model)
 
@@ -158,6 +160,10 @@ class WallELLMClient(LLMClient):
 
     def _retrieve_relevant_context(self, query: str) -> str:
         return self.memory_provider.build_context(query)
+
+    def chat(self, user_input: str) -> Optional[str]:
+        """Public chat entry point for API, REPL, and voice mode."""
+        return self._run_chat_loop(user_input)
 
     def _summarize_text(self, text: str) -> str:
         try:
@@ -261,24 +267,7 @@ class WallELLMClient(LLMClient):
         self.heartbeat.reset()
 
         # 4. Compress old memories if needed (non-blocking, guarded against re-entry)
-        if self.recall_mem.get_count() > conf.RECALL_MEMORY_LIMIT:
-            if self._compression_lock.acquire(blocking=False):
-
-                def _compress_then_unlock():
-                    try:
-                        self.recall_mem.compress_old_memories(
-                            self._summarize_text, self.archival_mem
-                        )
-                    finally:
-                        self._compression_lock.release()
-
-                t = threading.Thread(
-                    target=_compress_then_unlock,
-                    daemon=False,  # non-daemon so shutdown waits for it
-                    name="memory-compress",
-                )
-                t.start()
-                self._compress_thread = t
+        self._start_memory_compression_if_needed()
 
         # 5. Tool execution loop
         iteration = 0
@@ -338,6 +327,70 @@ class WallELLMClient(LLMClient):
 
         return self.comm_exec.get_last_message()
 
+    def _start_memory_compression_if_needed(self) -> None:
+        if self.recall_mem.get_count() <= conf.RECALL_MEMORY_LIMIT:
+            return
+        if not self._compression_lock.acquire(blocking=False):
+            return
+
+        def _compress_then_unlock():
+            try:
+                self.recall_mem.compress_old_memories(
+                    self._summarize_text,
+                    self.archival_mem,
+                )
+            finally:
+                self._compression_lock.release()
+
+        compress_thread = threading.Thread(
+            target=_compress_then_unlock,
+            daemon=False,
+            name="memory-compress",
+        )
+        compress_thread.start()
+        self._compress_thread = compress_thread
+
+    def wait_for_background_tasks(self, timeout: float = 15.0) -> None:
+        compress_thread = getattr(self, "_compress_thread", None)
+        if compress_thread is not None and compress_thread.is_alive():
+            _log.info("Waiting for memory compression to finish...")
+            compress_thread.join(timeout=timeout)
+            if compress_thread.is_alive():
+                _log.warning("Compression thread did not finish in time")
+
+    def reset_robot_to_neutral(self) -> None:
+        try:
+            self.robot_exec.execute("reset_to_neutral", {})
+        except Exception as exc:
+            _log.warning("Robot neutral reset failed: %s", exc)
+
+    def save_runtime_state(self) -> None:
+        for mem in (self.recall_mem, self.archival_mem):
+            if hasattr(mem, "faiss_manager") and mem.faiss_manager is not None:
+                try:
+                    mem.faiss_manager.save()
+                except Exception as exc:
+                    _log.warning("FAISS save failed: %s", exc)
+        self.recall_mem.shutdown()
+        self.personality.save()
+
+    def shutdown(self) -> None:
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+
+            _log.info("Shutting down WALL-E...")
+            if self.vision_service is not None:
+                self.vision_service.stop()
+            self.wait_for_background_tasks()
+            self.reset_robot_to_neutral()
+            self.save_runtime_state()
+            self.robot_exec.close()
+            if self.serial_manager is not None:
+                self.serial_manager.close()
+            self._shutdown_complete = True
+            _log.info("WALL-E offline. Goodbye!")
+
     # -- LLMClient interface --
 
     def stream_chat(self, messages: list[dict]) -> Iterator[str]:
@@ -354,7 +407,7 @@ class WallELLMClient(LLMClient):
             yield "I didn't catch that."
             return
 
-        response = self._run_chat_loop(user_text)
+        response = self.chat(user_text)
         if not response:
             response = "I'm not sure what to say."
 
@@ -365,13 +418,7 @@ class WallELLMClient(LLMClient):
             time.sleep(0.02)
 
     def close(self):
-        if self.vision_service is not None:
-            self.vision_service.stop()
-        self.robot_exec.close()
-        if self.serial_manager is not None:
-            self.serial_manager.close()
-        self.personality.save()
-        _log.info("Orchestrator shut down.")
+        self.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +473,7 @@ def text_mode_repl(llm_client: WallELLMClient, shutdown_event: threading.Event =
             if user_input.lower() in ("exit", "quit"):
                 break
 
-            response = llm_client._run_chat_loop(user_input)
+            response = llm_client.chat(user_input)
             if response:
                 print(f"WALL-E: {response}\n")
             else:
@@ -471,47 +518,9 @@ def _test_tts(url: str) -> bool:
 # ---------------------------------------------------------------------------
 def _shutdown(llm_client: WallELLMClient, api_srv=None):
     """Orderly shutdown of all subsystems."""
-    _log.info("Shutting down WALL-E...")
-
-    # 1. Vision
-    if llm_client.vision_service is not None:
-        llm_client.vision_service.stop()
-
-    # 2. API server
     if api_srv is not None:
         api_srv.stop()
-
-    # 3. Wait for in-flight memory compression (non-daemon thread)
-    compress_thread = getattr(llm_client, "_compress_thread", None)
-    if compress_thread is not None and compress_thread.is_alive():
-        _log.info("Waiting for memory compression to finish...")
-        compress_thread.join(timeout=15)
-        if compress_thread.is_alive():
-            _log.warning("Compression thread did not finish in time")
-
-    # 4. Reset robot to neutral position
-    try:
-        llm_client.robot_exec.execute("reset_to_neutral", {})
-    except Exception:
-        pass
-
-    # 5. Serial
-    if llm_client.serial_manager is not None:
-        llm_client.serial_manager.close()
-
-    # 6. Sync FAISS indices to disk before shutting down embeddings
-    for mem in (llm_client.recall_mem, llm_client.archival_mem):
-        if hasattr(mem, "faiss_manager") and mem.faiss_manager is not None:
-            try:
-                mem.faiss_manager.save()
-            except Exception as e:
-                _log.warning("FAISS save failed: %s", e)
-
-    # 7. Wait for pending embeddings then save memory state
-    llm_client.recall_mem.shutdown()
-    llm_client.personality.save()
-
-    _log.info("WALL-E offline. Goodbye!")
+    llm_client.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -586,8 +595,7 @@ def main():
         vision = VisionService(llm_client.context_manager, camera_index=args.camera, fps=vision_fps)
         llm_client.set_vision_service(vision)
         vision.start()
-        backend_name = "active" if vision._backend is not None else "none"
-        status_lines.append(_status_line("Vision:", f"{backend_name} (cam={args.camera})", vision._backend is not None))
+        status_lines.append(_status_line("Vision:", f"{vision.backend_name} (cam={args.camera})", vision.is_active))
     else:
         status_lines.append(_status_line("Vision:", "disabled", False))
 
