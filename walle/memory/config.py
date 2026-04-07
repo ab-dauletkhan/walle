@@ -1,9 +1,12 @@
 import logging
 import os
+import shutil
+import subprocess
 import sys
+import time
 from dataclasses import dataclass, field, fields
-from typing import List
 from pathlib import Path
+from typing import List, Optional
 
 # Project root (two levels up from walle/memory/)
 _PROJECT_ROOT: str = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -88,29 +91,78 @@ class Config:
         return instance
 
 
-def validate_ollama(config: "Config") -> bool:
-    """Check Ollama is reachable and model is available."""
+def validate_ollama(config: "Config") -> tuple[bool, Optional[subprocess.Popen]]:
+    """Ensure Ollama is running and the configured model is available.
+
+    1. Try to connect.  If unreachable, start ``ollama serve`` and retry.
+    2. If the model is missing, pull it automatically.
+
+    Returns (success, process) — *process* is non-None only if we spawned
+    ``ollama serve`` ourselves; the caller is responsible for terminating it.
+    """
+    import requests
+
     log = logging.getLogger("walle.config")
-    try:
-        import requests
-        res = requests.get(config.OLLAMA_BASE_URL, timeout=5)
-        if res.status_code != 200:
-            log.warning("Ollama server not responding at %s", config.OLLAMA_BASE_URL)
+    process = None
+
+    def _is_reachable() -> bool:
+        try:
+            return requests.get(config.OLLAMA_BASE_URL, timeout=3).ok
+        except Exception:
             return False
 
-        res = requests.get(f"{config.OLLAMA_BASE_URL}/api/tags")
-        models = [m['name'] for m in res.json().get('models', [])]
-        if config.OLLAMA_MODEL not in models and f"{config.OLLAMA_MODEL}:latest" not in models:
-            log.warning("Model '%s' not found. Available: %s", config.OLLAMA_MODEL, models)
-            log.warning("Run: ollama pull %s", config.OLLAMA_MODEL)
+    def _has_model() -> bool:
+        try:
+            models = [
+                m["name"]
+                for m in requests.get(
+                    f"{config.OLLAMA_BASE_URL}/api/tags", timeout=5
+                ).json().get("models", [])
+            ]
+            return config.OLLAMA_MODEL in models or f"{config.OLLAMA_MODEL}:latest" in models
+        except Exception:
             return False
 
-        log.info("Ollama validation passed - %s", config.OLLAMA_MODEL)
-        return True
-    except Exception as e:
-        log.warning("Ollama validation failed: %s", e)
-        log.warning("Make sure Ollama is running: ollama serve")
-        return False
+    # -- 1. Ensure server is running --
+    if not _is_reachable():
+        binary = shutil.which("ollama")
+        if not binary:
+            log.error("Ollama binary not found in PATH")
+            return False, None
+
+        log.info("Starting ollama serve...")
+        process = subprocess.Popen(
+            [binary, "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        for _ in range(10):
+            time.sleep(1)
+            if _is_reachable():
+                break
+        else:
+            process.terminate()
+            log.error("Ollama did not start within 10 seconds")
+            return False, None
+
+    # -- 2. Ensure model is available --
+    if not _has_model():
+        log.info("Pulling model '%s'...", config.OLLAMA_MODEL)
+        try:
+            subprocess.run(
+                [shutil.which("ollama") or "ollama", "pull", config.OLLAMA_MODEL],
+                check=True,
+                timeout=300,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            log.error("Failed to pull model '%s': %s", config.OLLAMA_MODEL, e)
+            if process:
+                process.terminate()
+            return False, None
+
+    log.info("Ollama ready — %s", config.OLLAMA_MODEL)
+    return True, process
 
 conf = Config.load()
 
@@ -155,10 +207,6 @@ def setup_logging(run_mode: str = None) -> None:
     except OSError:
         root_logger.warning("Could not open log file %s", log_path)
 
-
-# Add a NullHandler so log calls before setup_logging() don't vanish.
-# The real setup_logging() should be called once from main().
-logging.getLogger("walle").addHandler(logging.NullHandler())
 
 # Module-level logger for this file
 _log = logging.getLogger("walle.config")

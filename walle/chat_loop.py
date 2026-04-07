@@ -10,7 +10,7 @@ import logging
 import time
 import threading
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Optional
 
@@ -46,7 +46,7 @@ class ChatSession:
     def add(self, role, content, tool_calls=None):
         msg = {"role": role, "content": content}
         if tool_calls:
-            msg["tool_calls"] = tool_calls
+            msg["tool_calls"] = [asdict(tc) for tc in tool_calls]
         self.history.append(msg)
 
     def add_tool_result(self, tool_id, name, content):
@@ -252,7 +252,7 @@ class ChatLoop:
                 )
 
                 if execution.user_message and not user_received_message:
-                    _log.debug("WALL-E: %s", execution.user_message)
+                    _log.debug("send_message: %s", execution.user_message[:80])
                     self._recall_mem.insert("assistant", execution.user_message)
                     user_received_message = True
 

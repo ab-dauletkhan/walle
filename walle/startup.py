@@ -9,10 +9,10 @@ import argparse
 import logging
 import os
 import signal
-import threading
 from typing import Optional
 
 from walle.memory.config import conf, setup_logging, validate_ollama
+from walle.memory.embeddings import get_embedding_model
 from walle.memory.memory_system import Memory, RecallMemory, ArchivalMemory
 from walle.tools.memory_tools import MemoryToolExecutor
 from walle.tools.personality import PersonalityEngine, PersonalityToolExecutor
@@ -58,6 +58,7 @@ def build_app(args) -> tuple:
     lifecycle.register("serial", serial_mgr.close)
 
     # -- Memory --
+    get_embedding_model()  # warm up embeddings before REPL starts
     core_mem = Memory()
     recall_mem = RecallMemory(use_semantic=conf.USE_SEMANTIC_SEARCH)
     archival_mem = ArchivalMemory(use_semantic=conf.USE_SEMANTIC_SEARCH)
@@ -87,7 +88,7 @@ def build_app(args) -> tuple:
     tool_suite = ToolSuiteFacade(registry)
 
     # -- LLM client --
-    client = OpenAI(base_url=f"{conf.OLLAMA_BASE_URL}/v1", api_key="ollama")
+    client = OpenAI(base_url=f"{conf.OLLAMA_BASE_URL}/v1", api_key="ollama", timeout=30.0)
     llm_streamer = LLMStreamer(client, conf.OLLAMA_MODEL)
 
     # -- Prompt & memory providers --
@@ -254,12 +255,13 @@ def main():
 
     # Validate Ollama
     _log.info("[2/7] Validating Ollama (%s)...", conf.OLLAMA_MODEL)
-    ollama_ok = validate_ollama(conf)
+    ollama_ok, ollama_proc = validate_ollama(conf)
     status_lines.append(_status_line("LLM:", f"{conf.OLLAMA_MODEL} via Ollama", ollama_ok))
+    if ollama_proc:
+        lifecycle.register("ollama", ollama_proc.terminate)
     if not ollama_ok:
-        _log.warning("Ollama not reachable or model '%s' not found.", conf.OLLAMA_MODEL)
-        _log.warning("Make sure Ollama is running: ollama serve")
-        _log.warning("And model is pulled: ollama pull %s", conf.OLLAMA_MODEL)
+        _log.error("Ollama not available. Cannot start without LLM.")
+        return
 
     # Vision
     _log.info("[3/7] Setting up vision...")
@@ -310,23 +312,20 @@ def main():
     banner += f"\n{'=' * 42}"
     _log.info(banner)
 
-    # --- Signal handling ---
-    _shutdown_requested = threading.Event()
-
-    def _signal_handler(sig, frame):
-        _shutdown_requested.set()
-
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
-
     # --- Run ---
     if args.text_mode:
         print('  Type your message. "exit" to quit.\n')
-        _text_mode_repl(orchestrator, _shutdown_requested)
-        lifecycle.shutdown()
+        try:
+            _text_mode_repl(orchestrator)
+        finally:
+            lifecycle.shutdown()
         return
 
-    # Voice mode
+    # Voice mode — custom signal handler because VoiceAssistant.run()
+    # may not propagate KeyboardInterrupt cleanly through audio threads.
+    _halt = lambda *_: lifecycle.shutdown()
+    signal.signal(signal.SIGINT, _halt)
+    signal.signal(signal.SIGTERM, _halt)
     print(f'  Say "{args.wake_word}" to begin!\n')
     _run_voice_mode(orchestrator, robot_exec, args, lifecycle)
 
@@ -334,14 +333,14 @@ def main():
 # ---------------------------------------------------------------------------
 # Mode runners
 # ---------------------------------------------------------------------------
-def _text_mode_repl(orchestrator, shutdown_event: threading.Event):
+def _text_mode_repl(orchestrator):
     print(f"\n{'=' * 50}")
     print(f"  WALL-E Text Mode | {conf.OLLAMA_MODEL} via Ollama")
     print(f"  Type 'exit' or 'quit' to stop.")
     print(f"{'=' * 50}\n")
 
     try:
-        while not (shutdown_event and shutdown_event.is_set()):
+        while True:
             try:
                 user_input = input("You: ").strip()
             except EOFError:
