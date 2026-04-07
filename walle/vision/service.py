@@ -316,6 +316,36 @@ class CPUVisionBackend(VisionBackend):
 
 
 # ---------------------------------------------------------------------------
+# Vision Backend Registry (Strategy + Registry pattern)
+# ---------------------------------------------------------------------------
+class VisionBackendRegistry:
+    """Registry of backend factories, tried in order until one succeeds."""
+
+    def __init__(self):
+        self._factories: list[tuple[str, type]] = []
+
+    def register(self, name: str, factory) -> None:
+        self._factories.append((name, factory))
+
+    def create_first_available(self) -> Optional[VisionBackend]:
+        for name, factory in self._factories:
+            try:
+                return factory()
+            except Exception as e:
+                _log.warning("Backend '%s' unavailable: %s", name, e)
+        _log.warning("No vision backend available — running without face recognition")
+        return None
+
+
+def build_default_vision_registry() -> VisionBackendRegistry:
+    """Default priority: Coral TPU → CPU (YOLO + InsightFace)."""
+    registry = VisionBackendRegistry()
+    registry.register("coral", CoralVisionBackend)
+    registry.register("cpu", CPUVisionBackend)
+    return registry
+
+
+# ---------------------------------------------------------------------------
 # VisionService — background thread feeding ContextManager
 # ---------------------------------------------------------------------------
 class VisionService:
@@ -347,18 +377,8 @@ class VisionService:
         return self._backend.__class__.__name__.replace("VisionBackend", "").lower()
 
     def _create_backend(self) -> Optional[VisionBackend]:
-        """Try Coral first, fall back to CPU."""
-        try:
-            return CoralVisionBackend()
-        except Exception as e:
-            _log.warning("Coral not available (%s), trying CPU backend...", e)
-
-        try:
-            return CPUVisionBackend()
-        except Exception as e:
-            _log.warning("CPU backend not available (%s)", e)
-            _log.warning("Running without vision — no face recognition")
-            return None
+        """Use the default backend registry to find the first available backend."""
+        return build_default_vision_registry().create_first_available()
 
     def start(self) -> None:
         """Start the background vision processing thread."""
