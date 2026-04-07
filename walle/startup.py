@@ -12,7 +12,7 @@ import signal
 import threading
 from typing import Optional
 
-from walle.memory.config import conf, setup_logging
+from walle.memory.config import conf, setup_logging, validate_ollama
 from walle.memory.memory_system import Memory, RecallMemory, ArchivalMemory
 from walle.tools.memory_tools import MemoryToolExecutor
 from walle.tools.personality import PersonalityEngine, PersonalityToolExecutor
@@ -177,17 +177,6 @@ def _status_line(label: str, detail: str, ok: bool) -> str:
     return f"  {label:<10} {detail:<28} {tag}"
 
 
-def _validate_ollama(model: str) -> bool:
-    try:
-        import requests
-        r = requests.get(f"{conf.OLLAMA_BASE_URL}/api/tags", timeout=5)
-        if r.status_code != 200:
-            return False
-        models = [m["name"] for m in r.json().get("models", [])]
-        return model in models or f"{model}:latest" in models
-    except Exception:
-        return False
-
 
 def _test_tts(url: str) -> bool:
     try:
@@ -265,7 +254,7 @@ def main():
 
     # Validate Ollama
     _log.info("[2/7] Validating Ollama (%s)...", conf.OLLAMA_MODEL)
-    ollama_ok = _validate_ollama(conf.OLLAMA_MODEL)
+    ollama_ok = validate_ollama(conf)
     status_lines.append(_status_line("LLM:", f"{conf.OLLAMA_MODEL} via Ollama", ollama_ok))
     if not ollama_ok:
         _log.warning("Ollama not reachable or model '%s' not found.", conf.OLLAMA_MODEL)

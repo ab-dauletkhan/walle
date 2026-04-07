@@ -1,14 +1,20 @@
+"""Architecture guard tests — verify contracts survive refactoring."""
+
 import types
 
 import pytest
 
 from walle.memory.context_manager import ContextManager, VisualContext
-from walle.memory.memory_system import FAISSManager
-from walle.tools.registry import ToolSuiteFacade
+from walle.memory.vector_index import FAISSManager
+from walle.tools.registry import (
+    ToolSuiteFacade, ToolRegistry, CommunicationToolProvider, SchemaExecutorToolProvider,
+)
 from walle.vision.service import VisionService
 
 
 class FakeExecutor:
+    method_prefix = "_"
+
     def __init__(self, responses=None):
         self.responses = responses or {}
         self.calls = []
@@ -71,25 +77,22 @@ def test_faiss_manager_index_id_snapshot_is_stable_copy():
     manager.id_map = [1, 2, 3]
 
     snapshot = manager.get_indexed_ids()
-    snapshot.append(99)
+    snapshot.add(99)  # get_indexed_ids returns set
 
     assert manager.id_map == [1, 2, 3]
 
 
 def test_tool_suite_facade_dispatches_via_registry():
-    communication = FakeExecutor({"send_message": "Message sent to user"})
+    from walle.tools.robot.executor import get_robot_control_tools
+    from walle.tools.knowledge import get_knowledge_tools
+
     robot = FakeExecutor({"drive_forward": "Driving"})
-    memory = FakeExecutor()
-    personality = FakeExecutor()
     knowledge = FakeExecutor({"consult_internet_for_facts": "facts"})
 
-    facade = ToolSuiteFacade(
-        communication_executor=communication,
-        robot_executor=robot,
-        memory_executor=memory,
-        personality_executor=personality,
-        knowledge_executor=knowledge,
-    )
+    registry = ToolRegistry()
+    registry.register(SchemaExecutorToolProvider(get_robot_control_tools, robot))
+    registry.register(SchemaExecutorToolProvider(get_knowledge_tools, knowledge, request_heartbeat_after=True))
+    facade = ToolSuiteFacade(registry)
 
     result = facade.execute_tool(
         name="drive_forward",

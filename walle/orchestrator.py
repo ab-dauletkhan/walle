@@ -58,7 +58,7 @@ class WallEOrchestrator:
 
 
 def main():
-    from startup import main as startup_main
+    from walle.startup import main as startup_main
     startup_main()
 
 
