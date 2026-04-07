@@ -245,10 +245,15 @@ def main():
     args = parse_args()
 
     # --- Jetson overrides ---
-    vision_fps = 2
     if args.jetson:
-        import config_jetson
-        vision_fps = config_jetson.VISION_FPS
+        conf.OLLAMA_MODEL = "qwen3:4b"
+        conf.EMBEDDING_DEVICE = "cpu"
+        conf.EMBEDDING_BATCH_SIZE = 4
+        conf.USE_FAISS = True
+        conf.USE_SEMANTIC_SEARCH = True
+        conf.VISION_FPS = 1
+        _log.info("Jetson mode: model=%s, embedding=%s, fps=%s",
+                   conf.OLLAMA_MODEL, conf.EMBEDDING_DEVICE, conf.VISION_FPS)
 
     # --- Build the app ---
     status_lines = []
@@ -269,7 +274,7 @@ def main():
 
     # Vision
     _log.info("[3/7] Setting up vision...")
-    vision = attach_vision(orchestrator, context_manager, lifecycle, args, vision_fps)
+    vision = attach_vision(orchestrator, context_manager, lifecycle, args, conf.VISION_FPS)
     if vision is not None:
         status_lines.append(_status_line("Vision:", f"{vision.backend_name} (cam={args.camera})", vision.is_active))
     else:

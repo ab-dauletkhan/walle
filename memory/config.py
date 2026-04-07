@@ -57,6 +57,9 @@ class Config:
     ECHO_SUPPRESS_WINDOW: float = 8.0              # Echo suppression window (seconds)
     ECHO_COOLDOWN: float = 2.0                     # Post-TTS silence (seconds)
 
+    # --- Vision Processing ---
+    VISION_FPS: int = 2                              # Camera processing rate
+
     # --- Robot Settings ---
     SERIAL_PORT: str = None
     BAUD_RATE: int = 115200
