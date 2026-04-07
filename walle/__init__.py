@@ -1,0 +1,1 @@
+"""WALL-E robot companion."""

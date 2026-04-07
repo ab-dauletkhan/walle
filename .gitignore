@@ -1,50 +1,36 @@
-.__pycache__
+# Python
 __pycache__/
 *.pyc
-.sublime.project
-.sublime-workspace
-.local_config.py
-web_interface/local_config.py
-walle-webinterface.sublime-workspace
-walle-webinterface.sublime-project
+*.pyo
+venv/
+.venv/
+*.egg-info/
+.pytest_cache/
 
-# Runtime data (databases, indices, state)
+# Runtime data
+data/
 *.db
 *.log
 *.index
 *.index.ids
-memory/personality.json
-personality_config.json
-
-# Python
-venv/
-.venv/
-.pytest_cache/
 
 # IDE
 .claude/
+.sublime-project
+.sublime-workspace
 
-comp_vision_diplomka/__pycache__
-comp_vision_diplomka/data
-comp_vision_diplomka/face_recognition
-comp_vision_diplomka/tracker_test_videos
-comp_vision_diplomka/docker-compose.yaml
-comp_vision_diplomka/models/w600k_r50.onnx
+# OS
+.DS_Store
 
-walle_vision/coral_env
-walle_vision/venv
+# Models & weights (large files, download at deploy)
+models/comp_vision/data/
+models/comp_vision/models/w600k_r50.onnx
+models/comp_vision/__pycache__/
+models/coral_vision/models/
+models/coral_vision/inference_results*/
+models/coral_vision/coral_env/
+models/coral_vision/venv/
+models/coral_vision/*.whl
 
-walle_vision/videos_for_inference
-
-walle_vision/onnxruntime_gpu-1.19.0-cp310-cp310-linux_aarch64.whl
-walle_vision/torch-2.3.0-cp310-cp310-linux_aarch64.whl
-walle_vision/torch-2.4.0a0+07cecf4168.nv24.05.14710581-cp310-cp310-linux_aarch64.whl
-walle_vision/torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl
-
-walle_vision/vision
-
-walle_vision/torchvision
-
-walle_vision/models
-walle_vision/inference_results
-walle_vision/inference_results_tracking
+# Legacy
+legacy/web_interface/local_config.py

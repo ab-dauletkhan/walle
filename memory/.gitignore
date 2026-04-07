@@ -1,8 +1,0 @@
-mem/
-__pycache__/
-*.deb
-*.db
-*.index
-*.ids
-.env
-.DS_Store
