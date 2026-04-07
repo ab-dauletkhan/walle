@@ -20,10 +20,11 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from memory.memory_system import (
-    Memory, Block, RecallMemory, ArchivalMemory,
-    FAISSManager, get_embedding, _faiss_available
-)
+from memory.memory_system import Memory, Block, RecallMemory, ArchivalMemory
+from memory.embeddings import get_embedding
+from memory.vector_index import FAISSManager, is_faiss_available as _is_faiss_available
+
+_faiss_available = _is_faiss_available()
 from memory.config import conf
 
 
