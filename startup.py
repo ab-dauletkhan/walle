@@ -23,8 +23,15 @@ from memory.context_manager import ContextManager
 from memory.communication_tools import CommunicationExecutor
 
 from serial_manager import SerialManager
-from vision_service import VisionService, CaptureImageExecutor
-from orchestrator_support import RelevantMemoryProvider, SystemPromptBuilder, ToolSuiteFacade
+from vision_service import VisionService, CaptureImageExecutor, get_capture_image_tools
+from orchestrator_support import (
+    RelevantMemoryProvider, SystemPromptBuilder, ToolSuiteFacade,
+    ToolRegistry, CommunicationToolProvider, SchemaExecutorToolProvider,
+)
+from memory.robot_tools import get_robot_control_tools
+from memory.memory_tools import get_memory_tools
+from memory.personality_system import get_personality_tools
+from memory.knowledge_tools import get_knowledge_tools
 from chat_loop import ChatLoop, ChatSession, LLMStreamer
 from lifecycle import LifecycleManager
 
@@ -70,14 +77,14 @@ def build_app(args) -> tuple:
     context_manager = ContextManager()
     comm_exec = CommunicationExecutor()
 
-    # -- Tool suite --
-    tool_suite = ToolSuiteFacade(
-        communication_executor=comm_exec,
-        robot_executor=robot_exec,
-        memory_executor=mem_exec,
-        personality_executor=personality_exec,
-        knowledge_executor=knowledge_exec,
-    )
+    # -- Tool registry (Microkernel: each provider registers independently) --
+    registry = ToolRegistry()
+    registry.register(CommunicationToolProvider(comm_exec))
+    registry.register(SchemaExecutorToolProvider(get_robot_control_tools, robot_exec))
+    registry.register(SchemaExecutorToolProvider(get_memory_tools, mem_exec))
+    registry.register(SchemaExecutorToolProvider(get_personality_tools, personality_exec))
+    registry.register(SchemaExecutorToolProvider(get_knowledge_tools, knowledge_exec, request_heartbeat_after=True))
+    tool_suite = ToolSuiteFacade(registry)
 
     # -- LLM client --
     client = OpenAI(base_url=f"{conf.OLLAMA_BASE_URL}/v1", api_key="ollama")
@@ -144,7 +151,10 @@ def attach_vision(orchestrator, context_manager, lifecycle, args, vision_fps: in
         return None
     vision = VisionService(context_manager, camera_index=args.camera, fps=vision_fps)
     capture_exec = CaptureImageExecutor(vision, conf.OLLAMA_BASE_URL)
-    orchestrator.set_vision_service(vision, capture_exec)
+    orchestrator.set_vision_service(vision)
+    orchestrator.tool_suite.register(
+        SchemaExecutorToolProvider(get_capture_image_tools, capture_exec, request_heartbeat_after=True)
+    )
     vision.start()
     lifecycle.register("vision", vision.stop)
     return vision

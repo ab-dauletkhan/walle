@@ -30,9 +30,8 @@ class WallEOrchestrator:
         self.serial_manager = serial_manager
         self.tool_suite = tool_suite
 
-    def set_vision_service(self, vision_service, capture_image_exec):
+    def set_vision_service(self, vision_service):
         self.vision_service = vision_service
-        self.tool_suite.set_capture_image_executor(capture_image_exec)
 
     def chat(self, user_input: str) -> Optional[str]:
         return self._chat_loop.run(user_input)

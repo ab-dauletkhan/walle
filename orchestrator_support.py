@@ -10,13 +10,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from memory.communication_tools import SendMessageArgs, get_communication_tools
+from memory.communication_tools import SendMessageArgs
 from memory.heartbeat import add_heartbeat_to_tools
-from memory.knowledge_tools import get_knowledge_tools
-from memory.memory_tools import get_memory_tools
-from memory.personality_system import get_personality_tools
-from memory.robot_tools import get_robot_control_tools
-from vision_service import get_capture_image_tools
 
 _log = logging.getLogger("walle.orchestrator.support")
 
@@ -205,28 +200,19 @@ class RelevantMemoryProvider:
 
 
 class ToolSuiteFacade:
-    """Facade that unifies tool schemas and execution across subsystems."""
+    """Facade that delegates to a ToolRegistry.
 
-    def __init__(
-        self,
-        communication_executor,
-        robot_executor,
-        memory_executor,
-        personality_executor,
-        knowledge_executor,
-        capture_image_executor=None,
-    ):
-        self._communication_executor = communication_executor
-        self._robot_executor = robot_executor
-        self._memory_executor = memory_executor
-        self._personality_executor = personality_executor
-        self._knowledge_executor = knowledge_executor
-        self._capture_image_executor = capture_image_executor
-        self._registry = self._build_registry()
+    The registry is built in the Composition Root (startup.py).
+    Adding a new tool = one new ToolProvider + one registry.register() line.
+    No changes to this class needed.
+    """
 
-    def set_capture_image_executor(self, capture_image_executor) -> None:
-        self._capture_image_executor = capture_image_executor
-        self._registry = self._build_registry()
+    def __init__(self, registry: ToolRegistry):
+        self._registry = registry
+
+    def register(self, provider: ToolProvider) -> None:
+        """Register an additional provider (e.g. capture_image after vision init)."""
+        self._registry.register(provider)
 
     def build_schemas(self) -> list[dict]:
         return self._registry.get_schemas()
@@ -237,41 +223,3 @@ class ToolSuiteFacade:
             args,
             user_message_already_sent=user_message_already_sent,
         )
-
-    def _build_registry(self) -> ToolRegistry:
-        registry = ToolRegistry()
-        registry.register(CommunicationToolProvider(self._communication_executor))
-        registry.register(
-            SchemaExecutorToolProvider(
-                get_robot_control_tools,
-                self._robot_executor,
-            )
-        )
-        registry.register(
-            SchemaExecutorToolProvider(
-                get_memory_tools,
-                self._memory_executor,
-            )
-        )
-        registry.register(
-            SchemaExecutorToolProvider(
-                get_personality_tools,
-                self._personality_executor,
-            )
-        )
-        registry.register(
-            SchemaExecutorToolProvider(
-                get_knowledge_tools,
-                self._knowledge_executor,
-                request_heartbeat_after=True,
-            )
-        )
-        if self._capture_image_executor is not None:
-            registry.register(
-                SchemaExecutorToolProvider(
-                    get_capture_image_tools,
-                    self._capture_image_executor,
-                    request_heartbeat_after=True,
-                )
-            )
-        return registry
