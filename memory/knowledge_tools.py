@@ -1,6 +1,8 @@
 import json
 import re
-from base_executor import BaseToolExecutor
+
+from .base_executor import BaseToolExecutor
+from .config import conf, debug_print
 
 try:
     from duckduckgo_search import DDGS
@@ -8,7 +10,6 @@ except ImportError:
     print("⚠️ duckduckgo_search not installed. Web search disabled.")
     print("   Install with: pip install duckduckgo-search")
     DDGS = None
-from config import conf, debug_print
 
 def get_knowledge_tools():
     return [

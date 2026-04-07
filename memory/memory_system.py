@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 _log = logging.getLogger("walle.memory")
 
 # Configuration for Embeddings (Optimized for Jetson)
-from config import conf, MEMORY_DIR
+from .config import conf, MEMORY_DIR
+from .search_fallback import get_default_fallback_search_strategy
 
 
 def _connect_db(db_path: str) -> sqlite3.Connection:
@@ -258,6 +259,9 @@ class FAISSManager:
             rows = cursor.fetchall()
 
         if not rows:
+            with self._index_lock:
+                self._create_new_index()
+                self._insertions_since_save = 0
             return
 
         embeddings = []
@@ -483,6 +487,7 @@ class RecallMemory(FAISSIndexMixin):
     def __init__(self, db_path: str = None, use_semantic: bool = False):
         self.db_path = db_path or os.path.join(MEMORY_DIR, "walle_recall_memory.db")
         self.use_semantic = use_semantic
+        self._fallback_search = get_default_fallback_search_strategy()
         self._embedding_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="emb")
         self._pending_futures: set = set()
         self._pending_lock = threading.Lock()
@@ -611,6 +616,17 @@ class RecallMemory(FAISSIndexMixin):
                     results.sort(key=lambda x: x[0], reverse=True)
                     return [{"role": r[1][2], "content": r[1][3], "timestamp": r[1][1]} for r in results[:limit]]
 
+                rows = conn.execute(
+                    "SELECT role, content, timestamp FROM recall_memory ORDER BY timestamp DESC"
+                ).fetchall()
+                ranked = self._fallback_search.rank_rows(query, rows, lambda row: row[1])
+                if ranked:
+                    ranked.sort(key=lambda item: (item.score, item.row[2]), reverse=True)
+                    return [
+                        {"role": row[0], "content": row[1], "timestamp": row[2]}
+                        for row in (item.row for item in ranked[:limit])
+                    ]
+
             # Text search fallback
             if query:
                 rows = conn.execute(
@@ -632,32 +648,39 @@ class RecallMemory(FAISSIndexMixin):
     def compress_old_memories(self, summarizer_func: Callable[[str], str], archival_memory: 'ArchivalMemory', keep_recent: int = 50):
         """Summarizes old memories into archival storage before deletion."""
         count = self.get_count()
-        if count <= keep_recent: return 0
+        if count <= keep_recent:
+            return 0
 
         with _connect_db(self.db_path) as conn:
             # Fetch old memories
             rows = conn.execute("""SELECT role, content, timestamp FROM recall_memory 
                                  ORDER BY timestamp DESC LIMIT -1 OFFSET ?""", (keep_recent,)).fetchall()
-            
-            if not rows: return 0
-            
+
+            if not rows:
+                return 0
+
             # Format for summarization
             # Reverse to get chronological order for the summary
-            chronological_rows = rows[::-1] 
+            chronological_rows = rows[::-1]
             text_to_summarize = "\n".join([f"[{r[2]}] {r[0]}: {r[1]}" for r in chronological_rows])
-            
+
             _log.info("⏳ Summarizing old memories...")
             summary = summarizer_func(text_to_summarize)
-            
+
             # Store in Archival
             archival_memory.insert("conversation_summary", summary, importance=3)
-            
+
             # Delete from Recall
             # We strictly rely on timestamps to delete what we just fetched
-            newest_of_old = rows[0][2] # The timestamp of the 'newest' item in the 'old' batch
+            newest_of_old = rows[0][2]  # The timestamp of the newest item in the old batch
             conn.execute("DELETE FROM recall_memory WHERE timestamp <= ?", (newest_of_old,))
-            
-            return len(rows)
+            deleted_count = len(rows)
+
+        if self.faiss_manager and self.faiss_manager.is_available:
+            self.faiss_manager.rebuild_from_db(self.db_path, "recall_memory")
+            self.faiss_manager.save()
+
+        return deleted_count
 
     def shutdown(self, timeout: float = 30):
         """Wait for pending background embeddings (with timeout to avoid hangs)."""
@@ -684,6 +707,7 @@ class ArchivalMemory(FAISSIndexMixin):
     def __init__(self, db_path: str = None, use_semantic: bool = False):
         self.db_path = db_path or os.path.join(MEMORY_DIR, "walle_archival_memory.db")
         self.use_semantic = use_semantic
+        self._fallback_search = get_default_fallback_search_strategy()
         self._init_db()
 
         # Initialize FAISS manager for archival memory
@@ -736,6 +760,19 @@ class ArchivalMemory(FAISSIndexMixin):
 
         # Fallback: Text search with decay
         with _connect_db(self.db_path) as conn:
+            if self.use_semantic:
+                q_emb = get_embedding(query)
+                if not q_emb:
+                    rows = conn.execute(
+                        "SELECT id, category, content, importance, timestamp FROM archival_memory"
+                    ).fetchall()
+                    ranked = self._fallback_search.rank_rows(query, rows, lambda row: row[2])
+                    if ranked:
+                        ranked.sort(key=lambda item: item.score, reverse=True)
+                        return self._apply_importance_decay(
+                            [item.row for item in ranked[:fetch_limit]]
+                        )[:limit]
+
             rows = conn.execute(
                 "SELECT id, category, content, importance, timestamp FROM archival_memory WHERE content LIKE ? ORDER BY importance DESC LIMIT ?",
                 (f"%{query}%", fetch_limit)

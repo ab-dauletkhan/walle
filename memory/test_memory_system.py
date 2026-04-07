@@ -13,7 +13,6 @@ Or directly: python test_memory_system.py
 """
 
 import os
-import sys
 import time
 import json
 import tempfile
@@ -21,14 +20,11 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from memory_system import (
+from memory.memory_system import (
     Memory, Block, RecallMemory, ArchivalMemory,
     FAISSManager, get_embedding, _faiss_available
 )
-from config import conf
+from memory.config import conf
 
 
 class TestCoreMemory(unittest.TestCase):
@@ -436,7 +432,7 @@ class TestToolCalling(unittest.TestCase):
 
     def test_memory_tools_import(self):
         """Test that memory tools can be imported"""
-        from memory_tools import MemoryToolExecutor
+        from memory.memory_tools import MemoryToolExecutor
 
         db_path = os.path.join(self.temp_dir, "test_tools.db")
         memory = Memory(db_path=db_path)
@@ -446,7 +442,7 @@ class TestToolCalling(unittest.TestCase):
 
     def test_core_memory_append_tool(self):
         """Test core_memory_append tool"""
-        from memory_tools import MemoryToolExecutor
+        from memory.memory_tools import MemoryToolExecutor
 
         db_path = os.path.join(self.temp_dir, "test_tools.db")
         memory = Memory(db_path=db_path)
@@ -463,7 +459,7 @@ class TestToolCalling(unittest.TestCase):
 
     def test_core_memory_replace_tool(self):
         """Test core_memory_replace tool"""
-        from memory_tools import MemoryToolExecutor
+        from memory.memory_tools import MemoryToolExecutor
 
         db_path = os.path.join(self.temp_dir, "test_tools.db")
         memory = Memory(db_path=db_path)
@@ -485,7 +481,7 @@ class TestToolCalling(unittest.TestCase):
 
     def test_archival_memory_insert_tool(self):
         """Test archival_memory_insert tool"""
-        from memory_tools import MemoryToolExecutor
+        from memory.memory_tools import MemoryToolExecutor
 
         db_paths = {
             "core": os.path.join(self.temp_dir, "core.db"),
@@ -508,7 +504,7 @@ class TestToolCalling(unittest.TestCase):
 
     def test_tool_schema_format(self):
         """Test that tool schemas are in correct OpenAI format"""
-        from memory_tools import MemoryToolExecutor
+        from memory.memory_tools import MemoryToolExecutor
 
         memory = Memory(db_path=os.path.join(self.temp_dir, "test.db"))
         executor = MemoryToolExecutor(memory, None, None)

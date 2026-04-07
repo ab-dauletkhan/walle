@@ -2,8 +2,9 @@
 Memory management tools for LLM interaction
 """
 from typing import Dict, List, Any
-from memory_system import Memory, RecallMemory, ArchivalMemory
-from base_executor import BaseToolExecutor
+
+from .memory_system import Memory, RecallMemory, ArchivalMemory
+from .base_executor import BaseToolExecutor
 
 def get_memory_tools() -> List[Dict]:
     return [

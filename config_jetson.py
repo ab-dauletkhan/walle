@@ -4,14 +4,9 @@ Import this BEFORE initializing subsystems to apply Jetson-specific settings.
 
 Usage:
     import config_jetson  # applies overrides to conf
-    from config import conf  # now has Jetson values
+    from memory.config import conf  # now has Jetson values
 """
-import sys
-import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory"))
-
-from config import conf
+from memory.config import conf
 
 # ---------- Jetson mode flag ----------
 JETSON_MODE = True

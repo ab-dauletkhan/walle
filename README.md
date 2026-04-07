@@ -278,12 +278,12 @@ recency_score = exp(-age_days / 30.0)
 - `turn_right(speed, duration_ms)` — X{speed}
 - `stop_movement()` — q
 - `set_head_rotation(position)` — G{0-100}
-- `set_neck_position(position)` — N{0-100}
+- `set_neck_position(position)` — Adapter: T{position} + B{100-position}
 - `set_both_arms(left, right)` — L{val}\nR{val}
-- `express_emotion(emotion)` — Arm + neck presets
+- `express_emotion(emotion)` — Arm + dual-neck presets
 - `scan_surroundings(speed)` — Head sweep G20->G50->G80->G50
-- `wave_hello()` — Arm wave sequence
-- `reset_to_neutral()` — G50, N50, L50, R50
+- `wave_hello()` — Right-arm wave sequence
+- `reset_to_neutral()` — A0 neutral animation
 
 **Knowledge:**
 - `consult_internet_for_facts(query)` — DuckDuckGo search, English filtered, multi-region fallback
@@ -657,7 +657,7 @@ IF |posError| > 1 (CONTROLLER_THRESHOLD):
 1. Stop VisionService (join thread, release camera)
 2. Stop API server
 3. Wait for memory compression thread (max 15s)
-4. Reset robot to neutral position (G50, N50, L50, R50)
+4. Reset robot to neutral position (A0 neutral animation)
 5. Close serial connection
 6. Sync-save FAISS indices to disk
 7. Shutdown embedding thread pool (wait for in-flight futures)

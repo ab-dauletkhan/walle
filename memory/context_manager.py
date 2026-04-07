@@ -29,15 +29,23 @@ class VisualContext:
         if self.faces_detected:
             if len(self.faces_detected) == 1:
                 face = self.faces_detected[0]
-                if face.get('name'):
+                if face.get('name') and face.get('name') != "Unknown":
                     parts.append(f"I can see {face['name']}")
                 else:
                     parts.append("I can see a person")
             else:
-                known_faces = [f['name'] for f in self.faces_detected if f.get('name')]
+                known_faces = [
+                    f['name']
+                    for f in self.faces_detected
+                    if f.get('name') and f.get('name') != "Unknown"
+                ]
+                unknown_faces = len(self.faces_detected) - len(known_faces)
                 if known_faces:
                     parts.append(f"I can see {', '.join(known_faces)}")
-                parts.append(f"and {len(self.faces_detected) - len(known_faces)} other people")
+                elif unknown_faces:
+                    parts.append(f"I can see {unknown_faces} people")
+                if known_faces and unknown_faces:
+                    parts.append(f"and {unknown_faces} other people")
         
         if self.objects_detected:
             interesting_objects = [obj['object'] for obj in self.objects_detected[:5]]  # Top 5

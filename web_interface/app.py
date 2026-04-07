@@ -192,7 +192,7 @@ class ArduinoDevice:
         """
         Clear the serial send queue
         """
-        while not queue.empty():
+        while not self.queue.empty():
             self.queue.get()
 
     # ---------------------------------------------------------

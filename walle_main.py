@@ -3,47 +3,47 @@ WALL-E Unified Orchestrator
 Wires together STT/TTS voice pipeline with the memory-augmented LLM brain.
 """
 import logging
-import sys
 import os
 import json
 import time
 import signal
 import argparse
 import threading
+from dataclasses import dataclass
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Iterator, Optional
 
 # --- Path setup ---
 _BASE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(_BASE, "memory"))
-sys.path.insert(0, os.path.join(_BASE, "stt_tts"))
 
 # --- Memory subsystem imports ---
-from config import conf, debug_print, setup_logging
-from memory_system import Memory, RecallMemory, ArchivalMemory
-from memory_tools import get_memory_tools, MemoryToolExecutor
-from personality_system import PersonalityEngine, get_personality_tools, PersonalityToolExecutor
-from robot_tools import get_robot_control_tools, RobotControlExecutor, get_robot_tool_names
-from heartbeat import HeartbeatManager, add_heartbeat_to_tools
-from knowledge_tools import get_knowledge_tools, KnowledgeToolExecutor
-from context_manager import ContextManager, EnvironmentContext, InteractionContext, SensorSimulator
-from communication_tools import get_communication_tools, CommunicationExecutor, SendMessageArgs
+from memory.config import conf, debug_print, setup_logging
+from memory.memory_system import Memory, RecallMemory, ArchivalMemory
+from memory.memory_tools import MemoryToolExecutor
+from memory.personality_system import PersonalityEngine, PersonalityToolExecutor
+from memory.robot_tools import RobotControlExecutor
+from memory.heartbeat import HeartbeatManager
+from memory.knowledge_tools import KnowledgeToolExecutor
+from memory.context_manager import ContextManager, EnvironmentContext, InteractionContext, SensorSimulator
+from memory.communication_tools import CommunicationExecutor
 
 # --- Vision imports ---
-from vision_service import VisionService, CaptureImageExecutor, get_capture_image_tools
+from vision_service import VisionService, CaptureImageExecutor
+
+# --- Integration support ---
+from orchestrator_support import RelevantMemoryProvider, SystemPromptBuilder, ToolSuiteFacade
 
 # --- Serial & API imports ---
 from serial_manager import SerialManager
 
 # --- STT/TTS imports ---
-# LLMClient (from mock_llm.py) is lightweight — safe to import at module level.
+# LLMClient is lightweight — safe to import at module level.
 # Voice-heavy deps (VoiceAssistant, Mimic3TTSEngine, etc.) are lazy-loaded in main().
-from mock_llm import LLMClient
+from stt_tts.mock_llm import LLMClient
 
 try:
-    from main import BaseRobotController
+    from stt_tts.main import BaseRobotController
 except ImportError:
     # Fallback ABC if stt_tts deps (sounddevice, moonshine) are not installed.
     # RobotBridge still works; voice mode will fail with a clear error.
@@ -54,12 +54,20 @@ except ImportError:
         @abstractmethod
         def close(self) -> None: ...
 
-# --- OpenAI client (for Ollama) ---
-from openai import OpenAI
-from openai.types.chat import ChatCompletionMessageToolCall
-from openai.types.chat.chat_completion_message_tool_call import Function
-
 _log = logging.getLogger("walle.orchestrator")
+
+
+@dataclass(frozen=True)
+class ToolFunctionCall:
+    name: str
+    arguments: str
+
+
+@dataclass(frozen=True)
+class ToolCallEnvelope:
+    id: str
+    function: ToolFunctionCall
+    type: str = "function"
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +97,8 @@ class WallELLMClient(LLMClient):
     """Adapts the MemGPT-style chat loop into the LLMClient.stream_chat interface."""
 
     def __init__(self, serial_port=None, baud_rate=115200, serial_manager=None):
+        from openai import OpenAI
+
         self.client = OpenAI(base_url=f"{conf.OLLAMA_BASE_URL}/v1", api_key="ollama")
         self.model = conf.OLLAMA_MODEL
 
@@ -109,10 +119,26 @@ class WallELLMClient(LLMClient):
         self.context_manager = ContextManager()
         self.comm_exec = CommunicationExecutor()
         self.session = ChatSession()
+        self.prompt_builder = SystemPromptBuilder(
+            context_manager=self.context_manager,
+            personality_engine=self.personality,
+            core_memory=self.core_mem,
+        )
+        self.memory_provider = RelevantMemoryProvider(
+            recall_memory=self.recall_mem,
+            archival_memory=self.archival_mem,
+        )
 
         # Vision (initialized later via set_vision_service)
         self.vision_service: Optional[VisionService] = None
         self.capture_image_exec: Optional[CaptureImageExecutor] = None
+        self.tool_suite = ToolSuiteFacade(
+            communication_executor=self.comm_exec,
+            robot_executor=self.robot_exec,
+            memory_executor=self.mem_exec,
+            personality_executor=self.personality_exec,
+            knowledge_executor=self.knowledge_exec,
+        )
         self._compression_lock = threading.Lock()
 
         _log.info("Orchestrator initialized: %s via Ollama", self.model)
@@ -123,38 +149,15 @@ class WallELLMClient(LLMClient):
         self.capture_image_exec = CaptureImageExecutor(
             vision_service, conf.OLLAMA_BASE_URL
         )
+        self.tool_suite.set_capture_image_executor(self.capture_image_exec)
 
     # -- helpers --
 
-    def _get_system_prompt(self) -> str:
-        context_str = self.context_manager.get_context_string()
-        return (
-            "You are WALL-E, a robot companion running on Jetson. "
-            "Reply via send_message tool ONLY.\n"
-            "Your raw text is internal thought (invisible to user). "
-            "Keep replies to 1-3 sentences max — a TTS module reads your output aloud.\n"
-            f"{self.personality.get_system_prompt_addition()}\n"
-            "Use tools directly. Don't narrate what you plan to do.\n"
-            f"{context_str}\n"
-            f"{self.core_mem.compile()}\n"
-        )
+    def _get_system_prompt(self, relevant_memories: str = "") -> str:
+        return self.prompt_builder.build(relevant_memories)
 
     def _retrieve_relevant_context(self, query: str) -> str:
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            recall_future = executor.submit(self.recall_mem.search, query, 3)
-            archival_future = executor.submit(self.archival_mem.search, query, 2)
-            hits = recall_future.result()
-            facts = archival_future.result()
-
-        if not hits and not facts:
-            return ""
-
-        ctx = "\n[RELEVANT MEMORIES]\n"
-        for h in hits:
-            ctx += f"- {h['role']}: {h['content']}\n"
-        for f in facts:
-            ctx += f"- Fact: {f['content']}\n"
-        return ctx + "\n"
+        return self.memory_provider.build_context(query)
 
     def _summarize_text(self, text: str) -> str:
         try:
@@ -211,9 +214,12 @@ class WallELLMClient(LLMClient):
                 tool_calls_list = []
                 for idx in sorted(tool_calls_map.keys()):
                     t = tool_calls_map[idx]
-                    tool_calls_list.append(ChatCompletionMessageToolCall(
+                    tool_calls_list.append(ToolCallEnvelope(
                         id=t["id"] or f"call_{idx}",
-                        function=Function(name=t["func"]["name"], arguments=t["func"]["args"]),
+                        function=ToolFunctionCall(
+                            name=t["func"]["name"],
+                            arguments=t["func"]["args"],
+                        ),
                         type="function",
                     ))
 
@@ -230,23 +236,28 @@ class WallELLMClient(LLMClient):
 
     def _run_chat_loop(self, user_input: str) -> Optional[str]:
         """Run full MemGPT-style chat loop. Returns the message for the user."""
+        # Drop any stale message from a prior interrupted turn.
+        self.comm_exec.get_last_message()
+
         # 1. Context update
+        interaction_count = self.recall_mem.get_count()
         self.context_manager.update_interaction(InteractionContext(
             last_interaction=datetime.now(),
-            interaction_count=self.recall_mem.get_count(),
+            interaction_count=interaction_count,
         ))
-        if self.recall_mem.get_count() % 5 == 0:
+        if interaction_count % 5 == 0:
             self.context_manager.update_environment(
-                SensorSimulator.simulate_environment_context(battery=80 - self.recall_mem.get_count())
+                SensorSimulator.simulate_environment_context(
+                    battery=max(0, 80 - interaction_count)
+                )
             )
 
         # 2. Retrieve relevant memories
         memory_context = self._retrieve_relevant_context(user_input)
-        full_input = memory_context + user_input if memory_context else user_input
 
         # 3. Insert user message (deferred embedding)
         self.recall_mem.insert("user", user_input, defer_embedding=True)
-        self.session.add("user", full_input)
+        self.session.add("user", user_input)
         self.heartbeat.reset()
 
         # 4. Compress old memories if needed (non-blocking, guarded against re-entry)
@@ -272,23 +283,13 @@ class WallELLMClient(LLMClient):
         # 5. Tool execution loop
         iteration = 0
         user_received_message = False
-        robot_tool_names = get_robot_tool_names()
 
         while iteration < 10:
             iteration += 1
-            tools = (
-                get_communication_tools()
-                + get_robot_control_tools()
-                + get_memory_tools()
-                + get_personality_tools()
-                + get_knowledge_tools()
-            )
-            if self.capture_image_exec is not None:
-                tools += get_capture_image_tools()
-            tools = add_heartbeat_to_tools(tools)
+            tools = self.tool_suite.build_schemas()
 
             content, tool_calls = self._stream_llm(
-                self.session.get_messages(self._get_system_prompt()), tools
+                self.session.get_messages(self._get_system_prompt(memory_context)), tools
             )
 
             if not tool_calls:
@@ -311,49 +312,19 @@ class WallELLMClient(LLMClient):
                     self.session.add_tool_result(tc.id, name, f"Error: Invalid JSON - {e}")
                     continue
 
-                if args.pop("request_heartbeat", False):
-                    hb_req = True
+                execution = self.tool_suite.execute_tool(
+                    name=name,
+                    args=args,
+                    user_message_already_sent=user_received_message,
+                )
 
-                # send_message — what the user sees
-                if name == "send_message":
-                    try:
-                        validated = SendMessageArgs.model_validate(args)
-                        message = validated.message
-                    except Exception as e:
-                        _log.warning("send_message validation error: %s", e)
-                        self.session.add_tool_result(tc.id, name, f"Validation error: {e}")
-                        continue
+                if execution.user_message and not user_received_message:
+                    _log.debug("WALL-E: %s", execution.user_message)
+                    self.recall_mem.insert("assistant", execution.user_message)
+                    user_received_message = True
 
-                    if message and not user_received_message:
-                        _log.debug("WALL-E: %s", message)
-                        self.recall_mem.insert("assistant", message)
-                        user_received_message = True
-                        result = "Message delivered to user"
-                    else:
-                        result = "Message already sent (duplicate ignored)"
-                    self.session.add_tool_result(tc.id, name, result)
-                    continue
-
-                _log.debug("Tool: %s", name)
-
-                try:
-                    if name == "capture_image" and self.capture_image_exec is not None:
-                        result = self.capture_image_exec.execute(name, args)
-                        hb_req = True
-                    elif name == "consult_internet_for_facts":
-                        result = self.knowledge_exec.execute(name, args)
-                        hb_req = True
-                    elif name in robot_tool_names:
-                        result = self.robot_exec.execute(name, args)
-                    elif name == "set_personality":
-                        result = self.personality_exec.execute(name, args)
-                    else:
-                        result = self.mem_exec.execute(name, args)
-                except Exception as e:
-                    _log.error("Tool %s failed: %s", name, e)
-                    result = f"Error executing {name}: {e}"
-
-                self.session.add_tool_result(tc.id, name, str(result))
+                hb_req = hb_req or execution.heartbeat_requested
+                self.session.add_tool_result(tc.id, name, execution.tool_result)
 
             if user_received_message:
                 break
@@ -682,7 +653,7 @@ def main():
     # Voice mode — lazy-load heavy STT/TTS dependencies
     print(f'  Say "{args.wake_word}" to begin!\n')
 
-    from main import VoiceAssistant, ROBOT_INTENTS, Mimic3TTSEngine, ConsoleTTSEngine, ModelArch
+    from stt_tts.main import VoiceAssistant, ROBOT_INTENTS, Mimic3TTSEngine, ConsoleTTSEngine, ModelArch
 
     robot_bridge = RobotBridge(llm_client.robot_exec)
     tts = ConsoleTTSEngine() if args.no_tts else Mimic3TTSEngine(url=args.tts_url, voice=args.tts_voice)

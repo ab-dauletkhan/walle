@@ -4,7 +4,6 @@ Background thread that processes camera frames and feeds VisualContext into Cont
 Supports two backends: Google Coral TPU (preferred) and CPU (YOLOv8 + InsightFace fallback).
 """
 import logging
-import sys
 import os
 import time
 import threading
@@ -19,10 +18,9 @@ import numpy as np
 _log = logging.getLogger("walle.vision")
 
 _BASE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(_BASE, "memory"))
 
-from config import conf
-from context_manager import ContextManager, VisualContext
+from memory.config import conf
+from memory.context_manager import ContextManager, VisualContext
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +214,6 @@ class CPUVisionBackend(VisionBackend):
 
     def __init__(self):
         cv_dir = os.path.join(_BASE, "comp_vision_diplomka")
-        sys.path.insert(0, cv_dir)
 
         from ultralytics import YOLO
         import onnxruntime as ort

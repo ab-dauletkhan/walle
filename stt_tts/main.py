@@ -12,7 +12,7 @@ Each layer is an abstract interface so implementations can be swapped
 without touching the orchestration logic.
 
 To start:
-python3 main.py --wake-word "hey, rocket" --listen-timeout 3.0
+python3 -m stt_tts.main --wake-word "hey, rocket" --listen-timeout 3.0
 """
 
 import io
@@ -40,7 +40,7 @@ from moonshine_voice import (
     get_embedding_model,
 )
 
-from mock_llm import LLMClient, MockLLMClient
+from stt_tts.mock_llm import LLMClient, MockLLMClient
 
 STT_MODEL_CHOICES = {
     "tiny-streaming": ModelArch.TINY_STREAMING,
@@ -256,19 +256,20 @@ class SpeechRouter(TranscriptEventListener):
         "hey", "hi", "hello", "listening", "ready", "here",
     }
 
-    def _play_wake_sound(self) -> None:
+    def _play_wake_sound(self, initial_command: str = "") -> None:
         """Play a random WAV from wake_sounds_dir (non-blocking).
 
         After playback + cooldown, clears any echo that leaked into
         _command_text, then starts the listen timeout. This guarantees
         the user's actual speech is what gets collected.
         """
+        initial_command = initial_command.strip()
         now = time.time()
         if now - self._last_wake_play_time < self._WAKE_DEBOUNCE_SECONDS:
             return
 
         if not self._wake_sounds_dir or not os.path.isdir(self._wake_sounds_dir):
-            self._start_timeout(self._post_speak_timeout)
+            self._start_timeout(self._listen_timeout if initial_command else self._post_speak_timeout)
             return
         wavs = [
             os.path.join(self._wake_sounds_dir, f)
@@ -276,7 +277,7 @@ class SpeechRouter(TranscriptEventListener):
             if f.lower().endswith(".wav")
         ]
         if not wavs:
-            self._start_timeout(self._listen_timeout * 3)
+            self._start_timeout(self._listen_timeout if initial_command else self._listen_timeout * 3)
             return
         self._speaking = True
         self._echo_words = self._WAKE_ECHO_WORDS.copy()
@@ -293,8 +294,8 @@ class SpeechRouter(TranscriptEventListener):
                 print(f"  Wake sound error: {e}", file=sys.stderr)
             finally:
                 self._speaking = False
-                self._command_text = ""
-                self._start_timeout(self._post_speak_timeout)
+                self._command_text = initial_command
+                self._start_timeout(self._listen_timeout if initial_command else self._post_speak_timeout)
 
         threading.Thread(target=_play, daemon=True).start()
 
@@ -422,10 +423,11 @@ class SpeechRouter(TranscriptEventListener):
             tail = self._detect_wake(text)
             if tail is None:
                 return  # Not addressed to us — ignore background speech
+            initial_command = tail.strip()
             print("  👂 Yes, how can I help you?")
             self._state = self.LISTENING
-            self._command_text = ""
-            self._play_wake_sound()
+            self._command_text = initial_command
+            self._play_wake_sound(initial_command)
 
         elif self._state == self.LISTENING:
             if self._command_text:
@@ -634,7 +636,7 @@ def main():
 
     # -- Select LLM backend --
     if args.use_ollama:
-        from mock_llm import OllamaLLMClient
+        from stt_tts.mock_llm import OllamaLLMClient
         llm = OllamaLLMClient(base_url=args.ollama_url, model=args.ollama_model)
         print(f"LLM: Ollama ({args.ollama_model})", file=sys.stderr)
     else:
