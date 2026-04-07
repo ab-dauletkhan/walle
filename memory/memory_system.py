@@ -19,7 +19,10 @@ _log = logging.getLogger("walle.memory")
 
 # Configuration for Embeddings (Optimized for Jetson)
 from .config import conf, MEMORY_DIR
-from .search_fallback import get_default_fallback_search_strategy
+from .search_chain import (
+    FAISSSearchHandler, FTS5SearchHandler, RecentSearchHandler,
+    ensure_fts5_table, insert_fts5, delete_fts5_before,
+)
 
 
 def _connect_db(db_path: str) -> sqlite3.Connection:
@@ -301,6 +304,11 @@ class FAISSManager:
         """Check if index should be saved"""
         return self._insertions_since_save >= threshold
 
+    def get_indexed_ids(self) -> set:
+        """Return a snapshot of all row IDs currently in the FAISS index (thread-safe)."""
+        with self._index_lock:
+            return set(self.id_map)
+
     @property
     def is_available(self) -> bool:
         return _faiss_available and self.index is not None
@@ -501,7 +509,6 @@ class RecallMemory(FAISSIndexMixin):
     def __init__(self, db_path: str = None, use_semantic: bool = False):
         self.db_path = db_path or os.path.join(MEMORY_DIR, "walle_recall_memory.db")
         self.use_semantic = use_semantic
-        self._fallback_search = get_default_fallback_search_strategy()
         self._embedding_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="emb")
         self._pending_futures: set = set()
         self._pending_lock = threading.Lock()
@@ -517,12 +524,23 @@ class RecallMemory(FAISSIndexMixin):
             )
             self._ensure_faiss_index("recall_memory")
 
+        # Build search chain: FAISS → FTS5 → Recent
+        self._search_chain = FAISSSearchHandler(
+            faiss_manager=self.faiss_manager,
+            get_embedding_fn=get_embedding,
+            use_semantic=use_semantic,
+            next_handler=FTS5SearchHandler(
+                next_handler=RecentSearchHandler()
+            ),
+        )
+
     def _init_db(self):
         with _connect_db(self.db_path) as conn:
             conn.execute("""CREATE TABLE IF NOT EXISTS recall_memory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 role TEXT, content TEXT, tools_used TEXT, metadata TEXT, embedding BLOB)""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON recall_memory(timestamp DESC)")
+        ensure_fts5_table(self.db_path, "recall_memory")
 
     def insert(self, role: str, content: str, tools_used: List[str] = None, metadata: Dict = None, defer_embedding: bool = False):
         """
@@ -547,6 +565,9 @@ class RecallMemory(FAISSIndexMixin):
                  json.dumps(metadata) if metadata else None, embedding)
             )
             row_id = cursor.lastrowid
+
+        # Keep FTS5 index in sync
+        insert_fts5(self.db_path, "recall_memory", row_id, content)
 
         # Add to FAISS index (sync path)
         if embedding and self.faiss_manager and self.faiss_manager.is_available:
@@ -593,67 +614,9 @@ class RecallMemory(FAISSIndexMixin):
             _log.warning("⚠️ Background embedding failed: %s", e)
 
     def search(self, query: str = None, limit: int = 10) -> List[Dict]:
-        """Search recall memory with FAISS-accelerated semantic search"""
-
-        # Sync any deferred embeddings that landed in SQLite but not yet in FAISS
+        """Search recall memory via chain: FAISS → FTS5 → Recent."""
         self._sync_faiss_if_needed("recall_memory")
-
-        # FAISS-accelerated semantic search (O(log n))
-        result = self._faiss_search(
-            query, limit,
-            "SELECT id, timestamp, role, content FROM recall_memory WHERE id IN ({placeholders})"
-        )
-        if result:
-            rows, faiss_results = result
-            row_map = {r[0]: r for r in rows}
-            results = []
-            for row_id, score in faiss_results:
-                if row_id in row_map:
-                    r = row_map[row_id]
-                    results.append({"role": r[2], "content": r[3], "timestamp": r[1], "score": round(score, 4)})
-            return results
-
-        # Fallback: Naive semantic search (if FAISS unavailable)
-        with _connect_db(self.db_path) as conn:
-            if self.use_semantic and query:
-                q_emb = get_embedding(query)
-                if q_emb:
-                    rows = conn.execute(
-                        "SELECT id, timestamp, role, content, tools_used, embedding FROM recall_memory WHERE embedding IS NOT NULL"
-                    ).fetchall()
-                    q_vec = np.frombuffer(q_emb, dtype=np.float32)
-                    results = []
-                    for r in rows:
-                        vec = np.frombuffer(r[5], dtype=np.float32)
-                        score = np.dot(q_vec, vec) / (np.linalg.norm(q_vec) * np.linalg.norm(vec) + 1e-8)
-                        results.append((score, r))
-                    results.sort(key=lambda x: x[0], reverse=True)
-                    return [{"role": r[1][2], "content": r[1][3], "timestamp": r[1][1]} for r in results[:limit]]
-
-                rows = conn.execute(
-                    "SELECT role, content, timestamp FROM recall_memory ORDER BY timestamp DESC"
-                ).fetchall()
-                ranked = self._fallback_search.rank_rows(query, rows, lambda row: row[1])
-                if ranked:
-                    ranked.sort(key=lambda item: (item.score, item.row[2]), reverse=True)
-                    return [
-                        {"role": row[0], "content": row[1], "timestamp": row[2]}
-                        for row in (item.row for item in ranked[:limit])
-                    ]
-
-            # Text search fallback
-            if query:
-                rows = conn.execute(
-                    "SELECT role, content, timestamp FROM recall_memory WHERE content LIKE ? ORDER BY timestamp DESC LIMIT ?",
-                    (f"%{query}%", limit)
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT role, content, timestamp FROM recall_memory ORDER BY timestamp DESC LIMIT ?",
-                    (limit,)
-                ).fetchall()
-
-            return [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in rows]
+        return self._search_chain.search(query, limit, self.db_path, table="recall_memory") or []
 
     def get_count(self) -> int:
         with _connect_db(self.db_path) as conn:
@@ -690,6 +653,9 @@ class RecallMemory(FAISSIndexMixin):
             conn.execute("DELETE FROM recall_memory WHERE timestamp <= ?", (newest_of_old,))
             deleted_count = len(rows)
 
+        # Sync FTS5 index after deletion
+        delete_fts5_before(self.db_path, "recall_memory", newest_of_old)
+
         if self.faiss_manager and self.faiss_manager.is_available:
             self.faiss_manager.rebuild_from_db(self.db_path, "recall_memory")
             self.faiss_manager.save()
@@ -721,7 +687,6 @@ class ArchivalMemory(FAISSIndexMixin):
     def __init__(self, db_path: str = None, use_semantic: bool = False):
         self.db_path = db_path or os.path.join(MEMORY_DIR, "walle_archival_memory.db")
         self.use_semantic = use_semantic
-        self._fallback_search = get_default_fallback_search_strategy()
         self._init_db()
 
         # Initialize FAISS manager for archival memory
@@ -734,11 +699,22 @@ class ArchivalMemory(FAISSIndexMixin):
             )
             self._ensure_faiss_index("archival_memory")
 
+        # Build search chain: FAISS → FTS5 → Recent
+        self._search_chain = FAISSSearchHandler(
+            faiss_manager=self.faiss_manager,
+            get_embedding_fn=get_embedding,
+            use_semantic=use_semantic,
+            next_handler=FTS5SearchHandler(
+                next_handler=RecentSearchHandler()
+            ),
+        )
+
     def _init_db(self):
         with _connect_db(self.db_path) as conn:
             conn.execute("""CREATE TABLE IF NOT EXISTS archival_memory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 category TEXT, content TEXT, importance INTEGER, metadata TEXT, embedding BLOB)""")
+        ensure_fts5_table(self.db_path, "archival_memory")
 
     def insert(self, category: str, content: str, importance: int = 5, metadata: Dict = None):
         embedding = get_embedding(content) if self.use_semantic else None
@@ -750,6 +726,9 @@ class ArchivalMemory(FAISSIndexMixin):
             )
             row_id = cursor.lastrowid
 
+        # Keep FTS5 index in sync
+        insert_fts5(self.db_path, "archival_memory", row_id, content)
+
         # Add to FAISS index (use threshold-based save like RecallMemory)
         if embedding and self.faiss_manager and self.faiss_manager.is_available:
             self.faiss_manager.add(embedding, row_id)
@@ -757,45 +736,17 @@ class ArchivalMemory(FAISSIndexMixin):
                 self.faiss_manager.save_async()  # Non-blocking save
 
     def search(self, query: str, limit: int = 5) -> List[Dict]:
-        """Search archival memory with FAISS and importance decay"""
+        """Search archival memory via chain: FAISS → FTS5 → Recent, with importance decay."""
         fetch_limit = limit * 3  # Fetch more for decay filtering
-
-        # Sync any embeddings that landed in SQLite but not yet in FAISS
         self._sync_faiss_if_needed("archival_memory")
 
-        # FAISS-accelerated semantic search
-        result = self._faiss_search(
-            query, fetch_limit,
-            "SELECT id, category, content, importance, timestamp FROM archival_memory WHERE id IN ({placeholders})"
+        results = self._search_chain.search(
+            query, fetch_limit, self.db_path, table="archival_memory",
+            format_archival=self._apply_importance_decay,
         )
-        if result:
-            rows, _ = result
-            return self._apply_importance_decay(rows)[:limit]
-
-        # Fallback: Text search with decay
-        with _connect_db(self.db_path) as conn:
-            if self.use_semantic:
-                q_emb = get_embedding(query)
-                if not q_emb:
-                    rows = conn.execute(
-                        "SELECT id, category, content, importance, timestamp FROM archival_memory"
-                    ).fetchall()
-                    ranked = self._fallback_search.rank_rows(query, rows, lambda row: row[2])
-                    if ranked:
-                        ranked.sort(key=lambda item: item.score, reverse=True)
-                        return self._apply_importance_decay(
-                            [item.row for item in ranked[:fetch_limit]]
-                        )[:limit]
-
-            rows = conn.execute(
-                "SELECT id, category, content, importance, timestamp FROM archival_memory WHERE content LIKE ? ORDER BY importance DESC LIMIT ?",
-                (f"%{query}%", fetch_limit)
-            ).fetchall()
-
-        if not rows:
-            return []
-
-        return self._apply_importance_decay(rows)[:limit]
+        if results:
+            return results[:limit]
+        return []
 
     def _apply_importance_decay(self, rows: List[tuple]) -> List[Dict]:
         """

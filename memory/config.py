@@ -45,13 +45,6 @@ class Config:
     # --- Search Settings ---
     MAX_SEARCH_RESULTS: int = 5
     SEARCH_REGIONS: List[str] = field(default_factory=lambda: ["wt-wt", "us-en"])
-    SEARCH_FALLBACK_LEXICON_PATH: str = field(
-        default_factory=lambda: os.path.join(MEMORY_DIR, "search_fallback_lexicon.json")
-    )
-    SEARCH_FALLBACK_EXACT_MATCH_BOOST: float = 5.0
-    SEARCH_FALLBACK_OVERLAP_WEIGHT: float = 2.0
-    SEARCH_FALLBACK_COVERAGE_WEIGHT: float = 1.0
-
     # --- Vision Thresholds ---
     VISION_FACE_DETECTION_THRESHOLD: float = 0.5   # Min score from face detector
     VISION_FACE_RECOGNITION_MIN: float = 0.8       # Min detection score to attempt recognition

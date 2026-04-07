@@ -187,17 +187,18 @@ class TestRecallMemory(unittest.TestCase):
         self.assertGreaterEqual(len(python_results), 2)
 
     def test_semantic_search(self):
-        """Test semantic search with embeddings"""
-        # Insert semantically related messages
+        """Test text search finds matching content via FTS5."""
+        # Insert messages with shared tokens
         self.recall.insert("user", "I enjoy drinking coffee in the morning")
         self.recall.insert("user", "Programming is my hobby")
         self.recall.insert("user", "I like espresso and cappuccino")
 
-        # Search for coffee-related content
-        results = self.recall.search("What beverages do you like?", limit=3)
+        # FTS5 search using a token that appears in the content
+        results = self.recall.search("coffee", limit=3)
 
-        # Should return results (semantic search finds related content)
+        # Should return at least the coffee message
         self.assertGreater(len(results), 0)
+        self.assertTrue(any("coffee" in r["content"].lower() for r in results))
 
     def test_recent_messages_ordering(self):
         """Test that messages are ordered by recency"""
