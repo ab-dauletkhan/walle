@@ -14,12 +14,9 @@ _log = logging.getLogger("walle.robot")
 
 try:
     import serial
-
     SERIAL_AVAILABLE = True
 except ImportError:
     SERIAL_AVAILABLE = False
-    _log.warning("pyserial not installed. Robot control simulation mode only.")
-    _log.warning("   Install with: pip install pyserial")
 
 
 _ROBOT_REGISTRY = build_default_robot_registry()

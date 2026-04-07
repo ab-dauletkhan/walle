@@ -32,43 +32,53 @@ def _connect_db(db_path: str) -> sqlite3.Connection:
 _embedding_model = None
 _embedding_device = None
 _embedding_lock = threading.Lock()
+_embedding_failed = False  # Sentinel: once True, never retry
 
 def get_embedding_model():
-    """Lazy load sentence-transformer model (thread-safe)"""
-    global _embedding_model, _embedding_device
+    """Lazy load sentence-transformer model (thread-safe).
 
+    After the first failure (missing library or load error), sets a sentinel
+    so subsequent calls return None immediately without retrying.
+    """
+    global _embedding_model, _embedding_device, _embedding_failed
+
+    if _embedding_failed:
+        return None
     if _embedding_model is not None:
         return _embedding_model
 
     with _embedding_lock:
-        # Double-check after acquiring lock
-        if _embedding_model is None:
-            try:
-                from sentence_transformers import SentenceTransformer
-                import torch
+        if _embedding_failed:
+            return None
+        if _embedding_model is not None:
+            return _embedding_model
 
-                # Determine device
-                _embedding_device = conf.EMBEDDING_DEVICE if torch.cuda.is_available() else "cpu"
+        try:
+            from sentence_transformers import SentenceTransformer
+            import torch
 
-                _log.info("🔧 Loading embedding model: %s on %s...", conf.EMBEDDING_MODEL, _embedding_device)
-                _embedding_model = SentenceTransformer(
-                    conf.EMBEDDING_MODEL,
-                    device=_embedding_device
-                )
+            _embedding_device = conf.EMBEDDING_DEVICE if torch.cuda.is_available() else "cpu"
 
-                # Optimize for inference
-                if _embedding_device == "cuda":
-                    _embedding_model.half()  # Use FP16 for GPU efficiency
+            _log.info("Loading embedding model: %s on %s...", conf.EMBEDDING_MODEL, _embedding_device)
+            _embedding_model = SentenceTransformer(
+                conf.EMBEDDING_MODEL,
+                device=_embedding_device
+            )
 
-                _log.info("✅ Embedding model loaded")
+            if _embedding_device == "cuda":
+                _embedding_model.half()
 
-            except ImportError:
-                _log.warning("⚠️ sentence-transformers not installed. Embeddings disabled.")
-                _log.warning("   Install with: pip install sentence-transformers")
-                return None
-            except Exception as e:
-                _log.warning("⚠️ Failed to load embedding model: %s", e)
-                return None
+            _log.info("Embedding model loaded")
+
+        except ImportError:
+            _embedding_failed = True
+            _log.warning("sentence-transformers not installed. Embeddings disabled.")
+            _log.warning("   Install with: pip install sentence-transformers")
+            return None
+        except Exception as e:
+            _embedding_failed = True
+            _log.warning("Failed to load embedding model: %s", e)
+            return None
 
     return _embedding_model
 
@@ -103,7 +113,7 @@ def get_embedding(text: str) -> Optional[bytes]:
         return embedding_np.tobytes()
 
     except Exception as e:
-        _log.warning("⚠️ Embedding error: %s", e)
+        _log.warning("Embedding error: %s", e)
         return None
 
 

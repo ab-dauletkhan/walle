@@ -1,7 +1,7 @@
 import logging
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import List
 from pathlib import Path
 
@@ -68,33 +68,53 @@ class Config:
     SERIAL_PORT: str = None
     BAUD_RATE: int = 115200
 
-    def validate(self) -> bool:
-        """Validates Ollama configuration."""
-        log = logging.getLogger("walle.config")
-        try:
-            import requests
-            res = requests.get(self.OLLAMA_BASE_URL, timeout=5)
-            if res.status_code != 200:
-                log.warning("Ollama server not responding at %s", self.OLLAMA_BASE_URL)
-                return False
+    @classmethod
+    def load(cls) -> "Config":
+        """Create Config with defaults, then override from WALLE_* env vars."""
+        instance = cls()
+        for f in fields(instance):
+            env_key = f"WALLE_{f.name}"
+            env_val = os.environ.get(env_key)
+            if env_val is not None:
+                try:
+                    origin = f.type
+                    if origin is bool or origin == "bool":
+                        parsed = env_val.lower() in ("1", "true", "yes")
+                    elif origin is int or origin == "int":
+                        parsed = int(env_val)
+                    elif origin is float or origin == "float":
+                        parsed = float(env_val)
+                    else:
+                        parsed = env_val
+                    object.__setattr__(instance, f.name, parsed)
+                except (ValueError, TypeError):
+                    pass  # Keep default if env value can't be cast
+        return instance
 
-            res = requests.get(f"{self.OLLAMA_BASE_URL}/api/tags")
-            models = [m['name'] for m in res.json().get('models', [])]
-            if self.OLLAMA_MODEL not in models and f"{self.OLLAMA_MODEL}:latest" not in models:
-                log.warning("Model '%s' not found. Available: %s", self.OLLAMA_MODEL, models)
-                log.warning("Run: ollama pull %s", self.OLLAMA_MODEL)
-                return False
 
-            log.info("Ollama validation passed - %s", self.OLLAMA_MODEL)
-            return True
-        except Exception as e:
-            log.warning("Ollama validation failed: %s", e)
-            log.warning("Make sure Ollama is running: ollama serve")
+def validate_ollama(config: "Config") -> bool:
+    """Check Ollama is reachable and model is available."""
+    log = logging.getLogger("walle.config")
+    try:
+        import requests
+        res = requests.get(config.OLLAMA_BASE_URL, timeout=5)
+        if res.status_code != 200:
+            log.warning("Ollama server not responding at %s", config.OLLAMA_BASE_URL)
             return False
 
-    @classmethod
-    def load(cls):
-        return cls()
+        res = requests.get(f"{config.OLLAMA_BASE_URL}/api/tags")
+        models = [m['name'] for m in res.json().get('models', [])]
+        if config.OLLAMA_MODEL not in models and f"{config.OLLAMA_MODEL}:latest" not in models:
+            log.warning("Model '%s' not found. Available: %s", config.OLLAMA_MODEL, models)
+            log.warning("Run: ollama pull %s", config.OLLAMA_MODEL)
+            return False
+
+        log.info("Ollama validation passed - %s", config.OLLAMA_MODEL)
+        return True
+    except Exception as e:
+        log.warning("Ollama validation failed: %s", e)
+        log.warning("Make sure Ollama is running: ollama serve")
+        return False
 
 conf = Config.load()
 
@@ -140,15 +160,9 @@ def setup_logging(run_mode: str = None) -> None:
         root_logger.warning("Could not open log file %s", log_path)
 
 
-# Convenience: call at import time so early log calls don't vanish.
-# main() can call setup_logging() again to reconfigure after arg parsing.
-setup_logging()
+# Add a NullHandler so log calls before setup_logging() don't vanish.
+# The real setup_logging() should be called once from main().
+logging.getLogger("walle").addHandler(logging.NullHandler())
 
 # Module-level logger for this file
 _log = logging.getLogger("walle.config")
-
-
-def debug_print(*args, **kwargs):
-    """Legacy helper kept for backward-compat. Prefer logger.debug()."""
-    if conf.RUN_MODE == "debug":
-        print(*args, **kwargs)

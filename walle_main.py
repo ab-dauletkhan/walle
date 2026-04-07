@@ -18,7 +18,7 @@ from typing import Iterator, Optional
 _BASE = os.path.dirname(os.path.abspath(__file__))
 
 # --- Memory subsystem imports ---
-from memory.config import conf, debug_print, setup_logging
+from memory.config import conf, setup_logging
 from memory.memory_system import Memory, RecallMemory, ArchivalMemory
 from memory.memory_tools import MemoryToolExecutor
 from memory.personality_system import PersonalityEngine, PersonalityToolExecutor
@@ -527,6 +527,8 @@ def _shutdown(llm_client: WallELLMClient, api_srv=None):
 # Main entry point
 # ---------------------------------------------------------------------------
 def main():
+    setup_logging()
+
     parser = argparse.ArgumentParser(description="WALL-E Unified Orchestrator")
 
     # Mode

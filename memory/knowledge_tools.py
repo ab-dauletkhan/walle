@@ -1,14 +1,15 @@
 import json
+import logging
 import re
 
 from .base_executor import BaseToolExecutor
-from .config import conf, debug_print
+from .config import conf
+
+_log = logging.getLogger("walle.knowledge")
 
 try:
     from duckduckgo_search import DDGS
 except ImportError:
-    print("⚠️ duckduckgo_search not installed. Web search disabled.")
-    print("   Install with: pip install duckduckgo-search")
     DDGS = None
 
 def get_knowledge_tools():
@@ -70,6 +71,7 @@ class KnowledgeToolExecutor(BaseToolExecutor):
 
     def _search_web(self, query: str) -> str:
         if DDGS is None:
+            _log.warning("duckduckgo_search not installed. Install with: pip install duckduckgo-search")
             return "❌ SYSTEM: Web search not available. Install duckduckgo-search package."
 
         # Logic: Only append 'english' if the query is long enough to likely return foreign results.
@@ -83,7 +85,7 @@ class KnowledgeToolExecutor(BaseToolExecutor):
         else:
             search_query = f"{clean_query} english" if "english" not in clean_query.lower() else clean_query
             
-        debug_print(f"   🌍 Searching: '{search_query}'...")
+        _log.debug("Searching: '%s'...", search_query)
 
         best_results = []
 
@@ -106,7 +108,7 @@ class KnowledgeToolExecutor(BaseToolExecutor):
                             break 
                             
                     except Exception as e:
-                        debug_print(f"   ⚠️ Region {region} failed: {e}")
+                        _log.debug("Region %s failed: %s", region, e)
                         continue
             
             if not best_results:
@@ -120,5 +122,5 @@ class KnowledgeToolExecutor(BaseToolExecutor):
             return formatted
             
         except Exception as e:
-            debug_print(f"❌ Search Error: {e}")
+            _log.debug("Search Error: %s", e)
             return f"Search failed: {str(e)}"
