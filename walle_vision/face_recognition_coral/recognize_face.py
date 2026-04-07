@@ -1,0 +1,268 @@
+"""
+Run to recognize people that were scanned previously. When a person with name "X" is recognized, the program will give an
+auidio output saying "Hello X".
+
+If you do not have an Edge TPU or you want to see the performance difference, change the
+variable ifEdgeTPU_1_else_0 in main() to 0.
+"""
+
+import io
+import re
+import os
+import time
+from tflite_runtime.interpreter import load_delegate
+
+from annotation import Annotator
+
+import numpy as np
+
+from PIL import Image
+from PIL import ImageDraw
+import cv2
+
+
+from tflite_runtime.interpreter import Interpreter
+
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 960
+
+def main():
+  #ifEdgeTPU_1_else_0 = 1
+  ifEdgeTPU_1_else_0 = 1
+  
+  labels = load_labels('coco_labels.txt')
+  people_lables = load_labels('people_labels.txt')
+  
+  #get interpreter for face detection model
+  if ifEdgeTPU_1_else_0 == 1:
+      interpreter = Interpreter(model_path = 'models/ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite',
+        experimental_delegates=[load_delegate('libedgetpu.so.1.0')])
+  else:
+      interpreter = Interpreter(model_path = 'models/ssd_mobilenet_v2_face_quant_postprocess.tflite')
+  
+  interpreter.allocate_tensors()
+  _, input_height, input_width, _ = interpreter.get_input_details()[0]['shape']
+  
+  #get interpreter for face embedding model
+  if ifEdgeTPU_1_else_0 == 1:
+      interpreter_emb = Interpreter(model_path = 'models/Mobilenet1_triplet1589223569_triplet_quant_edgetpu.tflite',
+        experimental_delegates=[load_delegate('libedgetpu.so.1.0')])
+  else:
+      interpreter_emb = Interpreter(model_path = 'models/Mobilenet1_triplet1589223569_triplet_quant.tflite')
+
+  interpreter_emb.allocate_tensors()
+
+  cap = cv2.VideoCapture(0)
+  cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+  cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+  cap.set(cv2.CAP_PROP_FPS, 30)
+
+  try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to grab frame")
+            break
+
+        # Rotate 270 degrees
+        #frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        # Convert BGR (OpenCV) to RGB (PIL), then resize for inference
+        image_large = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        image = image_large.convert('RGB').resize(
+            (input_width, input_height), Image.LANCZOS)
+
+        start_time = time.monotonic()
+        results = detect_objects(interpreter, image, 0.5)
+        elapsed_ms = (time.monotonic() - start_time) * 1000
+
+        # Draw annotations
+        annotate_objects(frame, results, labels, CAMERA_WIDTH, CAMERA_HEIGHT)
+        cv2.putText(frame, '%.1fms' % elapsed_ms, (5, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.imshow('Face Recognition', frame)
+
+        ymin, xmin, ymax, xmax, score = get_best_box_param(results, CAMERA_WIDTH, CAMERA_HEIGHT)
+
+        if score > 0.80:
+            img = np.array(image_large)
+            img_cut = img[ymin:ymax, xmin:xmax, :]
+            img_cut = cv2.resize(img_cut, dsize=(96, 96),
+                                 interpolation=cv2.INTER_CUBIC).astype('uint8')
+            img_cut = img_cut.reshape(1, 96, 96, 3) / 255.
+            emb = img_to_emb(interpreter_emb, img_cut)
+            get_person_from_embedding(people_lables, emb)
+
+        # Press 'q' to quit
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+  finally:
+    cap.release()
+    cv2.destroyAllWindows()
+
+def get_person_from_embedding(people_lables, emb):
+    """Compare embedding to scanned people using cosine similarity (consistent with CoralVisionBackend)."""
+    num_emb_check = 20
+    path = 'scanned_people/'
+    folders = os.listdir(path)
+    folders = sorted(folders)
+    averages = np.zeros(len(folders))
+
+    # Normalise the query embedding once
+    emb_flat = emb.flatten()
+    emb_norm = np.linalg.norm(emb_flat)
+    if emb_norm < 1e-12:
+        print("person on pic: ", people_lables[0])
+        return
+    emb_unit = emb_flat / emb_norm
+
+    folder_number = 0
+    start = time.time()
+    for folder in folders:
+        sim_sum = 0.0
+        files = os.listdir(path + folder + '/embeddings')
+        files = sorted(files)
+        checked = 0
+        for file in files:
+            emb2 = np.load(path + folder + '/embeddings' + '/' + file)
+            ref_flat = emb2.flatten()
+            ref_norm = np.linalg.norm(ref_flat)
+            if ref_norm < 1e-12:
+                continue
+            sim_sum += float(np.dot(emb_unit, ref_flat / ref_norm))
+            checked += 1
+            if checked == num_emb_check:
+                break
+        averages[folder_number] = sim_sum / max(checked, 1)
+        folder_number += 1
+
+    who_is_on_pic = 0
+    highest_sim_found = -1.0
+    run = 0
+    end = time.time()
+    print("time for detection: ", end - start)
+    for average in averages:
+        run += 1
+        if average > 0.5 and average > highest_sim_found:
+            highest_sim_found = average
+            who_is_on_pic = run
+        print(f"  cosine similarity: {average:.4f}")
+    print("person on pic: ", people_lables[who_is_on_pic])
+
+
+def load_labels(path):
+  #Loads the labels file. Supports files with or without index numbers.
+  with open(path, 'r', encoding='utf-8') as f:
+    lines = f.readlines()
+    labels = {}
+    for row_number, content in enumerate(lines):
+      pair = re.split(r'[:\s]+', content.strip(), maxsplit=1)
+      if len(pair) == 2 and pair[0].strip().isdigit():
+        labels[int(pair[0])] = pair[1].strip()
+      else:
+        labels[row_number] = pair[0].strip()
+  return labels
+
+
+def set_input_tensor(interpreter, image):
+  #Sets the input tensor.
+  tensor_index = interpreter.get_input_details()[0]['index']
+  input_tensor = interpreter.tensor(tensor_index)()[0]
+  input_tensor[:, :] = image
+
+
+def get_output_tensor(interpreter, index):
+  #Returns the output tensor at the given index.
+  output_details = interpreter.get_output_details()[index]
+  tensor = np.squeeze(interpreter.get_tensor(output_details['index']))
+  return tensor
+
+def set_input_tensor_emb(interpreter, input):
+    #Sets input sensor for face embedding model
+    input_details = interpreter.get_input_details()[0]
+    tensor_index = input_details['index']
+    scale, zero_point = input_details['quantization']
+    input_tensor = interpreter.tensor(tensor_index)()[0]
+    input_tensor[:, :] = np.uint8(input/scale + zero_point)
+
+
+
+def img_to_emb(interpreter,input):
+    #returns embedding vector, using the face embedding model
+    set_input_tensor_emb(interpreter, input)
+    interpreter.invoke()
+    output_details = interpreter.get_output_details()[0]
+    #emb = np.squeeze(interpreter.get_tensor(output_details['index']))
+    emb = interpreter.get_tensor(output_details['index'])
+    scale, zero_point = output_details['quantization']
+    emb = scale * (emb - zero_point)
+    return emb
+
+def detect_objects(interpreter, image, threshold):
+  #Returns a list of detection results, each a dictionary of object info.
+  set_input_tensor(interpreter, image)
+  interpreter.invoke()
+
+  # Get all output details
+  boxes = get_output_tensor(interpreter, 0)
+  classes = get_output_tensor(interpreter, 1)
+  scores = get_output_tensor(interpreter, 2)
+  count = int(get_output_tensor(interpreter, 3))
+
+  results = []
+  for i in range(count):
+    if scores[i] >= threshold:
+      result = {
+          'bounding_box': boxes[i],
+          'class_id': classes[i],
+          'score': scores[i]
+      }
+      results.append(result)
+  return results
+
+def get_best_box_param(results,CAMERA_WIDTH, CAMERA_HEIGHT):
+    #Returns the box parameters for the box with the highest score
+    best_boxvalue = 0
+    xmin = 0
+    xmax = 1
+    ymin = 0
+    ymax = 1
+    for obj in results:
+        if obj['score'] > best_boxvalue:
+            best_boxvalue = obj['score']
+            ymin, xmin, ymax, xmax = obj['bounding_box']
+            if xmin < 0:
+                xmin = 0
+            if xmax > 1:
+                xmax = 1
+            if ymin < 0:
+                ymin = 0
+            if ymax > 1:
+                ymax = 1
+            xmin = int(xmin * CAMERA_WIDTH)
+            xmax = int(xmax * CAMERA_WIDTH)
+            ymin = int(ymin * CAMERA_HEIGHT)
+            ymax = int(ymax * CAMERA_HEIGHT)
+    #print("score: ", best_boxvalue)
+    return ymin, xmin, ymax, xmax, best_boxvalue
+
+def annotate_objects(frame, results, labels, CAMERA_WIDTH, CAMERA_HEIGHT):
+    for obj in results:
+        ymin, xmin, ymax, xmax = obj['bounding_box']
+        xmin = int(xmin * CAMERA_WIDTH)
+        xmax = int(xmax * CAMERA_WIDTH)
+        ymin = int(ymin * CAMERA_HEIGHT)
+        ymax = int(ymax * CAMERA_HEIGHT)
+
+        cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
+        cv2.putText(frame, '%s %.2f' % (labels[obj['class_id']], obj['score']),
+                    (xmin, ymin - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    
+
+
+
+if __name__ == '__main__':
+  main()

@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <link rel="shortcut icon" href="{{ url_for('static', filename='favicon.ico') }}">
+	
+    <!-- Required meta tags -->
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+
+    <!-- Bootstrap CSS -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/latoFontFamily.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/bootstrap.min.css') }}">
+    <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='css/mystyle.css') }}">
+    <title>WALL-E Controller</title>
+</head>
+<body>
+	<div class="container-fluid">
+		<form action="/login_request" method="post">
+			<br>
+			<div class="row set-row">
+				<div class="col set-text">Password</div>
+				<div class="col" type="password">
+					<input type="text" class="form-control set-num" autocomplete="off" type="password" name="password" autofocus>
+				</div>
+			</div>
+			<div class="row set-row">
+				<div class="col set-text"></div>
+				<div class="col">
+					<button type="submit" value="Submit" class="btn btn-outline-info">Submit</button>
+				</div>
+			</div>
+			{% if incorrectPassword %}
+				<div class="row set-row" style="padding-top: 1em">
+					<div class="col set-text"></div>
+					<div class="col">
+						<div class="alert-col alert alert-danger" style="max-width: 12em">
+							<div id="alert-space">Incorrect Password!</div>
+						</div>
+					</div>
+			 	</div>
+			{% endif %}
+		</form>
+	</div>
+
+    <!-- Optional JavaScript -->
+    <!-- jQuery first, then Popper.js, then Bootstrap JS -->
+    <script src="{{ url_for('static', filename='js/jquery-3.7.1.min.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/bootstrap.bundle.min.js') }}"></script>
+	
+</body>
+<footer></footer>

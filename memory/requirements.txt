@@ -1,0 +1,29 @@
+# WALL-E v3.1 Requirements
+# For NVIDIA Jetson or any system with Ollama
+
+# Core dependencies
+numpy>=1.24.0
+
+# Transformers for tokenizers
+transformers>=4.35.0
+
+# Embeddings (Lightweight)
+sentence-transformers>=2.2.0
+
+# FAISS for fast vector search
+faiss-cpu>=1.7.4
+
+# OpenAI SDK (for Ollama compatibility)
+openai>=1.3.0
+
+# HTTP requests (for Ollama validation)
+requests>=2.31.0
+
+# Web search
+duckduckgo-search>=4.0.0
+
+# Serial communication for robot control
+pyserial>=3.5
+
+# Testing
+pytest>=7.4.0
