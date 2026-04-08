@@ -67,62 +67,37 @@ class LLMStreamer:
         self._model = model
 
     def stream(self, messages, tools, max_retries=2):
-        """Stream response, return (content, tool_calls_list)."""
+        """Call LLM and return (content, tool_calls_list)."""
         for attempt in range(max_retries):
             try:
-                stream = self._client.chat.completions.create(
+                response = self._client.chat.completions.create(
                     model=self._model,
                     messages=messages,
                     tools=tools,
                     tool_choice="auto",
-                    stream=True,
                 )
 
-                full_content = ""
-                tool_calls_map = {}
-                inner_thought_started = False
+                choice = response.choices[0]
+                content = choice.message.content or ""
 
-                for chunk in stream:
-                    delta = chunk.choices[0].delta
-                    if delta.content:
-                        full_content += delta.content
-                        if _log.isEnabledFor(logging.DEBUG):
-                            if not inner_thought_started:
-                                print("   \U0001f4ad ", end="", flush=True)
-                                inner_thought_started = True
-                            print(delta.content, end="", flush=True)
-
-                    if delta.tool_calls:
-                        for tc in delta.tool_calls:
-                            idx = tc.index
-                            if idx not in tool_calls_map:
-                                tool_calls_map[idx] = {"id": "", "func": {"name": "", "args": ""}}
-                            if tc.id:
-                                tool_calls_map[idx]["id"] += tc.id
-                            if tc.function.name:
-                                tool_calls_map[idx]["func"]["name"] += tc.function.name
-                            if tc.function.arguments:
-                                tool_calls_map[idx]["func"]["args"] += tc.function.arguments
-
-                if inner_thought_started:
-                    print()
+                if content and _log.isEnabledFor(logging.DEBUG):
+                    print(f"   \U0001f4ad {content}")
 
                 tool_calls_list = []
-                for idx in sorted(tool_calls_map.keys()):
-                    t = tool_calls_map[idx]
-                    tool_calls_list.append(ToolCallEnvelope(
-                        id=t["id"] or f"call_{idx}",
-                        function=ToolFunctionCall(
-                            name=t["func"]["name"],
-                            arguments=t["func"]["args"],
-                        ),
-                        type="function",
-                    ))
+                if choice.message.tool_calls:
+                    for tc in choice.message.tool_calls:
+                        tool_calls_list.append(ToolCallEnvelope(
+                            id=tc.id,
+                            function=ToolFunctionCall(
+                                name=tc.function.name,
+                                arguments=tc.function.arguments or "{}",
+                            ),
+                        ))
 
-                return full_content, tool_calls_list
+                return content, tool_calls_list
 
             except Exception as e:
-                _log.warning("Stream error (attempt %d/%d): %s", attempt + 1, max_retries, e)
+                _log.warning("LLM error (attempt %d/%d): %s", attempt + 1, max_retries, e)
                 time.sleep(1)
 
         _log.error("Failed to generate LLM response after %d retries", max_retries)
@@ -233,20 +208,28 @@ class ChatLoop:
                         continue
                 break
 
+            # Validate all tool call arguments before committing to session
+            parsed_calls = []
+            valid = True
+            for tc in tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                    parsed_calls.append((tc, args))
+                except json.JSONDecodeError as e:
+                    _log.warning("Malformed tool call '%s': %s", tc.function.name, e)
+                    valid = False
+                    break
+
+            if not valid:
+                # Don't poison session history — discard and retry
+                continue
+
             self._session.add("assistant", content or "", tool_calls)
             hb_req = False
 
-            for tc in tool_calls:
-                name = tc.function.name
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError as e:
-                    _log.warning("JSON error in tool %s: %s", name, e)
-                    self._session.add_tool_result(tc.id, name, f"Error: Invalid JSON - {e}")
-                    continue
-
+            for tc, args in parsed_calls:
                 execution = self._tool_suite.execute_tool(
-                    name=name,
+                    name=tc.function.name,
                     args=args,
                     user_message_already_sent=user_received_message,
                 )
@@ -257,7 +240,7 @@ class ChatLoop:
                     user_received_message = True
 
                 hb_req = hb_req or execution.heartbeat_requested
-                self._session.add_tool_result(tc.id, name, execution.tool_result)
+                self._session.add_tool_result(tc.id, tc.function.name, execution.tool_result)
 
             if user_received_message:
                 break
