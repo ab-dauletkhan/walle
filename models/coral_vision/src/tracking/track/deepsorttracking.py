@@ -6,14 +6,16 @@ from ultralytics import YOLO
 import numpy as np
 import cv2
 import torch
-import psycopg2
 import time
-from src.face_recognition_system.recognize.recognize import recognize_image
-from src.face_recognition_system.recognize.pipeline import ArcFaceEmbedder
+from face_recognition_coral.recognize_face import (
+    detect_objects,
+    Interpreter,
+    load_delegate,
+)
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}, cuda_available={torch.cuda.is_available()}")
 
-DSN = "postgresql://faceuser:facepass@localhost:5432/facedb"
+ifEdgeTPU_1_else_0 = 1
 
 
 
@@ -25,6 +27,18 @@ extractor = Extractor(model_path='models/ckpt.t7', use_cuda=True) #re-id model
 
 metric = knnd("cosine", matching_threshold=0.5)
 tracker = DeepSortTracker(metric,  max_age = 30000, n_init = 2) #saves only peole from last 10 seconds (300 frames, 30 fps)
+
+if ifEdgeTPU_1_else_0 == 1:
+    interpreter = Interpreter(
+        model_path='face_recognition_coral/models/ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite',
+        experimental_delegates=[load_delegate('libedgetpu.so.1.0')],
+    )
+else:
+    interpreter = Interpreter(
+        model_path='face_recognition_coral/models/ssd_mobilenet_v2_face_quant_postprocess.tflite'
+    )
+interpreter.allocate_tensors()
+_, input_height, input_width, _ = interpreter.get_input_details()[0]['shape']
 
 
 def get_features_for_tracker(frame):    
@@ -88,8 +102,6 @@ out_vid = cv2.VideoWriter(
 
 flaggg = 0
 image = []
-conn = psycopg2.connect(DSN)
-embedder = ArcFaceEmbedder("models/w600k_r50.onnx")
 
 t_start = time.perf_counter()
 frames = 0
@@ -111,7 +123,20 @@ while cap.isOpened():
         if not track.is_confirmed():
             continue
         if track.time_since_update == 0:
-            out = recognize_image(frame, embedder, conn=conn, threshold=0.8)
+            image_large = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image = cv2.resize(image_large, (input_width, input_height), interpolation=cv2.INTER_LANCZOS4)
+            detections_face = detect_objects(interpreter, image, 0.5)
+            out = []
+            for det in detections_face:
+                if det['score'] <= 0.80:
+                    continue
+                ymin, xmin, ymax, xmax = det['bounding_box']
+                xmin = max(0, min(int(xmin * frame_width), frame_width))
+                xmax = max(0, min(int(xmax * frame_width), frame_width))
+                ymin = max(0, min(int(ymin * frame_height), frame_height))
+                ymax = max(0, min(int(ymax * frame_height), frame_height))
+                if xmax > xmin and ymax > ymin:
+                    out.append({'bbox': (xmin, ymin, xmax - xmin, ymax - ymin)})
             
             
             # --- Whole person bbox from DeepSort ---
@@ -128,7 +153,7 @@ while cap.isOpened():
             if len(out) == 0:
                 print(f"frame: {frames}, track_id: {track.track_id}, face: NOT DETECTED")
             else:
-                # --- Face bboxes from recognize_image ---
+                # --- Face bboxes from recognize_face ---
                 for face_result in out:
                     fx, fy, fw, fh = face_result['bbox']
                     x_right_face = fx + fw
@@ -174,7 +199,6 @@ cv2.destroyAllWindows()
 cv2.waitKey(1)
 cap.release()
 #out_vid.release()
-conn.close()
 if len(image) != 0:
     cv2.imshow("face", image)
 if cv2.waitKey(10000) & 0xFF == ord('q'):
