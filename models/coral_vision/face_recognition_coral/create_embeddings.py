@@ -23,7 +23,7 @@ def main():
     
     ifEdgeTPU_1_else_0 = 1
     
-    scan_person = 1 # Change the number of the folder, where you want to create the embeddings
+    scan_person = 3 # Change the number of the folder, where you want to create the embeddings
 
     #get interpreter for face embedding model
     if ifEdgeTPU_1_else_0 == 1:

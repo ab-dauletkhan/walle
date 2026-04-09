@@ -51,7 +51,7 @@ def main():
   
   
   
-  person_number = 2 # Change the number of the person you scan. It will create a new number for that person
+  person_number = 3 # Change the number of the person you scan. It will create a new number for that person
   count_images_saved = 0
   
   if os.path.isdir('scanned_people') == False:

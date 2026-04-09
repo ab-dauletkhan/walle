@@ -1,4 +1,6 @@
 0  unknown
 1  Yerzhan
+2  Dauletkhan
+3  Edige
 
 

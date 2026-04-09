@@ -21,17 +21,21 @@ from PIL import ImageDraw
 import cv2
 
 
+
+
 from tflite_runtime.interpreter import Interpreter
 
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 960
 
 def main():
-  #ifEdgeTPU_1_else_0 = 1
+
   ifEdgeTPU_1_else_0 = 1
   
   labels = load_labels('coco_labels.txt')
   people_lables = load_labels('people_labels.txt')
+  
+  preloaded_embeddings = preload_embeddings('scanned_people/')
   
   #get interpreter for face detection model
   if ifEdgeTPU_1_else_0 == 1:
@@ -83,6 +87,7 @@ def main():
         cv2.imshow('Face Recognition', frame)
 
         ymin, xmin, ymax, xmax, score = get_best_box_param(results, CAMERA_WIDTH, CAMERA_HEIGHT)
+        
         frame_height, frame_width = frame.shape[:2]
 
         print(f"frame_width: {frame_width}, frame_height: {frame_height}")
@@ -97,11 +102,13 @@ def main():
         if score > 0.80:
             img = np.array(image_large)
             img_cut = img[ymin:ymax, xmin:xmax, :]
+            if img_cut is None or img_cut.size == 0 or img_cut.shape[0] == 0 or img_cut.shape[1] == 0:
+                continue  # skip this frame, face crop is invalid
             img_cut = cv2.resize(img_cut, dsize=(96, 96),
                                  interpolation=cv2.INTER_CUBIC).astype('uint8')
             img_cut = img_cut.reshape(1, 96, 96, 3) / 255.
             emb = img_to_emb(interpreter_emb, img_cut)
-            get_person_from_embedding(people_lables, emb)
+            get_person_from_embedding(people_lables, emb, preloaded_embeddings)
 
         # Press 'q' to quit
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -110,46 +117,37 @@ def main():
   finally:
     cap.release()
     cv2.destroyAllWindows()
-
-def get_person_from_embedding(people_lables,emb):
-    #Comares embedding to embedding of scaned people to determine who is on the picture
-    num_emb_check = 20
-    path = 'scanned_people/'
-    folders = os.listdir(path)
-    folders = sorted(folders)
-    averages = np.zeros(len(folders))
-    folder_number = 0
-    start = time.time()
+    
+def preload_embeddings(path, num_emb_check=20):
+    """Load all embeddings from disk once at startup."""
+    folders = sorted(os.listdir(path))
+    embeddings = {}
     for folder in folders:
-        average_one_person = 0
-        #print(folder)
-        files = os.listdir(path + folder + '/embeddings')
-        files = sorted(files)
-        checked = 0
-        for file in files:
-            emb2 = np.load(path + folder + '/embeddings' + '/' + file)
-            #print(emb.shape)
-            norm = np.sum((emb-emb2)**2)
-            average_one_person = average_one_person + norm
-            #print(norm)
-            checked = checked + 1
-            if checked == num_emb_check:
-                break
-        average_one_person = average_one_person/num_emb_check
-        averages[folder_number] = averages[folder_number] + average_one_person
-        folder_number = folder_number + 1
+        emb_path = os.path.join(path, folder, 'embeddings')
+        files = sorted(os.listdir(emb_path))[:num_emb_check]
+        embeddings[folder] = [np.load(os.path.join(emb_path, f)) for f in files]
+        print(f"Loaded {len(embeddings[folder])} embeddings for {folder}")
+    return embeddings
+
+def get_person_from_embedding(people_lables, emb, preloaded_embeddings):
+    folders = sorted(preloaded_embeddings.keys())
+    averages = np.zeros(len(folders))
+    
+    for i, folder in enumerate(folders):
+        embs = preloaded_embeddings[folder]
+        # vectorized — no Python loop over files
+        diffs = np.array([np.sum((emb - e) ** 2) for e in embs])
+        averages[i] = diffs.mean()
+
     who_is_on_pic = 0
     lowest_norm_found = 999
-    run = 0
-    end = time.time()
-    print("time for detection: ", end-start)
-    for average in averages:
-        run = run + 1
+    for run, average in enumerate(averages):
         if average < 0.9 and average < lowest_norm_found:
             lowest_norm_found = average
-            who_is_on_pic = run
+            who_is_on_pic = run + 1
         print(average)
     print("person on pic: ", people_lables[who_is_on_pic])
+
 
 
 def load_labels(path):

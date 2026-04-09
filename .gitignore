@@ -34,3 +34,15 @@ models/coral_vision/*.whl
 
 # Legacy
 legacy/web_interface/local_config.py
+models/coral_vision/src/tracking/deepsort_pytorch/
+models/coral_vision/face_recognition_coral/scanned_people/
+walle_vision/src/tracking/deepsort_pytorch/
+walle_vision/coral_env/
+
+*.pt
+*.pth
+*.onnx
+*.t7
+*.mp4
+*.whl
+walle_vision/models/

@@ -22,7 +22,7 @@ from ultralytics import YOLO
 # Config
 # =========================
 
-SERIAL_PORT = "/dev/ttyACM0"  # change if needed
+SERIAL_PORT = "/dev/ttyCH341USB0"  # change if needed
 SERIAL_BAUD = 115200
 
 HEAD_CHANNEL = 2
