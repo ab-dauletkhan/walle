@@ -83,6 +83,16 @@ def main():
         cv2.imshow('Face Recognition', frame)
 
         ymin, xmin, ymax, xmax, score = get_best_box_param(results, CAMERA_WIDTH, CAMERA_HEIGHT)
+        frame_height, frame_width = frame.shape[:2]
+
+        print(f"frame_width: {frame_width}, frame_height: {frame_height}")
+        if score > 0.80:
+            print(
+                f"x_left_face: {xmin}, x_right_face: {xmax}, "
+                f"y_left_face: {ymin}, y_right_face: {ymax}"
+            )
+        else:
+            print("face: NOT DETECTED")
 
         if score > 0.80:
             img = np.array(image_large)
@@ -101,53 +111,44 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
 
-def get_person_from_embedding(people_lables, emb):
-    """Compare embedding to scanned people using cosine similarity (consistent with CoralVisionBackend)."""
+def get_person_from_embedding(people_lables,emb):
+    #Comares embedding to embedding of scaned people to determine who is on the picture
     num_emb_check = 20
     path = 'scanned_people/'
     folders = os.listdir(path)
     folders = sorted(folders)
     averages = np.zeros(len(folders))
-
-    # Normalise the query embedding once
-    emb_flat = emb.flatten()
-    emb_norm = np.linalg.norm(emb_flat)
-    if emb_norm < 1e-12:
-        print("person on pic: ", people_lables[0])
-        return
-    emb_unit = emb_flat / emb_norm
-
     folder_number = 0
     start = time.time()
     for folder in folders:
-        sim_sum = 0.0
+        average_one_person = 0
+        #print(folder)
         files = os.listdir(path + folder + '/embeddings')
         files = sorted(files)
         checked = 0
         for file in files:
             emb2 = np.load(path + folder + '/embeddings' + '/' + file)
-            ref_flat = emb2.flatten()
-            ref_norm = np.linalg.norm(ref_flat)
-            if ref_norm < 1e-12:
-                continue
-            sim_sum += float(np.dot(emb_unit, ref_flat / ref_norm))
-            checked += 1
+            #print(emb.shape)
+            norm = np.sum((emb-emb2)**2)
+            average_one_person = average_one_person + norm
+            #print(norm)
+            checked = checked + 1
             if checked == num_emb_check:
                 break
-        averages[folder_number] = sim_sum / max(checked, 1)
-        folder_number += 1
-
+        average_one_person = average_one_person/num_emb_check
+        averages[folder_number] = averages[folder_number] + average_one_person
+        folder_number = folder_number + 1
     who_is_on_pic = 0
-    highest_sim_found = -1.0
+    lowest_norm_found = 999
     run = 0
     end = time.time()
-    print("time for detection: ", end - start)
+    print("time for detection: ", end-start)
     for average in averages:
-        run += 1
-        if average > 0.5 and average > highest_sim_found:
-            highest_sim_found = average
+        run = run + 1
+        if average < 0.9 and average < lowest_norm_found:
+            lowest_norm_found = average
             who_is_on_pic = run
-        print(f"  cosine similarity: {average:.4f}")
+        print(average)
     print("person on pic: ", people_lables[who_is_on_pic])
 
 
