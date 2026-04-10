@@ -193,28 +193,44 @@ class SystemPromptBuilder:
 
 
 class RelevantMemoryProvider:
-    """Facade for assembling relevant recall and archival context."""
+    """Facade for assembling relevant recall and archival context.
 
-    def __init__(self, recall_memory, archival_memory, recall_limit: int = 3, archival_limit: int = 2):
+    Uses score threshold instead of fixed count — only memories
+    semantically close to the query are included, like human
+    associative recall.
+    """
+
+    _SCORE_THRESHOLD = 0.35   # cosine distance — lower = more relevant
+    _FETCH_LIMIT = 50         # max candidates to fetch from FAISS, then filter by score
+
+    def __init__(self, recall_memory, archival_memory):
         self._recall_memory = recall_memory
         self._archival_memory = archival_memory
-        self._recall_limit = recall_limit
-        self._archival_limit = archival_limit
 
     def build_context(self, query: str) -> str:
         with ThreadPoolExecutor(max_workers=2) as executor:
-            recall_future = executor.submit(self._recall_memory.search, query, self._recall_limit)
-            archival_future = executor.submit(self._archival_memory.search, query, self._archival_limit)
+            recall_future = executor.submit(self._recall_memory.search, query, self._FETCH_LIMIT)
+            archival_future = executor.submit(self._archival_memory.search, query, self._FETCH_LIMIT)
             recall_hits = recall_future.result()
             archival_hits = archival_future.result()
 
-        if not recall_hits and not archival_hits:
+        # Filter by relevance score (only FAISS results have score)
+        recall_relevant = [h for h in recall_hits if h.get("score", 0) <= self._SCORE_THRESHOLD]
+        archival_relevant = [h for h in archival_hits if h.get("score", 0) <= self._SCORE_THRESHOLD]
+
+        # Fallback: if no scored results, take top 2 from each (FTS5/recent don't have scores)
+        if not recall_relevant and recall_hits:
+            recall_relevant = recall_hits[:2]
+        if not archival_relevant and archival_hits:
+            archival_relevant = archival_hits[:1]
+
+        if not recall_relevant and not archival_relevant:
             return ""
 
         lines = ["", "[RELEVANT MEMORIES]"]
-        for hit in recall_hits:
+        for hit in recall_relevant:
             lines.append(f"- {hit['role']}: {hit['content']}")
-        for hit in archival_hits:
+        for hit in archival_relevant:
             lines.append(f"- Fact: {hit['content']}")
         return "\n".join(lines) + "\n\n"
 
