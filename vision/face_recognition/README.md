@@ -1,54 +1,60 @@
 # Face Recognition with Edge TPU
 
-This repository contains a trained model for the Coral edge TPU, creating embedding representations for
-facial recognition. This allows fast inference on a local device. Face recognition is a two stage task: First faces are detected 
-(resulting in a cropped image with the face) and in the second stage these images are transformed to an
-embedding representing that face (1-D array). For face detection the following pretrained model was used:
-https://coral.ai/examples/detect-image/#run-the-example-for-face-detection. The model for the embeddings
-takes as input 96*96 arrays, values between 0 and 1, and outputs a 1-D array of size 192. The Facenet paper 
-(https://arxiv.org/abs/1503.03832) recommends an output size of 128, but this results in an error when converting
-to an edge TPU model. As a base model MobileNetV2 is used. So far the model has been trained on a third of
-the VGGFace2 dataset. Updated models will follow.
+This folder contains WALL-E's Coral/TFLite face enrollment and recognition
+utilities. Run them from the repository root with uv; do not create a separate
+virtual environment inside this folder.
 
-In the following I will explain how this model can be used on a project with the Raspberry Pi to recognize
-previously scanned people and give live audio feedback who is visible during a video stream.
+## Setup
 
-## How to scan and recognize people
-hardware:
+```bash
+uv sync --extra vision-coral
+```
 
-Raspberry 4B 4Gb
+The `vision-coral` extra installs Python dependencies where wheels are
+available. Real Edge TPU runs also need the native Coral runtime that provides
+`libedgetpu.so.1.0` on the Jetson/Linux host.
 
-Coral USB Accelerator
+Use `--no-edge-tpu` to run the non-TPU TFLite models.
 
-Raspberry Pi Camera v2
+## Enroll a Person
 
-Mini External USB 2.0 Speaker
+```bash
+uv run walle-face-scan --person 1 --edge-tpu
+uv run walle-face-embeddings --person 1 --edge-tpu
+```
 
-Before you continue, check if all libraries from requirements.txt are installed.
+Then edit `people_labels.txt` so the folder number maps to the person's name:
 
-### Scan People
-Run scan_people.py to use the face detector and save pictures of a single person to a folder during a video stream. 
-Read more detailed instructions within the code file.
+```text
+1  Dauletkhan
+```
 
-### Create Embeddings
-Run create_embeddings.py to use the face embedding model, converting the extracted facial pictures to embedding
- arrays. 
+Generated enrollment data is stored under:
 
-### Update Labels
-Give names to the scanned people. Each scanned person is associated with the folder number in the folder "scanned_people".
-Open the file people_labels.txt to write in the left column the folder number and in the right column the name of the person.
-Start by replacing "Alfred Maier" with the person scanned and saved in folder number "1".
+```text
+vision/face_recognition/scanned_people/{person_number}/
+    png/
+    npy/
+    embeddings/
+```
 
-### Run Face Recognition
-Run recognize_face.py to detect faces in a live stream, create embeddings of detected people and compare
-with the embeddings that have already been recored and labeled. Read more detailed instructions within the code file.
+That directory is ignored by git.
 
+## Recognize and Track
 
-## Use without Edge TPU
-The python scripts also work without Edge TPU. In each file there is a variable "ifEdgeTPU_1_else_0" that can be
-set to 0.
+```bash
+uv run walle-face-recognize --edge-tpu
+uv run walle-face-track-head --edge-tpu --serial-port /dev/ttyCH341USB0
+```
 
-here is the link to the notebook, where I trained the model:
-https://colab.research.google.com/drive/1n-cMQ_mP0t40OOzfIJwGLPu_0gkYnHNK?usp=sharing
+All commands support `--help` without requiring a camera, TFLite runtime, or
+Coral hardware to be present.
 
-for questions write to: damian.berger@me.com
+## Models
+
+The tracked TFLite models live in `vision/face_recognition/models`:
+
+- `ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite`
+- `ssd_mobilenet_v2_face_quant_postprocess.tflite`
+- `Mobilenet1_triplet1589223569_triplet_quant_edgetpu.tflite`
+- `Mobilenet1_triplet1589223569_triplet_quant.tflite`

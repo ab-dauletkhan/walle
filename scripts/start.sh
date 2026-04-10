@@ -4,13 +4,14 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
 
 # ---------- Configuration ----------
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-qwen2.5:3b}"
 MIMIC3_URL="${MIMIC3_URL:-http://localhost:59125}"
-VENV_DIR="${VENV_DIR:-$SCRIPT_DIR/venv}"
+UV_EXTRAS="${UV_EXTRAS:---extra jetson}"
 WALLE_ARGS="${WALLE_ARGS:-}"
 
 # Collect PIDs of services we start so we can clean up
@@ -72,16 +73,16 @@ else
     WALLE_ARGS="$WALLE_ARGS --no-tts"
 fi
 
-# ---------- 3. Python virtual environment ----------
-echo "=== Setting up Python ==="
-if [ -d "$VENV_DIR" ]; then
-    echo "  Activating venv: $VENV_DIR"
-    source "$VENV_DIR/bin/activate" 2>/dev/null || source "$VENV_DIR/Scripts/activate" 2>/dev/null || true
-else
-    echo "  No venv found at $VENV_DIR, using system Python."
+# ---------- 3. Python project environment ----------
+echo "=== Setting up Python with uv ==="
+if ! command -v uv >/dev/null 2>&1; then
+    echo "  ERROR: uv is required. Install uv, then run this script again."
+    exit 1
 fi
 
-echo "  Python: $(python --version 2>&1)"
+echo "  Sync args: $UV_EXTRAS"
+uv sync $UV_EXTRAS
+echo "  Python: $(uv run $UV_EXTRAS python --version 2>&1)"
 
 # ---------- 4. Launch WALL-E ----------
 echo ""
@@ -89,4 +90,4 @@ echo "=== Launching WALL-E ==="
 echo "  Args: $WALLE_ARGS $*"
 echo ""
 
-python "$SCRIPT_DIR/walle_main.py" $WALLE_ARGS "$@"
+uv run $UV_EXTRAS walle $WALLE_ARGS "$@"

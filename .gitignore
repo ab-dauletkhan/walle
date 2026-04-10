@@ -1,11 +1,23 @@
 # Python
 __pycache__/
-*.pyc
-*.pyo
-venv/
-.venv/
+*.py[cod]
+*$py.class
 *.egg-info/
+build/
+dist/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Python environments
+.venv/
+venv/
+env/
+.env
+.env.*
 
 # Runtime data
 data/
@@ -21,23 +33,21 @@ data/
 
 # OS
 .DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Face enrollment output
+vision/face_recognition/scanned_people/
 
 # Models & weights (large files, download at deploy)
 models/comp_vision/data/
+models/comp_vision/face_db/
 models/comp_vision/models/w600k_r50.onnx
 models/comp_vision/__pycache__/
-models/coral_vision/models/
-models/coral_vision/inference_results*/
-models/coral_vision/coral_env/
-models/coral_vision/venv/
-models/coral_vision/*.whl
 
 # Legacy
 legacy/web_interface/local_config.py
-models/coral_vision/src/tracking/deepsort_pytorch/
-models/coral_vision/face_recognition_coral/scanned_people/
-walle_vision/src/tracking/deepsort_pytorch/
-walle_vision/coral_env/
 
 *.pt
 *.pth
@@ -45,4 +55,3 @@ walle_vision/coral_env/
 *.t7
 *.mp4
 *.whl
-walle_vision/models/

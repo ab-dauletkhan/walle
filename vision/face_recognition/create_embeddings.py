@@ -1,84 +1,78 @@
-"""
-Converts the detected faces in the folder "scanned_people" to embeddings, which are used to identify people.
+from __future__ import annotations
 
-Important: You have to execute this code for each subfolder in "scanned_people". To do so change the variable
-"scan_person" in main() for each folder number.
-
-If you do not have an Edge TPU or you want to see the performance difference, change the
-variable ifEdgeTPU_1_else_0 in main() to 0.
-"""
-
-import os
+import argparse
 import shutil
-from PIL import Image
+import sys
+
 import numpy as np
-import time
-import os
 
-from tflite_runtime.interpreter import load_delegate
-from tflite_runtime.interpreter import Interpreter
-
-
-def main():
-    
-    ifEdgeTPU_1_else_0 = 1
-    
-    scan_person = 3 # Change the number of the folder, where you want to create the embeddings
-
-    #get interpreter for face embedding model
-    if ifEdgeTPU_1_else_0 == 1:
-      interpreter = Interpreter(model_path = 'models/Mobilenet1_triplet1589223569_triplet_quant_edgetpu.tflite',
-        experimental_delegates=[load_delegate('libedgetpu.so.1.0')])
-    else:
-      interpreter = Interpreter(model_path = 'models/Mobilenet1_triplet1589223569_triplet_quant.tflite')
-
-    
-    interpreter.allocate_tensors()
-
-    
-    path_person = 'scanned_people/' + str(scan_person)
-    
-    if os.path.isdir(path_person + '/embeddings') == False:
-        os.mkdir(path_person + '/embeddings')
-    else:
-        shutil.rmtree(path_person + '/embeddings')
-        os.mkdir(path_person + '/embeddings')
-    
-    files = os.listdir(path_person + '/npy')
-    files = sorted(files)
-
-    for file in files:
-        print(file)
-        img = np.load(path_person + '/npy/' + file).reshape(1,96,96,3)/255.
-        #emb = FRmodel.predict(img)
-        emb = img_to_emb(interpreter,img)
-        np.save(path_person + '/embeddings/' + file,emb)
-
-def set_input_tensor(interpreter, input):
-    #Sets the input tensor.
-    input_details = interpreter.get_input_details()[0]
-    tensor_index = input_details['index']
-    scale, zero_point = input_details['quantization']
-    input_tensor = interpreter.tensor(tensor_index)()[0]
-    input_tensor[:, :] = np.uint8(input/scale + zero_point)
+from .common import (
+    FaceRecognitionError,
+    create_embedding_interpreter,
+    image_to_embedding,
+    resolve_data_dir,
+)
 
 
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Create TFLite face embeddings from enrolled face crops."
+    )
+    parser.add_argument("--person", type=int, required=True, help="Person folder number to process.")
+    parser.add_argument(
+        "--edge-tpu",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the Edge TPU model and libedgetpu delegate.",
+    )
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="Directory for scanned_people data. Defaults to vision/face_recognition/scanned_people.",
+    )
+    return parser
 
-def img_to_emb(interpreter,input):
-    #returns embedding vector, using the face embedding model
-    set_input_tensor(interpreter, input)
-    interpreter.invoke()
-    output_details = interpreter.get_output_details()[0]
-    #emb = np.squeeze(interpreter.get_tensor(output_details['index']))
-    emb = interpreter.get_tensor(output_details['index'])
-    scale, zero_point = output_details['quantization']
-    emb = scale * (emb - zero_point)
-    return emb
+
+def run(args: argparse.Namespace) -> None:
+    data_dir = resolve_data_dir(args.data_dir)
+    person_dir = data_dir / str(args.person)
+    npy_dir = person_dir / "npy"
+    embeddings_dir = person_dir / "embeddings"
+
+    if not npy_dir.is_dir():
+        raise FaceRecognitionError(
+            f"No scanned crops found at {npy_dir}. Run `uv run walle-face-scan --person {args.person}` first."
+        )
+
+    files = sorted(npy_dir.glob("*.npy"))
+    if not files:
+        raise FaceRecognitionError(f"No .npy face crops found in {npy_dir}.")
+
+    if embeddings_dir.exists():
+        shutil.rmtree(embeddings_dir)
+    embeddings_dir.mkdir(parents=True)
+
+    interpreter = create_embedding_interpreter(args.edge_tpu)
+
+    for path in files:
+        face_crop = np.load(path).reshape(1, 96, 96, 3) / 255.0
+        embedding = image_to_embedding(interpreter, face_crop)
+        np.save(embeddings_dir / path.name, embedding)
+        print(f"created embedding: {embeddings_dir / path.name}")
+
+    print(f"Created {len(files)} embeddings for person {args.person}.")
 
 
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        run(args)
+    except FaceRecognitionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
-        
-        
 
-if __name__ == '__main__':
-  main()
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -69,52 +69,35 @@
 ### File Layout
 
 ```
-walle-main/
-+-- walle_main.py              # Unified orchestrator (WallELLMClient, main loop)
-+-- serial_manager.py          # Thread-safe Arduino serial I/O
-+-- vision_service.py          # Background vision (Coral / CPU backends)
-+-- api_server.py              # REST API (Flask, port 5001)
-+-- config_jetson.py           # Jetson Orin Nano overrides
-+-- start.sh                   # Service startup script
+walle/
++-- pyproject.toml             # uv dependency and script entry points
++-- uv.lock                    # Locked Python dependency graph
++-- scripts/
+|   +-- start.sh               # uv-backed service startup script
 |
-+-- memory/
-|   +-- config.py              # Central configuration dataclass
-|   +-- memory_system.py       # 3-tier memory + FAISS vector search
-|   +-- memory_tools.py        # LLM tool schemas for memory ops
-|   +-- robot_tools.py         # LLM tool schemas for motor/servo
-|   +-- communication_tools.py # send_message tool
-|   +-- knowledge_tools.py     # DuckDuckGo web search tool
-|   +-- personality_system.py  # Personality traits + persistence
-|   +-- context_manager.py     # Multi-modal context aggregation
-|   +-- heartbeat.py           # Multi-step reasoning continuation
-|   +-- base_executor.py       # Abstract tool executor pattern
++-- walle/
+|   +-- startup.py             # Unified orchestrator entry point
+|   +-- serial_manager.py      # Thread-safe Arduino serial I/O
+|   +-- api_server.py          # REST API (Flask, port 5001)
+|   +-- memory/                # Memory, embeddings, context, heartbeat
+|   +-- tools/                 # Robot, memory, personality, communication tools
+|   +-- vision/                # VisionService and capture_image tool
+|   +-- voice/                 # STT/TTS assistant and LLM client
 |
-+-- stt_tts/
-|   +-- main.py                # Voice assistant (STT + TTS + state machine)
-|   +-- mock_llm.py            # LLMClient interface + mock/Ollama impl
-|
-+-- walle_vision/
-|   +-- face_recognition_coral/
-|       +-- recognize_face.py  # Coral face detection + embedding
++-- vision/
+|   +-- face_recognition/
+|       +-- common.py          # Shared Coral model, path, embedding helpers
+|       +-- recognize_face.py  # Live face recognition CLI
 |       +-- create_embeddings.py
-|       +-- scan_people.py     # Face enrollment utility
+|       +-- scan_people.py     # Face enrollment CLI
+|       +-- track_and_turn_head.py
+|       +-- models/            # Tracked TFLite model files
 |
-+-- comp_vision_diplomka/
-|   +-- pipeline.py            # CPU fallback (YOLOv8 + ArcFace ONNX)
++-- firmware/
+|   +-- wall-e/                # Arduino firmware
 |
-+-- wall-e/
-|   +-- wall-e.ino             # Arduino firmware (main)
-|   +-- animations.ino         # Predefined servo animations
-|   +-- display.ino            # OLED battery display
-|   +-- L298NMotorController.hpp
-|   +-- Queue.hpp              # Ring buffer for animation waypoints
-|
-+-- web_interface/
-    +-- app.py                 # Flask web dashboard (port 5000)
-    +-- config.py              # Web config (password, ports)
-    +-- picamera2_stream.py    # MJPEG camera streaming
-    +-- static/js/main.js      # Frontend JS
-    +-- templates/             # Jinja2 HTML templates
++-- legacy/
+    +-- web_interface/         # Older Flask dashboard
 ```
 
 ---
@@ -347,16 +330,26 @@ VisionService (background thread, 1-2 FPS)
 
 ### 3.4 Face Enrollment
 
-**Utility:** `scan_people.py`
+**Utilities:** `walle-face-scan`, `walle-face-embeddings`, `walle-face-recognize`
 - Camera: 1280x960 @ 30 FPS
 - Detection threshold: 0.9 (conservative for clean enrollment)
 - Captures 20+ images per person
 - Stores cropped 96x96 faces as `.npy` arrays
-- `create_embeddings.py` converts crops to embedding vectors
+- `walle-face-embeddings` converts crops to embedding vectors
+
+**Commands:**
+```
+uv sync --extra vision-coral
+uv run walle-face-scan --person 1 --edge-tpu
+uv run walle-face-embeddings --person 1 --edge-tpu
+uv run walle-face-recognize --edge-tpu
+```
+
+Use `--no-edge-tpu` to run the non-TPU TFLite models with the same data layout.
 
 **Storage:**
 ```
-scanned_people/{person_name}/
+vision/face_recognition/scanned_people/{person_number}/
     embeddings/    # .npy embedding vectors (max 20 loaded at runtime)
     npy/           # Raw face crops
     png/           # Visual verification images
@@ -633,13 +626,13 @@ IF |posError| > 1 (CONTROLLER_THRESHOLD):
 
 ## 8. Startup & Shutdown Sequences
 
-### 8.1 Startup (`start.sh` + `walle_main.py`)
+### 8.1 Startup (`scripts/start.sh` + `uv run walle`)
 
 ```
 1. Start Ollama LLM server (wait up to 30s)
 2. Pull model if missing (qwen3:4b on Jetson)
 3. Check Mimic3 TTS server (optional)
-4. Activate Python venv
+4. Sync/use the uv project environment
 5. Initialize memory system (Core + Recall + Archival)
 6. Validate Ollama reachability + model availability
 7. Start VisionService (background daemon thread)
@@ -668,7 +661,30 @@ IF |posError| > 1 (CONTROLLER_THRESHOLD):
 
 ## 9. Dependencies
 
-### 9.1 Jetson Minimal (`requirements_jetson.txt`)
+`pyproject.toml` and `uv.lock` are the source of truth. Do not create a separate
+virtual environment inside `vision/face_recognition`.
+
+Common setup:
+
+```
+uv sync --extra dev
+uv run pytest
+```
+
+Jetson/Coral setup:
+
+```
+uv sync --extra jetson
+uv sync --extra vision-coral
+```
+
+CPU vision fallback:
+
+```
+uv sync --extra vision-cpu
+```
+
+### 9.1 Dependency Groups
 
 | Package              | Purpose                    |
 |----------------------|----------------------------|
@@ -685,7 +701,12 @@ IF |posError| > 1 (CONTROLLER_THRESHOLD):
 | requests             | HTTP (TTS, Ollama)         |
 | numpy                | Numerical computing        |
 
-**Optional:** `pycoral` + `tflite-runtime` (Coral TPU), `ultralytics` + `onnxruntime` (CPU vision), `duckduckgo_search` (knowledge tool).
+**Coral runtime:** uv manages the Python packages where wheels are available,
+including `tflite-runtime` for supported Linux/Python targets. The native
+`libedgetpu.so.1.0` runtime is a system dependency and must be installed on the
+Jetson/Linux host before `--edge-tpu` commands can run.
+
+**Optional:** `ultralytics` + `onnxruntime` for CPU vision fallback.
 
 ---
 

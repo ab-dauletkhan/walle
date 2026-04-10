@@ -45,7 +45,7 @@ vision-cpu = [
 vision-coral = [
     "opencv-python>=4.8",
     "pillow>=10.0",
-    # tflite-runtime and pycoral installed separately (platform-specific wheels)
+    "tflite-runtime==2.14.0; sys_platform == 'linux' and python_version >= '3.10' and python_version < '3.12'",
 ]
 
 # Voice — STT + TTS
@@ -88,6 +88,10 @@ jetson = [
 
 [project.scripts]
 walle = "walle.startup:main"
+walle-face-scan = "vision.face_recognition.scan_people:main"
+walle-face-embeddings = "vision.face_recognition.create_embeddings:main"
+walle-face-recognize = "vision.face_recognition.recognize_face:main"
+walle-face-track-head = "vision.face_recognition.track_and_turn_head:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -100,4 +104,4 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["walle"]
+packages = ["walle", "vision"]

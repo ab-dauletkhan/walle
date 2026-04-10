@@ -22,6 +22,18 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(_BASE))  # walle/ → project ro
 
 from walle.memory.config import conf
 from walle.memory.context_manager import ContextManager, VisualContext
+from vision.face_recognition.common import (
+    DEFAULT_DATA_DIR,
+    PEOPLE_LABELS_PATH,
+    create_detection_interpreter,
+    create_embedding_interpreter,
+    detect_faces,
+    input_size,
+    load_labels,
+    load_people_embeddings,
+    recognize_detection,
+    require_pil_image,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -47,140 +59,45 @@ class CoralVisionBackend(VisionBackend):
     """Face detection + recognition using Google Coral Edge TPU."""
 
     def __init__(self):
-        from tflite_runtime.interpreter import Interpreter, load_delegate
-        from PIL import Image
+        self._Image = require_pil_image()
 
-        self._Image = Image
-        coral_dir = os.path.join(_PROJECT_ROOT, "models", "coral_vision", "face_recognition_coral")
+        self._det_interpreter = create_detection_interpreter(edge_tpu=True)
+        self._input_w, self._input_h = input_size(self._det_interpreter)
 
-        # Face detection model (SSD MobileNet v2)
-        self._det_interpreter = Interpreter(
-            model_path=os.path.join(coral_dir, "models", "ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite"),
-            experimental_delegates=[load_delegate("libedgetpu.so.1.0")],
-        )
-        self._det_interpreter.allocate_tensors()
-        _, self._input_h, self._input_w, _ = self._det_interpreter.get_input_details()[0]["shape"]
-
-        # Face embedding model
-        self._emb_interpreter = Interpreter(
-            model_path=os.path.join(coral_dir, "models", "Mobilenet1_triplet1589223569_triplet_quant_edgetpu.tflite"),
-            experimental_delegates=[load_delegate("libedgetpu.so.1.0")],
-        )
-        self._emb_interpreter.allocate_tensors()
-
-        # Load people labels and embeddings
-        self._people_labels = self._load_labels(os.path.join(coral_dir, "people_labels.txt"))
-        self._scanned_dir = os.path.join(coral_dir, "scanned_people")
-        self._people_embeddings = self._load_people_embeddings()
+        self._emb_interpreter = create_embedding_interpreter(edge_tpu=True)
+        self._people_labels = load_labels(PEOPLE_LABELS_PATH)
+        self._people_embeddings = load_people_embeddings(DEFAULT_DATA_DIR, required=False)
+        if not self._people_embeddings:
+            _log.warning(
+                "No Coral face embeddings found at %s; detected faces will be Unknown",
+                DEFAULT_DATA_DIR,
+            )
 
         _log.info("Coral TPU backend initialized")
-
-    def _load_labels(self, path):
-        import re
-        labels = {}
-        if not os.path.exists(path):
-            return labels
-        with open(path, "r", encoding="utf-8") as f:
-            for row, line in enumerate(f):
-                pair = re.split(r"[:\s]+", line.strip(), maxsplit=1)
-                if len(pair) == 2 and pair[0].strip().isdigit():
-                    labels[int(pair[0])] = pair[1].strip()
-                else:
-                    labels[row] = pair[0].strip()
-        return labels
-
-    def _load_people_embeddings(self):
-        """Pre-load embeddings for each scanned person."""
-        people = {}
-        if not os.path.isdir(self._scanned_dir):
-            return people
-        for folder in sorted(os.listdir(self._scanned_dir)):
-            emb_dir = os.path.join(self._scanned_dir, folder, "embeddings")
-            if not os.path.isdir(emb_dir):
-                continue
-            embeddings = []
-            for f in sorted(os.listdir(emb_dir))[:20]:
-                if f.endswith(".npy"):
-                    embeddings.append(np.load(os.path.join(emb_dir, f)))
-            if embeddings:
-                people[folder] = embeddings
-        return people
 
     def _detect_faces(self, image_pil):
         """Run face detection, return list of (ymin, xmin, ymax, xmax, score) in pixel coords."""
         resized = image_pil.convert("RGB").resize((self._input_w, self._input_h), self._Image.LANCZOS)
-        # Set input tensor
-        input_details = self._det_interpreter.get_input_details()[0]
-        self._det_interpreter.tensor(input_details["index"])()[0][:, :] = resized
-        self._det_interpreter.invoke()
-
-        # Parse outputs
-        boxes = np.squeeze(self._det_interpreter.get_tensor(self._det_interpreter.get_output_details()[0]["index"]))
-        classes = np.squeeze(self._det_interpreter.get_tensor(self._det_interpreter.get_output_details()[1]["index"]))
-        scores = np.squeeze(self._det_interpreter.get_tensor(self._det_interpreter.get_output_details()[2]["index"]))
-        count = int(np.squeeze(self._det_interpreter.get_tensor(self._det_interpreter.get_output_details()[3]["index"])))
-
         w, h = image_pil.size
-        results = []
-        for i in range(min(count, len(scores))):
-            if scores[i] < conf.VISION_FACE_DETECTION_THRESHOLD:
-                continue
-            ymin = int(max(0, boxes[i][0] * h))
-            xmin = int(max(0, boxes[i][1] * w))
-            ymax = int(min(h, boxes[i][2] * h))
-            xmax = int(min(w, boxes[i][3] * w))
-            results.append((ymin, xmin, ymax, xmax, float(scores[i])))
-        return results
+        return detect_faces(
+            self._det_interpreter,
+            resized,
+            conf.VISION_FACE_DETECTION_THRESHOLD,
+            w,
+            h,
+        )
 
-    def _recognize_face(self, image_rgb_array, ymin, xmin, ymax, xmax):
+    def _recognize_face(self, image_rgb_array, detection):
         """Crop face, compute embedding, match against known people."""
-        import cv2
-        crop = image_rgb_array[ymin:ymax, xmin:xmax]
-        if crop.size == 0:
-            return None, 0.0
-        crop = cv2.resize(crop, (96, 96)).astype("uint8")
-        crop_input = crop.reshape(1, 96, 96, 3) / 255.0
-
-        # Compute embedding
-        input_details = self._emb_interpreter.get_input_details()[0]
-        scale, zero_point = input_details["quantization"]
-        self._emb_interpreter.tensor(input_details["index"])()[0][:, :] = np.clip(crop_input / scale + zero_point, 0, 255).astype(np.uint8)
-        self._emb_interpreter.invoke()
-        output_details = self._emb_interpreter.get_output_details()[0]
-        emb = self._emb_interpreter.get_tensor(output_details["index"])
-        o_scale, o_zp = output_details["quantization"]
-        emb = o_scale * (emb - o_zp)
-
-        # Match against known people using cosine similarity
-        best_name = None
-        best_sim = -1.0
-        emb_flat = emb.flatten()
-        emb_norm = np.linalg.norm(emb_flat)
-        if emb_norm < 1e-12:
-            return None, 0.0
-        emb_unit = emb_flat / emb_norm
-
-        for folder, embeddings in self._people_embeddings.items():
-            sims = []
-            for ref in embeddings[:20]:
-                ref_flat = ref.flatten()
-                ref_norm = np.linalg.norm(ref_flat)
-                if ref_norm < 1e-12:
-                    continue
-                sims.append(float(np.dot(emb_unit, ref_flat / ref_norm)))
-            if not sims:
-                continue
-            avg_sim = np.mean(sims)
-            if avg_sim > conf.VISION_FACE_MATCH_THRESHOLD and avg_sim > best_sim:
-                best_sim = avg_sim
-                try:
-                    idx = int(folder)
-                    best_name = self._people_labels.get(idx, folder)
-                except ValueError:
-                    best_name = folder
-
-        confidence = max(0.0, best_sim) if best_name else 0.0
-        return best_name, confidence
+        match = recognize_detection(
+            self._emb_interpreter,
+            image_rgb_array,
+            detection,
+            self._people_labels,
+            self._people_embeddings,
+            conf.VISION_FACE_MATCH_THRESHOLD,
+        )
+        return match.name, match.confidence
 
     def process_frame(self, frame: np.ndarray) -> List[Dict]:
         from PIL import Image
@@ -192,14 +109,14 @@ class CoralVisionBackend(VisionBackend):
         rgb_array = np.array(pil_image)
 
         faces = []
-        for ymin, xmin, ymax, xmax, score in detections:
-            if score < conf.VISION_FACE_RECOGNITION_MIN:
+        for detection in detections:
+            if detection.score < conf.VISION_FACE_RECOGNITION_MIN:
                 continue
-            name, confidence = self._recognize_face(rgb_array, ymin, xmin, ymax, xmax)
+            name, confidence = self._recognize_face(rgb_array, detection)
             faces.append({
                 "name": name or "Unknown",
-                "confidence": round(confidence if name else score, 2),
-                "location": f"({xmin},{ymin})-({xmax},{ymax})",
+                "confidence": round(confidence if name else detection.score, 2),
+                "location": f"({detection.xmin},{detection.ymin})-({detection.xmax},{detection.ymax})",
             })
         return faces
 
