@@ -74,6 +74,8 @@ ml = [
 # Development
 dev = [
     "pytest>=8.0",
+    "ruff>=0.15.10",
+    "ty>=0.0.29",
 ]
 
 # Everything except Jetson-specific torch
