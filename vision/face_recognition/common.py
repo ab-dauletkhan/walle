@@ -7,7 +7,6 @@ from typing import Optional
 
 import numpy as np
 
-
 FACE_DIR = Path(__file__).resolve().parent
 MODELS_DIR = FACE_DIR / "models"
 DEFAULT_DATA_DIR = FACE_DIR / "scanned_people"
@@ -84,7 +83,10 @@ def require_pil_image():
 
 def require_tflite_runtime():
     try:
-        from tflite_runtime.interpreter import Interpreter, load_delegate
+        from tflite_runtime.interpreter import (  # ty: ignore[unresolved-import]
+            Interpreter,
+            load_delegate,
+        )
     except ImportError as exc:
         raise FaceRecognitionError(
             "tflite-runtime is not installed. Run `uv sync --extra vision-coral` "
@@ -211,7 +213,9 @@ def best_detection(detections: list[Detection]) -> Optional[Detection]:
     return max(detections, key=lambda detection: detection.score)
 
 
-def annotate_detections(frame, detections: list[Detection], labels: dict[int, str], cv2_module=None) -> None:
+def annotate_detections(
+    frame, detections: list[Detection], labels: dict[int, str], cv2_module=None
+) -> None:
     cv2 = cv2_module or require_cv2()
     for detection in detections:
         cv2.rectangle(
@@ -234,10 +238,14 @@ def annotate_detections(frame, detections: list[Detection], labels: dict[int, st
 
 def crop_face_rgb(image_rgb_array, detection: Detection, size: int = 96):
     cv2 = require_cv2()
-    crop = image_rgb_array[detection.ymin:detection.ymax, detection.xmin:detection.xmax, :]
+    crop = image_rgb_array[
+        detection.ymin : detection.ymax, detection.xmin : detection.xmax, :
+    ]
     if crop is None or crop.size == 0 or crop.shape[0] == 0 or crop.shape[1] == 0:
         return None
-    return cv2.resize(crop, dsize=(size, size), interpolation=cv2.INTER_CUBIC).astype("uint8")
+    return cv2.resize(crop, dsize=(size, size), interpolation=cv2.INTER_CUBIC).astype(
+        "uint8"
+    )
 
 
 def set_embedding_input_tensor(interpreter, input_array) -> None:
@@ -245,10 +253,14 @@ def set_embedding_input_tensor(interpreter, input_array) -> None:
     tensor_index = input_details["index"]
     scale, zero_point = input_details["quantization"]
     if not scale:
-        raise FaceRecognitionError("Embedding model has unsupported input quantization.")
+        raise FaceRecognitionError(
+            "Embedding model has unsupported input quantization."
+        )
 
     input_tensor = interpreter.tensor(tensor_index)()[0]
-    quantized = np.clip(input_array / scale + zero_point, 0, 255).astype(input_tensor.dtype)
+    quantized = np.clip(input_array / scale + zero_point, 0, 255).astype(
+        input_tensor.dtype
+    )
     input_tensor[:, :] = quantized
 
 
@@ -334,7 +346,9 @@ def match_embedding(
             reference_norm = np.linalg.norm(reference_flat)
             if reference_norm < 1e-12:
                 continue
-            similarities.append(float(np.dot(embedding_unit, reference_flat / reference_norm)))
+            similarities.append(
+                float(np.dot(embedding_unit, reference_flat / reference_norm))
+            )
 
         if not similarities:
             continue

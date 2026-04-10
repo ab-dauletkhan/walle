@@ -16,8 +16,9 @@ _log = logging.getLogger("walle.faiss")
 
 _faiss_available = False
 try:
-    import torch  # noqa: F401 — must import before faiss to avoid OpenMP segfault on macOS
     import faiss
+    import torch  # noqa: F401 — must import before faiss to avoid OpenMP segfault on macOS
+
     _faiss_available = True
 except ImportError:
     faiss = None
@@ -25,6 +26,7 @@ except ImportError:
 
 def _connect_db(db_path: str):
     import sqlite3
+
     conn = sqlite3.connect(db_path, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
@@ -56,7 +58,7 @@ class FAISSManager:
                 self.index = faiss.read_index(self.index_path)
                 id_map_path = self.index_path + ".ids"
                 if Path(id_map_path).exists():
-                    with open(id_map_path, 'r') as f:
+                    with open(id_map_path, "r") as f:
                         self.id_map = json.load(f)
                 _log.info("FAISS index loaded: %s vectors", self.index.ntotal)
             except Exception as e:
@@ -106,7 +108,7 @@ class FAISSManager:
         with self._save_lock:
             try:
                 faiss.write_index(self.index, self.index_path)
-                with open(self.index_path + ".ids", 'w') as f:
+                with open(self.index_path + ".ids", "w") as f:
                     json.dump(self.id_map, f)
                 self._insertions_since_save = 0
             except Exception as e:
@@ -133,7 +135,9 @@ class FAISSManager:
         if table not in allowed_tables:
             raise ValueError(f"Invalid table name: {table}")
         with _connect_db(db_path) as conn:
-            rows = conn.execute(f"SELECT id, embedding FROM {table} WHERE embedding IS NOT NULL").fetchall()
+            rows = conn.execute(
+                f"SELECT id, embedding FROM {table} WHERE embedding IS NOT NULL"
+            ).fetchall()
         if not rows:
             with self._index_lock:
                 self._create_new_index()

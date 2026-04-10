@@ -37,6 +37,11 @@ def test_vision_imports():
     assert importlib.import_module("walle.vision.service") is not None
     assert importlib.import_module("vision.face_recognition.common") is not None
     assert importlib.import_module("vision.face_recognition.scan_people") is not None
-    assert importlib.import_module("vision.face_recognition.create_embeddings") is not None
+    assert (
+        importlib.import_module("vision.face_recognition.create_embeddings") is not None
+    )
     assert importlib.import_module("vision.face_recognition.recognize_face") is not None
-    assert importlib.import_module("vision.face_recognition.track_and_turn_head") is not None
+    assert (
+        importlib.import_module("vision.face_recognition.track_and_turn_head")
+        is not None
+    )

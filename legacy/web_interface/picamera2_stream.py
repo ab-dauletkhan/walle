@@ -1,7 +1,7 @@
 """
 Simple class to start a camera stream using PI Camera 2
 
-Note: only cameras connected to the Raspberry Pi via the 
+Note: only cameras connected to the Raspberry Pi via the
 CSI ribbon cable work; USB webcameras are unfortunately
 not supported by this code.
 """
@@ -10,11 +10,11 @@ import io
 import logging
 import socketserver
 from http import server
-from threading import Thread, Condition, Event
+from threading import Condition, Thread
+
 from picamera2 import Picamera2
 from picamera2.encoders import MJPEGEncoder
 from picamera2.outputs import FileOutput
-
 
 PAGE = """\
 <html>
@@ -47,41 +47,43 @@ output: StreamingOutput = StreamingOutput()
 # ================================================================
 class StreamingHandler(server.BaseHTTPRequestHandler):
     """Handle the web server requests"""
-    
+
     def do_GET(self):
-        if self.path == '/':
+        if self.path == "/":
             self.send_response(301)
-            self.send_header('Location', '/index.html')
+            self.send_header("Location", "/index.html")
             self.end_headers()
-        elif self.path == '/index.html':
-            content = PAGE.encode('utf-8')
+        elif self.path == "/index.html":
+            content = PAGE.encode("utf-8")
             self.send_response(200)
-            self.send_header('Content-Type', 'text/html')
-            self.send_header('Content-Length', len(content))
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", len(content))
             self.end_headers()
             self.wfile.write(content)
-        elif self.path == '/stream.mjpg':
+        elif self.path == "/stream.mjpg":
             self.send_response(200)
-            self.send_header('Age', 0)
-            self.send_header('Cache-Control', 'no-cache, private')
-            self.send_header('Pragma', 'no-cache')
-            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
+            self.send_header("Age", 0)
+            self.send_header("Cache-Control", "no-cache, private")
+            self.send_header("Pragma", "no-cache")
+            self.send_header(
+                "Content-Type", "multipart/x-mixed-replace; boundary=FRAME"
+            )
             self.end_headers()
             try:
                 while True:
                     with output.condition:
                         output.condition.wait()
                         frame = output.frame
-                    self.wfile.write(b'--FRAME\r\n')
-                    self.send_header('Content-Type', 'image/jpeg')
-                    self.send_header('Content-Length', len(frame))
+                    self.wfile.write(b"--FRAME\r\n")
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", len(frame))
                     self.end_headers()
                     self.wfile.write(frame)
-                    self.wfile.write(b'\r\n')
+                    self.wfile.write(b"\r\n")
             except Exception as e:
                 logging.warning(
-                    'Removed streaming client %s: %s',
-                    self.client_address, str(e))
+                    "Removed streaming client %s: %s", self.client_address, str(e)
+                )
         else:
             self.send_error(404)
             self.end_headers()
@@ -100,7 +102,7 @@ class PiCameraStreamer:
     stream_active: bool = False
     stream_thread: Thread | None = None
     picam2: Picamera2 | None = None
-    #output: StreamingOutput | None = None
+    # output: StreamingOutput | None = None
     streaming_server: StreamingServer | None = None
 
     def __init__(self):
@@ -114,8 +116,13 @@ class PiCameraStreamer:
         :return: True is camera stream is active, False otherwise
         """
         global output
-        return (self.stream_active and self.picam2 is not None and output is not None 
-            and self.streaming_server is not None and self.stream_thread is not None)
+        return (
+            self.stream_active
+            and self.picam2 is not None
+            and output is not None
+            and self.streaming_server is not None
+            and self.stream_thread is not None
+        )
 
     # ------------------------------------------------------------
     def start_stream(self) -> (bool, str):
@@ -131,19 +138,27 @@ class PiCameraStreamer:
                 self.picam2 = Picamera2()
                 output = StreamingOutput()
 
-                self.picam2.configure(self.picam2.create_video_configuration(main={"size": (640, 480)}))
-                self.picam2.set_controls({"FrameDurationLimits":(33333,100000),"ExposureValue":6.0, "Brightness":0.1})
+                self.picam2.configure(
+                    self.picam2.create_video_configuration(main={"size": (640, 480)})
+                )
+                self.picam2.set_controls(
+                    {
+                        "FrameDurationLimits": (33333, 100000),
+                        "ExposureValue": 6.0,
+                        "Brightness": 0.1,
+                    }
+                )
                 self.picam2.start_recording(MJPEGEncoder(), FileOutput(output))
 
-                address = ('', 8080)
+                address = ("", 8080)
                 self.streaming_server = StreamingServer(address, StreamingHandler)
-                self.stream_thread = Thread(target = self.__stream_thread)
+                self.stream_thread = Thread(target=self.__stream_thread)
                 self.stream_thread.start()
                 self.stream_active = True
 
         except Exception as ex:
             error = repr(ex)
-            logging.error(f'Failed to start PiCamera2 stream: {repr(ex)}')
+            logging.error(f"Failed to start PiCamera2 stream: {repr(ex)}")
             self.stop_stream()
 
         return (self.is_stream_active(), error)
@@ -156,12 +171,12 @@ class PiCameraStreamer:
         """
         try:
             global output
-            
+
             if self.picam2 is not None:
                 self.picam2.stop_recording()
                 self.picam2.close()
                 self.picam2 = None
-                
+
             if self.streaming_server is not None:
                 self.streaming_server.shutdown()
                 self.streaming_server.server_close()
@@ -173,10 +188,10 @@ class PiCameraStreamer:
                 self.stream_active = False
 
             output = None
-            
+
         except Exception as ex:
             print(repr(ex))
-            logging.error(f'Failed to stop PiCamera2 stream: {repr(ex)}')
+            logging.error(f"Failed to stop PiCamera2 stream: {repr(ex)}")
 
         return not self.is_stream_active()
 

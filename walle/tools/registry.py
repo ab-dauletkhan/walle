@@ -10,8 +10,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from walle.tools.communication import SendMessageArgs, get_communication_tools
 from walle.memory.heartbeat import add_heartbeat_to_tools
+from walle.tools.communication import SendMessageArgs, get_communication_tools
 
 _log = logging.getLogger("walle.orchestrator.support")
 
@@ -72,7 +72,9 @@ class CommunicationToolProvider(ToolProvider):
         if not validated.message:
             return ToolExecutionResult(tool_result="Error: message cannot be empty")
         if user_message_already_sent:
-            return ToolExecutionResult(tool_result="Message already sent (duplicate ignored)")
+            return ToolExecutionResult(
+                tool_result="Message already sent (duplicate ignored)"
+            )
 
         result = self._communication_executor.execute(name, args)
         return ToolExecutionResult(
@@ -137,7 +139,9 @@ class ToolRegistry:
             schemas.extend(provider.get_schemas())
         return add_heartbeat_to_tools(schemas)
 
-    def execute(self, name: str, args: dict, *, user_message_already_sent: bool) -> ToolExecutionResult:
+    def execute(
+        self, name: str, args: dict, *, user_message_already_sent: bool
+    ) -> ToolExecutionResult:
         for provider in self._providers:
             if provider.handles(name):
                 return provider.execute(
@@ -158,33 +162,31 @@ class SystemPromptBuilder:
 
     def build(self, relevant_memories: str = "") -> str:
         context_str = self._context_manager.get_context_string()
-        relevant_memories_section = f"{relevant_memories}\n" if relevant_memories else ""
+        relevant_memories_section = (
+            f"{relevant_memories}\n" if relevant_memories else ""
+        )
         return (
             # Identity
             "You are WALL-E, a physical robot companion. "
             "You have a body with motors, arms, a head, and a neck. "
             "You exist in the real world and can move, look around, and interact.\n\n"
-
             # Communication rules
             "COMMUNICATION:\n"
             "- The user CANNOT see your text output. Use send_message tool for ALL replies.\n"
             "- Keep messages to 1-3 sentences. A TTS module reads them aloud.\n"
             "- Your raw text is internal thought — use it to reason before acting.\n\n"
-
             # Movement rules
             "MOVEMENT:\n"
             "- Each movement call is limited to 5 seconds. For longer moves, call multiple times.\n"
             "- After movement, call get_robot_status to verify you completed the action.\n"
             "- If status shows motors still running or position is wrong, adjust and retry.\n"
             "- You can chain multiple tools in one turn: move, check, move again, then respond.\n\n"
-
             # Behavior
             "BEHAVIOR:\n"
             f"{self._personality_engine.get_system_prompt_addition()}\n"
             "- Act, don't narrate. Call tools directly instead of describing what you plan to do.\n"
             "- Be honest about your limitations. If you can't see (no vision), say so.\n"
             "- Express yourself physically — wave when greeting, show emotion through posture.\n\n"
-
             # Dynamic context
             f"{context_str}\n"
             f"{relevant_memories_section}"
@@ -200,8 +202,8 @@ class RelevantMemoryProvider:
     associative recall.
     """
 
-    _SCORE_THRESHOLD = 0.35   # cosine distance — lower = more relevant
-    _FETCH_LIMIT = 50         # max candidates to fetch from FAISS, then filter by score
+    _SCORE_THRESHOLD = 0.35  # cosine distance — lower = more relevant
+    _FETCH_LIMIT = 50  # max candidates to fetch from FAISS, then filter by score
 
     def __init__(self, recall_memory, archival_memory):
         self._recall_memory = recall_memory
@@ -209,14 +211,22 @@ class RelevantMemoryProvider:
 
     def build_context(self, query: str) -> str:
         with ThreadPoolExecutor(max_workers=2) as executor:
-            recall_future = executor.submit(self._recall_memory.search, query, self._FETCH_LIMIT)
-            archival_future = executor.submit(self._archival_memory.search, query, self._FETCH_LIMIT)
+            recall_future = executor.submit(
+                self._recall_memory.search, query, self._FETCH_LIMIT
+            )
+            archival_future = executor.submit(
+                self._archival_memory.search, query, self._FETCH_LIMIT
+            )
             recall_hits = recall_future.result()
             archival_hits = archival_future.result()
 
         # Filter by relevance score (only FAISS results have score)
-        recall_relevant = [h for h in recall_hits if h.get("score", 0) <= self._SCORE_THRESHOLD]
-        archival_relevant = [h for h in archival_hits if h.get("score", 0) <= self._SCORE_THRESHOLD]
+        recall_relevant = [
+            h for h in recall_hits if h.get("score", 0) <= self._SCORE_THRESHOLD
+        ]
+        archival_relevant = [
+            h for h in archival_hits if h.get("score", 0) <= self._SCORE_THRESHOLD
+        ]
 
         # Fallback: if no scored results, take top 2 from each (FTS5/recent don't have scores)
         if not recall_relevant and recall_hits:
@@ -253,7 +263,9 @@ class ToolSuiteFacade:
     def build_schemas(self) -> list[dict]:
         return self._registry.get_schemas()
 
-    def execute_tool(self, name: str, args: dict, user_message_already_sent: bool) -> ToolExecutionResult:
+    def execute_tool(
+        self, name: str, args: dict, user_message_already_sent: bool
+    ) -> ToolExecutionResult:
         return self._registry.execute(
             name,
             args,

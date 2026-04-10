@@ -3,25 +3,17 @@ WALL-E Vision Service
 Background thread that processes camera frames and feeds VisualContext into ContextManager.
 Supports two backends: Google Coral TPU (preferred) and CPU (YOLOv8 + InsightFace fallback).
 """
+
+import base64
 import logging
 import os
-import time
 import threading
-import tempfile
-import base64
+import time
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import Dict, List, Optional
 
 import numpy as np
-
-_log = logging.getLogger("walle.vision")
-
-_BASE = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(_BASE))  # walle/ → project root
-
-from walle.memory.config import conf
-from walle.memory.context_manager import ContextManager, VisualContext
 from vision.face_recognition.common import (
     DEFAULT_DATA_DIR,
     PEOPLE_LABELS_PATH,
@@ -34,6 +26,14 @@ from vision.face_recognition.common import (
     recognize_detection,
     require_pil_image,
 )
+
+from walle.memory.config import conf
+from walle.memory.context_manager import ContextManager, VisualContext
+
+_log = logging.getLogger("walle.vision")
+
+_BASE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(_BASE))  # walle/ → project root
 
 
 # ---------------------------------------------------------------------------
@@ -48,8 +48,7 @@ class VisionBackend(ABC):
         ...
 
     @abstractmethod
-    def close(self) -> None:
-        ...
+    def close(self) -> None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +65,9 @@ class CoralVisionBackend(VisionBackend):
 
         self._emb_interpreter = create_embedding_interpreter(edge_tpu=True)
         self._people_labels = load_labels(PEOPLE_LABELS_PATH)
-        self._people_embeddings = load_people_embeddings(DEFAULT_DATA_DIR, required=False)
+        self._people_embeddings = load_people_embeddings(
+            DEFAULT_DATA_DIR, required=False
+        )
         if not self._people_embeddings:
             _log.warning(
                 "No Coral face embeddings found at %s; detected faces will be Unknown",
@@ -77,7 +78,9 @@ class CoralVisionBackend(VisionBackend):
 
     def _detect_faces(self, image_pil):
         """Run face detection, return list of (ymin, xmin, ymax, xmax, score) in pixel coords."""
-        resized = image_pil.convert("RGB").resize((self._input_w, self._input_h), self._Image.LANCZOS)
+        resized = image_pil.convert("RGB").resize(
+            (self._input_w, self._input_h), self._Image.LANCZOS
+        )
         w, h = image_pil.size
         return detect_faces(
             self._det_interpreter,
@@ -100,8 +103,8 @@ class CoralVisionBackend(VisionBackend):
         return match.name, match.confidence
 
     def process_frame(self, frame: np.ndarray) -> List[Dict]:
-        from PIL import Image
         import cv2
+        from PIL import Image
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(rgb)
@@ -113,11 +116,13 @@ class CoralVisionBackend(VisionBackend):
             if detection.score < conf.VISION_FACE_RECOGNITION_MIN:
                 continue
             name, confidence = self._recognize_face(rgb_array, detection)
-            faces.append({
-                "name": name or "Unknown",
-                "confidence": round(confidence if name else detection.score, 2),
-                "location": f"({detection.xmin},{detection.ymin})-({detection.xmax},{detection.ymax})",
-            })
+            faces.append(
+                {
+                    "name": name or "Unknown",
+                    "confidence": round(confidence if name else detection.score, 2),
+                    "location": f"({detection.xmin},{detection.ymin})-({detection.xmax},{detection.ymax})",
+                }
+            )
         return faces
 
     def close(self):
@@ -133,8 +138,8 @@ class CPUVisionBackend(VisionBackend):
     def __init__(self):
         cv_dir = os.path.join(_PROJECT_ROOT, "models", "comp_vision")
 
-        from ultralytics import YOLO
         import onnxruntime as ort
+        from ultralytics import YOLO
 
         # Face detector
         model_path = os.path.join(cv_dir, "yolov8n-face.pt")
@@ -143,7 +148,9 @@ class CPUVisionBackend(VisionBackend):
         # ArcFace embedder (CPU only to save GPU for LLM)
         onnx_path = os.path.join(cv_dir, "models", "w600k_r50.onnx")
         if os.path.exists(onnx_path):
-            self._emb_session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+            self._emb_session = ort.InferenceSession(
+                onnx_path, providers=["CPUExecutionProvider"]
+            )
             self._emb_input_name = self._emb_session.get_inputs()[0].name
         else:
             self._emb_session = None
@@ -213,18 +220,22 @@ class CPUVisionBackend(VisionBackend):
                 # Crop and recognize
                 name = None
                 similarity = det_conf
-                crop = frame[max(0, y1):y2, max(0, x1):x2]
+                crop = frame[max(0, y1) : y2, max(0, x1) : x2]
                 if crop.size > 0 and self._emb_session is not None:
-                    crop_rgb = cv2.cvtColor(cv2.resize(crop, (112, 112)), cv2.COLOR_BGR2RGB)
+                    crop_rgb = cv2.cvtColor(
+                        cv2.resize(crop, (112, 112)), cv2.COLOR_BGR2RGB
+                    )
                     emb = self._get_embedding(crop_rgb)
                     if emb is not None:
                         name, similarity = self._match_face(emb)
 
-                faces.append({
-                    "name": name or "Unknown",
-                    "confidence": round(similarity, 2),
-                    "location": f"({x1},{y1})-({x2},{y2})",
-                })
+                faces.append(
+                    {
+                        "name": name or "Unknown",
+                        "confidence": round(similarity, 2),
+                        "location": f"({x1},{y1})-({x2},{y2})",
+                    }
+                )
 
         return faces
 
@@ -268,7 +279,9 @@ def build_default_vision_registry() -> VisionBackendRegistry:
 class VisionService:
     """Continuously processes camera frames and updates ContextManager with visual context."""
 
-    def __init__(self, context_manager: ContextManager, camera_index: int = 0, fps: int = 2):
+    def __init__(
+        self, context_manager: ContextManager, camera_index: int = 0, fps: int = 2
+    ):
         self._context_manager = context_manager
         self._camera_index = camera_index
         self._target_interval = 1.0 / max(fps, 1)
@@ -308,17 +321,27 @@ class VisionService:
             return
 
         import cv2
+
         self._cap = cv2.VideoCapture(self._camera_index)
         if not self._cap.isOpened():
-            _log.warning("Could not open camera %s, continuing without vision", self._camera_index)
+            _log.warning(
+                "Could not open camera %s, continuing without vision",
+                self._camera_index,
+            )
             self._cap.release()
             self._cap = None
             return
 
         self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True, name="vision-service")
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name="vision-service"
+        )
         self._thread.start()
-        _log.info("Started (camera=%s, target_fps=%s)", self._camera_index, int(1 / self._target_interval))
+        _log.info(
+            "Started (camera=%s, target_fps=%s)",
+            self._camera_index,
+            int(1 / self._target_interval),
+        )
 
     def stop(self) -> None:
         """Stop the background thread and release camera."""
@@ -340,8 +363,8 @@ class VisionService:
 
     # Error backoff parameters
     _MAX_CONSECUTIVE_ERRORS = 5
-    _BACKOFF_BASE = 0.5        # seconds, doubles each consecutive error
-    _BACKOFF_MAX = 30.0        # cap
+    _BACKOFF_BASE = 0.5  # seconds, doubles each consecutive error
+    _BACKOFF_MAX = 30.0  # cap
 
     def _loop(self) -> None:
         """Background loop: capture frame -> detect faces -> update context."""
@@ -374,17 +397,26 @@ class VisionService:
                     self._BACKOFF_MAX,
                 )
                 if consecutive_errors <= self._MAX_CONSECUTIVE_ERRORS:
-                    _log.warning("Frame processing error (%s): %s", consecutive_errors, e)
+                    _log.warning(
+                        "Frame processing error (%s): %s", consecutive_errors, e
+                    )
                 elif consecutive_errors == self._MAX_CONSECUTIVE_ERRORS + 1:
-                    _log.error("Repeated failures (%sx), throttling to %.1fs intervals. Suppressing further logs.", consecutive_errors, backoff)
+                    _log.error(
+                        "Repeated failures (%sx), throttling to %.1fs intervals. Suppressing further logs.",
+                        consecutive_errors,
+                        backoff,
+                    )
                 time.sleep(backoff)
                 continue
 
             # Rate-limit + frame drop detection
             elapsed = time.monotonic() - loop_start
             if elapsed > self._target_interval * 2:
-                _log.debug("Frame processing took %.0fms (target %.0fms) — frame drop likely",
-                           elapsed * 1000, self._target_interval * 1000)
+                _log.debug(
+                    "Frame processing took %.0fms (target %.0fms) — frame drop likely",
+                    elapsed * 1000,
+                    self._target_interval * 1000,
+                )
             sleep_time = self._target_interval - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
@@ -420,7 +452,12 @@ def get_capture_image_tools() -> list:
 class CaptureImageExecutor:
     """Handles the capture_image tool call: grabs a frame and describes it via a vision LLM."""
 
-    def __init__(self, vision_service: VisionService, ollama_base_url: str, vision_model: str = "moondream"):
+    def __init__(
+        self,
+        vision_service: VisionService,
+        ollama_base_url: str,
+        vision_model: str = "moondream",
+    ):
         self._vision_service = vision_service
         self._ollama_url = ollama_base_url
         self._vision_model = vision_model

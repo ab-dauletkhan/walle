@@ -22,7 +22,6 @@ from .common import (
     resolve_data_dir,
 )
 
-
 DEFAULT_CAMERA_WIDTH = 1280
 DEFAULT_CAMERA_HEIGHT = 960
 DEFAULT_CAMERA_FPS = 30
@@ -32,7 +31,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Recognize enrolled people from a live camera stream."
     )
-    parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index.")
+    parser.add_argument(
+        "--camera-index", type=int, default=0, help="OpenCV camera index."
+    )
     parser.add_argument(
         "--edge-tpu",
         action=argparse.BooleanOptionalAction,
@@ -85,7 +86,9 @@ def run(args: argparse.Namespace) -> None:
 
             frame_height, frame_width = frame.shape[:2]
             image_rgb = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            detection_image = image_rgb.convert("RGB").resize((input_width, input_height), Image.LANCZOS)
+            detection_image = image_rgb.convert("RGB").resize(
+                (input_width, input_height), Image.LANCZOS
+            )
 
             detections = detect_faces(
                 detection_interpreter,

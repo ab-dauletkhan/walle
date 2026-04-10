@@ -15,30 +15,29 @@ To start:
 python3 -m stt_tts.main --wake-word "hey, rocket" --listen-timeout 3.0
 """
 
+import argparse
 import io
 import os
 import random
 import re
 import sys
-import time
 import threading
-import argparse
+import time
 from abc import ABC, abstractmethod
 from typing import Optional
 
 import numpy as np
 import requests
 import sounddevice as sd
-from scipy.io import wavfile
-
 from moonshine_voice import (
+    IntentRecognizer,
     MicTranscriber,
     ModelArch,
     TranscriptEventListener,
-    IntentRecognizer,
-    get_model_for_language,
     get_embedding_model,
+    get_model_for_language,
 )
+from scipy.io import wavfile
 
 from walle.voice.llm_client import LLMClient, MockLLMClient
 
@@ -66,7 +65,9 @@ def _to_float32_audio(audio: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(audio)
 
 
-def _play_audio_stable(audio: np.ndarray, sample_rate: int, blocking: bool = True) -> None:
+def _play_audio_stable(
+    audio: np.ndarray, sample_rate: int, blocking: bool = True
+) -> None:
     audio = _to_float32_audio(audio)
     sd.stop()
     sd.play(
@@ -82,23 +83,24 @@ def _play_audio_stable(audio: np.ndarray, sample_rate: int, blocking: bool = Tru
 # Layer 1: Robot Controller
 # ─────────────────────────────────────────────────────────────
 
+
 class BaseRobotController(ABC):
     """Interface for executing physical robot actions."""
 
     @abstractmethod
-    def execute(self, action: str, utterance: str, confidence: float) -> None:
-        ...
+    def execute(self, action: str, utterance: str, confidence: float) -> None: ...
 
     @abstractmethod
-    def close(self) -> None:
-        ...
+    def close(self) -> None: ...
 
 
 class StubRobotController(BaseRobotController):
     """Prints actions to console. Replace with serial/ROS controller later."""
 
     def execute(self, action: str, utterance: str, confidence: float) -> None:
-        print(f"  [Executing ROBOT action] '{action}' (heard: '{utterance}', confidence: {confidence:.0%})")
+        print(
+            f"  [Executing ROBOT action] '{action}' (heard: '{utterance}', confidence: {confidence:.0%})"
+        )
 
     def close(self) -> None:
         pass
@@ -108,12 +110,12 @@ class StubRobotController(BaseRobotController):
 # Layer 2: TTS Engine
 # ─────────────────────────────────────────────────────────────
 
+
 class BaseTTSEngine(ABC):
     """Interface for text-to-speech output."""
 
     @abstractmethod
-    def speak(self, text: str) -> None:
-        ...
+    def speak(self, text: str) -> None: ...
 
 
 class ConsoleTTSEngine(BaseTTSEngine):
@@ -145,8 +147,15 @@ class Mimic3TTSEngine(BaseTTSEngine):
                 print(f"  TTS error: HTTP {resp.status_code}", file=sys.stderr)
                 return
             content_type = resp.headers.get("Content-Type", "")
-            if "wav" not in content_type and "audio" not in content_type and "octet" not in content_type:
-                print(f"  TTS error: unexpected Content-Type '{content_type}'", file=sys.stderr)
+            if (
+                "wav" not in content_type
+                and "audio" not in content_type
+                and "octet" not in content_type
+            ):
+                print(
+                    f"  TTS error: unexpected Content-Type '{content_type}'",
+                    file=sys.stderr,
+                )
                 return
             try:
                 sr, audio = wavfile.read(io.BytesIO(resp.content))
@@ -155,7 +164,10 @@ class Mimic3TTSEngine(BaseTTSEngine):
                 return
             _play_audio_stable(audio, sr)
         except requests.exceptions.ConnectionError:
-            print(f"  TTS error: cannot connect to Mimic3 at {self._url} — falling back to console", file=sys.stderr)
+            print(
+                f"  TTS error: cannot connect to Mimic3 at {self._url} — falling back to console",
+                file=sys.stderr,
+            )
             print(f"  [TTS-fallback] {text}")
         except Exception as e:
             print(f"  TTS error: {e} — falling back to console", file=sys.stderr)
@@ -165,6 +177,7 @@ class Mimic3TTSEngine(BaseTTSEngine):
 # ─────────────────────────────────────────────────────────────
 # Layer 3: Speech Router (Intent + LLM fallback)
 # ─────────────────────────────────────────────────────────────
+
 
 class SpeechRouter(TranscriptEventListener):
     """Routes transcription events through a wake-word-gated state machine.
@@ -204,7 +217,9 @@ class SpeechRouter(TranscriptEventListener):
 
         self._handled_utterances: set[str] = set()
         self._conversation: list[dict] = []
-        self._max_conversation_length = 20  # Rolling window to prevent unbounded memory growth
+        self._max_conversation_length = (
+            20  # Rolling window to prevent unbounded memory growth
+        )
         self._busy = False
         self._speaking = False
         self._last_text_length = 0
@@ -232,7 +247,9 @@ class SpeechRouter(TranscriptEventListener):
     #    Together they reliably filter self-heard audio on slow STT pipelines.
 
     _ECHO_COOLDOWN = 2.0
-    _ECHO_WINDOW = 4.0  # seconds after TTS to keep content-based filtering (reduced from 8s)
+    _ECHO_WINDOW = (
+        4.0  # seconds after TTS to keep content-based filtering (reduced from 8s)
+    )
     _WAKE_DEBOUNCE_SECONDS = 1.5
 
     @property
@@ -252,8 +269,21 @@ class SpeechRouter(TranscriptEventListener):
             self._speaking = False
 
     _WAKE_ECHO_WORDS = {
-        "yes", "how", "can", "i", "help", "you", "what", "do", "need",
-        "hey", "hi", "hello", "listening", "ready", "here",
+        "yes",
+        "how",
+        "can",
+        "i",
+        "help",
+        "you",
+        "what",
+        "do",
+        "need",
+        "hey",
+        "hi",
+        "hello",
+        "listening",
+        "ready",
+        "here",
     }
 
     def _play_wake_sound(self, initial_command: str = "") -> None:
@@ -269,7 +299,9 @@ class SpeechRouter(TranscriptEventListener):
             return
 
         if not self._wake_sounds_dir or not os.path.isdir(self._wake_sounds_dir):
-            self._start_timeout(self._listen_timeout if initial_command else self._post_speak_timeout)
+            self._start_timeout(
+                self._listen_timeout if initial_command else self._post_speak_timeout
+            )
             return
         wavs = [
             os.path.join(self._wake_sounds_dir, f)
@@ -277,7 +309,9 @@ class SpeechRouter(TranscriptEventListener):
             if f.lower().endswith(".wav")
         ]
         if not wavs:
-            self._start_timeout(self._listen_timeout if initial_command else self._listen_timeout * 3)
+            self._start_timeout(
+                self._listen_timeout if initial_command else self._listen_timeout * 3
+            )
             return
         self._speaking = True
         self._echo_words = self._WAKE_ECHO_WORDS.copy()
@@ -295,7 +329,11 @@ class SpeechRouter(TranscriptEventListener):
             finally:
                 self._speaking = False
                 self._command_text = initial_command
-                self._start_timeout(self._listen_timeout if initial_command else self._post_speak_timeout)
+                self._start_timeout(
+                    self._listen_timeout
+                    if initial_command
+                    else self._post_speak_timeout
+                )
 
         threading.Thread(target=_play, daemon=True).start()
 
@@ -309,7 +347,9 @@ class SpeechRouter(TranscriptEventListener):
         if not words:
             return False
         overlap = len(words & self._echo_words) / len(words)
-        return overlap > 0.6  # Raised from 0.4 to reduce false positives on short phrases
+        return (
+            overlap > 0.6
+        )  # Raised from 0.4 to reduce false positives on short phrases
 
     # -- Wake word detection --
 
@@ -341,7 +381,7 @@ class SpeechRouter(TranscriptEventListener):
                 last_match_idx = ti
         if wi == len(wake_token_list):
             # Return text after the last matched wake token
-            remaining_tokens = text_tokens[last_match_idx + 1:]
+            remaining_tokens = text_tokens[last_match_idx + 1 :]
             return " ".join(remaining_tokens)
         return None
 
@@ -456,7 +496,9 @@ class SpeechRouter(TranscriptEventListener):
 
             # Trim conversation to rolling window to prevent unbounded memory growth
             if len(self._conversation) > self._max_conversation_length:
-                self._conversation = self._conversation[-self._max_conversation_length:]
+                self._conversation = self._conversation[
+                    -self._max_conversation_length :
+                ]
 
             self._speak(full_response)
         except Exception as e:
@@ -522,7 +564,9 @@ class VoiceAssistant:
 
         # -- Intent recognizer --
         print("Loading embedding model for intent recognition...", file=sys.stderr)
-        emb_path, emb_arch = get_embedding_model(embedding_model, embedding_quantization)
+        emb_path, emb_arch = get_embedding_model(
+            embedding_model, embedding_quantization
+        )
         self._intent_recognizer = IntentRecognizer(
             model_path=emb_path,
             model_arch=emb_arch,
@@ -558,11 +602,13 @@ class VoiceAssistant:
         If the utterance is actually the wake word, let the SpeechRouter
         handle it instead of executing a robot command.
         """
+
         def handler(trigger: str, utterance: str, similarity: float):
             if self._router._detect_wake(utterance) is not None:
                 return
             self._router.mark_handled(utterance)
             self._robot.execute(action, utterance, similarity)
+
         return handler
 
     def run(self) -> None:
@@ -571,8 +617,11 @@ class VoiceAssistant:
         print(f"{'=' * 60}", file=sys.stderr)
         print(f"  Robot commands ({len(self._intents)}):", file=sys.stderr)
         for phrase, action in self._intents.items():
-            print(f"    • \"{phrase}\" → {action}", file=sys.stderr)
-        print(f"  Wake word: \"{self._router._wake_word}\" → then speak your question for LLM", file=sys.stderr)
+            print(f'    • "{phrase}" → {action}', file=sys.stderr)
+        print(
+            f'  Wake word: "{self._router._wake_word}" → then speak your question for LLM',
+            file=sys.stderr,
+        )
         print(f"  Silence timeout: {self._router._listen_timeout}s", file=sys.stderr)
         print(f"{'=' * 60}", file=sys.stderr)
         print("  Press Ctrl+C to stop.\n", file=sys.stderr)
@@ -594,37 +643,63 @@ class VoiceAssistant:
 # Entry point
 # ─────────────────────────────────────────────────────────────
 
+
 def parse_args():
-    p = argparse.ArgumentParser(description="Voice Assistant: Moonshine STT + Intent + LLM")
+    p = argparse.ArgumentParser(
+        description="Voice Assistant: Moonshine STT + Intent + LLM"
+    )
 
     p.add_argument("--language", default="en", help="STT language (default: en)")
     p.add_argument(
-        "--stt-model", default="small-streaming",
+        "--stt-model",
+        default="small-streaming",
         choices=list(STT_MODEL_CHOICES.keys()),
         help="Moonshine STT model (default: small-streaming)",
     )
-    p.add_argument("--wake-word", default="hey robot",
-                    help="Wake phrase to activate LLM queries (default: 'hey robot')")
-    p.add_argument("--listen-timeout", type=float, default=3.0,
-                    help="Seconds of silence before sending to LLM (default: 3.0)")
-    p.add_argument("--wake-sounds-dir", default=None,
-                    help="Directory with .wav files to play on wake (default: wake_up_sounds/ next to script)")
-    p.add_argument("--intent-threshold", type=float, default=0.65,
-                    help="Intent match confidence threshold 0-1 (default: 0.65)")
+    p.add_argument(
+        "--wake-word",
+        default="hey robot",
+        help="Wake phrase to activate LLM queries (default: 'hey robot')",
+    )
+    p.add_argument(
+        "--listen-timeout",
+        type=float,
+        default=3.0,
+        help="Seconds of silence before sending to LLM (default: 3.0)",
+    )
+    p.add_argument(
+        "--wake-sounds-dir",
+        default=None,
+        help="Directory with .wav files to play on wake (default: wake_up_sounds/ next to script)",
+    )
+    p.add_argument(
+        "--intent-threshold",
+        type=float,
+        default=0.65,
+        help="Intent match confidence threshold 0-1 (default: 0.65)",
+    )
     p.add_argument("--embedding-model", default="embeddinggemma-300m")
     p.add_argument("--embedding-quantization", default="q4", help="q4, q8, fp16, fp32")
 
     tts_group = p.add_argument_group("TTS")
-    tts_group.add_argument("--no-tts", action="store_true",
-                           help="Disable audio TTS (console-only)")
-    tts_group.add_argument("--tts-url", default="http://localhost:59125",
-                           help="Mimic3 TTS server URL (default: http://localhost:59125)")
-    tts_group.add_argument("--tts-voice", default="en_UK/apope_low",
-                           help="TTS voice (default: en_UK/apope_low)")
+    tts_group.add_argument(
+        "--no-tts", action="store_true", help="Disable audio TTS (console-only)"
+    )
+    tts_group.add_argument(
+        "--tts-url",
+        default="http://localhost:59125",
+        help="Mimic3 TTS server URL (default: http://localhost:59125)",
+    )
+    tts_group.add_argument(
+        "--tts-voice",
+        default="en_UK/apope_low",
+        help="TTS voice (default: en_UK/apope_low)",
+    )
 
     llm_group = p.add_argument_group("LLM")
-    llm_group.add_argument("--use-ollama", action="store_true",
-                           help="Use real Ollama instead of mock LLM")
+    llm_group.add_argument(
+        "--use-ollama", action="store_true", help="Use real Ollama instead of mock LLM"
+    )
     llm_group.add_argument("--ollama-url", default="http://localhost:11434")
     llm_group.add_argument("--ollama-model", default="qwen2.5:3b")
 
@@ -637,6 +712,7 @@ def main():
     # -- Select LLM backend --
     if args.use_ollama:
         from walle.voice.llm_client import OllamaLLMClient
+
         llm = OllamaLLMClient(base_url=args.ollama_url, model=args.ollama_model)
         print(f"LLM: Ollama ({args.ollama_model})", file=sys.stderr)
     else:
@@ -650,13 +726,17 @@ def main():
         print("TTS: Console only (use without --no-tts for audio)", file=sys.stderr)
     else:
         tts = Mimic3TTSEngine(url=args.tts_url, voice=args.tts_voice)
-        print(f"TTS: Mimic3 at {args.tts_url} (voice: {args.tts_voice})", file=sys.stderr)
+        print(
+            f"TTS: Mimic3 at {args.tts_url} (voice: {args.tts_voice})", file=sys.stderr
+        )
 
     stt_arch = STT_MODEL_CHOICES[args.stt_model]
 
     wake_sounds = args.wake_sounds_dir
     if wake_sounds is None:
-        default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wake_up_sounds")
+        default_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "wake_up_sounds"
+        )
         if os.path.isdir(default_dir):
             wake_sounds = default_dir
     if wake_sounds:

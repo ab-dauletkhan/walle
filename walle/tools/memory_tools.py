@@ -1,10 +1,12 @@
 """
 Memory management tools for LLM interaction
 """
-from typing import Dict, List, Any
 
-from walle.memory.memory_system import Memory, RecallMemory, ArchivalMemory
+from typing import Dict, List
+
+from walle.memory.memory_system import ArchivalMemory, Memory, RecallMemory
 from walle.tools.base_executor import BaseToolExecutor
+
 
 def get_memory_tools() -> List[Dict]:
     return [
@@ -17,11 +19,11 @@ def get_memory_tools() -> List[Dict]:
                     "type": "object",
                     "properties": {
                         "label": {"type": "string", "enum": ["persona", "human"]},
-                        "content": {"type": "string"}
+                        "content": {"type": "string"},
                     },
-                    "required": ["label", "content"]
-                }
-            }
+                    "required": ["label", "content"],
+                },
+            },
         },
         {
             "type": "function",
@@ -33,11 +35,11 @@ def get_memory_tools() -> List[Dict]:
                     "properties": {
                         "label": {"type": "string", "enum": ["persona", "human"]},
                         "old_content": {"type": "string"},
-                        "new_content": {"type": "string"}
+                        "new_content": {"type": "string"},
                     },
-                    "required": ["label", "old_content", "new_content"]
-                }
-            }
+                    "required": ["label", "old_content", "new_content"],
+                },
+            },
         },
         {
             "type": "function",
@@ -49,11 +51,11 @@ def get_memory_tools() -> List[Dict]:
                     "properties": {
                         "category": {"type": "string"},
                         "content": {"type": "string"},
-                        "importance": {"type": "integer", "minimum": 1, "maximum": 10}
+                        "importance": {"type": "integer", "minimum": 1, "maximum": 10},
                     },
-                    "required": ["category", "content"]
-                }
-            }
+                    "required": ["category", "content"],
+                },
+            },
         },
         {
             "type": "function",
@@ -64,12 +66,13 @@ def get_memory_tools() -> List[Dict]:
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
-                        "limit": {"type": "integer"}
-                    }
-                }
-            }
-        }
+                        "limit": {"type": "integer"},
+                    },
+                },
+            },
+        },
     ]
+
 
 class MemoryToolExecutor(BaseToolExecutor):
     """Executor for memory-related tools."""
@@ -80,25 +83,31 @@ class MemoryToolExecutor(BaseToolExecutor):
         self.archival = archival
 
     def _core_memory_append(self, args):
-        block = self.memory.get_block(args['label'])
-        if not block: return "Block not found"
-        success, msg = block.append("\n" + args['content'])
-        if success: self.memory.save()
+        block = self.memory.get_block(args["label"])
+        if not block:
+            return "Block not found"
+        success, msg = block.append("\n" + args["content"])
+        if success:
+            self.memory.save()
         return f"Append result: {msg}"
 
     def _core_memory_replace(self, args):
-        block = self.memory.get_block(args['label'])
-        if not block: return "Block not found"
-        success, msg = block.replace(args['old_content'], args['new_content'])
-        if success: self.memory.save()
+        block = self.memory.get_block(args["label"])
+        if not block:
+            return "Block not found"
+        success, msg = block.replace(args["old_content"], args["new_content"])
+        if success:
+            self.memory.save()
         return f"Replace result: {msg}"
 
     def _archival_memory_insert(self, args):
-        self.archival.insert(args['category'], args['content'], args.get('importance', 5))
+        self.archival.insert(
+            args["category"], args["content"], args.get("importance", 5)
+        )
         return "Saved to archival memory."
 
     def _recall_memory_search(self, args):
-        res = self.recall.search(args.get('query'), args.get('limit', 5))
+        res = self.recall.search(args.get("query"), args.get("limit", 5))
         return f"Results: {res}"
 
     def get_tool_schemas(self) -> List[Dict]:

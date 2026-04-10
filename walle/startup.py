@@ -9,31 +9,37 @@ import argparse
 import logging
 import os
 import signal
-from typing import Optional
 
-from walle.memory.config import conf, setup_logging, validate_ollama
-from walle.memory.embeddings import get_embedding_model
-from walle.memory.memory_system import Memory, RecallMemory, ArchivalMemory
-from walle.tools.memory_tools import MemoryToolExecutor
-from walle.tools.personality import PersonalityEngine, PersonalityToolExecutor
-from walle.tools.robot.executor import RobotControlExecutor
-from walle.memory.heartbeat import HeartbeatManager
-from walle.tools.knowledge import KnowledgeToolExecutor
-from walle.memory.context_manager import ContextManager
-from walle.tools.communication import CommunicationExecutor
-
-from walle.serial_manager import SerialManager
-from walle.vision.service import VisionService, CaptureImageExecutor, get_capture_image_tools
-from walle.tools.registry import (
-    RelevantMemoryProvider, SystemPromptBuilder, ToolSuiteFacade,
-    ToolRegistry, CommunicationToolProvider, SchemaExecutorToolProvider,
-)
-from walle.tools.robot.executor import get_robot_control_tools
-from walle.tools.memory_tools import get_memory_tools
-from walle.tools.personality import get_personality_tools
-from walle.tools.knowledge import get_knowledge_tools
 from walle.chat_loop import ChatLoop, ChatSession, LLMStreamer
 from walle.lifecycle import LifecycleManager
+from walle.memory.config import conf, setup_logging, validate_ollama
+from walle.memory.context_manager import ContextManager
+from walle.memory.embeddings import get_embedding_model
+from walle.memory.heartbeat import HeartbeatManager
+from walle.memory.memory_system import ArchivalMemory, Memory, RecallMemory
+from walle.serial_manager import SerialManager
+from walle.tools.communication import CommunicationExecutor
+from walle.tools.knowledge import KnowledgeToolExecutor, get_knowledge_tools
+from walle.tools.memory_tools import MemoryToolExecutor, get_memory_tools
+from walle.tools.personality import (
+    PersonalityEngine,
+    PersonalityToolExecutor,
+    get_personality_tools,
+)
+from walle.tools.registry import (
+    CommunicationToolProvider,
+    RelevantMemoryProvider,
+    SchemaExecutorToolProvider,
+    SystemPromptBuilder,
+    ToolRegistry,
+    ToolSuiteFacade,
+)
+from walle.tools.robot.executor import RobotControlExecutor, get_robot_control_tools
+from walle.vision.service import (
+    CaptureImageExecutor,
+    VisionService,
+    get_capture_image_tools,
+)
 
 _log = logging.getLogger("walle.startup")
 _BASE = os.path.dirname(os.path.abspath(__file__))
@@ -83,12 +89,20 @@ def build_app(args) -> tuple:
     registry.register(CommunicationToolProvider(comm_exec))
     registry.register(SchemaExecutorToolProvider(get_robot_control_tools, robot_exec))
     registry.register(SchemaExecutorToolProvider(get_memory_tools, mem_exec))
-    registry.register(SchemaExecutorToolProvider(get_personality_tools, personality_exec))
-    registry.register(SchemaExecutorToolProvider(get_knowledge_tools, knowledge_exec, request_heartbeat_after=True))
+    registry.register(
+        SchemaExecutorToolProvider(get_personality_tools, personality_exec)
+    )
+    registry.register(
+        SchemaExecutorToolProvider(
+            get_knowledge_tools, knowledge_exec, request_heartbeat_after=True
+        )
+    )
     tool_suite = ToolSuiteFacade(registry)
 
     # -- LLM client --
-    client = OpenAI(base_url=f"{conf.OLLAMA_BASE_URL}/v1", api_key="ollama", timeout=30.0)
+    client = OpenAI(
+        base_url=f"{conf.OLLAMA_BASE_URL}/v1", api_key="ollama", timeout=30.0
+    )
     llm_streamer = LLMStreamer(client, conf.OLLAMA_MODEL)
 
     # -- Prompt & memory providers --
@@ -127,12 +141,15 @@ def build_app(args) -> tuple:
     # The remaining hooks from last-to-run to first-to-run:
     lifecycle.register("embeddings", recall_mem.shutdown)
     lifecycle.register("faiss-save", lambda: _save_faiss(recall_mem, archival_mem))
-    lifecycle.register("robot-neutral", lambda: robot_exec.execute("reset_to_neutral", {}))
+    lifecycle.register(
+        "robot-neutral", lambda: robot_exec.execute("reset_to_neutral", {})
+    )
     lifecycle.register("memory-compression", chat_loop.wait_for_compression)
 
     # -- Build orchestrator (thin facade) --
     # Import here to avoid circular — walle_main imports from startup
     from walle.orchestrator import WallEOrchestrator
+
     orchestrator = WallEOrchestrator(
         chat_loop=chat_loop,
         comm_exec=comm_exec,
@@ -156,7 +173,9 @@ def attach_vision(orchestrator, context_manager, lifecycle, args, vision_fps: in
     capture_exec = CaptureImageExecutor(vision, conf.OLLAMA_BASE_URL)
     orchestrator.set_vision_service(vision)
     orchestrator.tool_suite.register(
-        SchemaExecutorToolProvider(get_capture_image_tools, capture_exec, request_heartbeat_after=True)
+        SchemaExecutorToolProvider(
+            get_capture_image_tools, capture_exec, request_heartbeat_after=True
+        )
     )
     vision.start()
     lifecycle.register("vision", vision.stop)
@@ -180,10 +199,10 @@ def _status_line(label: str, detail: str, ok: bool) -> str:
     return f"  {label:<10} {detail:<28} {tag}"
 
 
-
 def _test_tts(url: str) -> bool:
     try:
         import requests
+
         r = requests.get(url, timeout=3)
         return r.status_code == 200
     except Exception:
@@ -197,33 +216,68 @@ def parse_args():
     parser = argparse.ArgumentParser(description="WALL-E Unified Orchestrator")
 
     # Mode
-    parser.add_argument("--text-mode", action="store_true", help="Text REPL instead of voice")
-    parser.add_argument("--no-vision", action="store_true", help="Disable vision processing")
-    parser.add_argument("--camera", type=int, default=0, help="Camera index (default 0)")
-    parser.add_argument("--jetson", action="store_true", help="Apply Jetson Orin Nano optimizations")
+    parser.add_argument(
+        "--text-mode", action="store_true", help="Text REPL instead of voice"
+    )
+    parser.add_argument(
+        "--no-vision", action="store_true", help="Disable vision processing"
+    )
+    parser.add_argument(
+        "--camera", type=int, default=0, help="Camera index (default 0)"
+    )
+    parser.add_argument(
+        "--jetson", action="store_true", help="Apply Jetson Orin Nano optimizations"
+    )
 
     # Serial
-    parser.add_argument("--serial-port", default=conf.SERIAL_PORT, help="Arduino serial port")
-    parser.add_argument("--baud-rate", type=int, default=conf.BAUD_RATE, help="Serial baud rate")
+    parser.add_argument(
+        "--serial-port", default=conf.SERIAL_PORT, help="Arduino serial port"
+    )
+    parser.add_argument(
+        "--baud-rate", type=int, default=conf.BAUD_RATE, help="Serial baud rate"
+    )
 
     # Web API
-    parser.add_argument("--web-port", type=int, default=5001, help="API server port (0 to disable)")
+    parser.add_argument(
+        "--web-port", type=int, default=5001, help="API server port (0 to disable)"
+    )
 
     # TTS
     parser.add_argument("--no-tts", action="store_true", help="Console TTS (no audio)")
-    parser.add_argument("--tts-url", default="http://localhost:59125", help="Mimic3 TTS URL")
+    parser.add_argument(
+        "--tts-url", default="http://localhost:59125", help="Mimic3 TTS URL"
+    )
     parser.add_argument("--tts-voice", default="en_UK/apope_low", help="Mimic3 voice")
 
     # Voice / STT
     parser.add_argument("--wake-word", default="hey robot", help="Wake word phrase")
-    parser.add_argument("--listen-timeout", type=float, default=3.0, help="Silence timeout (seconds)")
+    parser.add_argument(
+        "--listen-timeout", type=float, default=3.0, help="Silence timeout (seconds)"
+    )
     parser.add_argument("--language", default="en", help="STT language")
-    parser.add_argument("--stt-model", default="small-streaming",
-                        choices=["tiny-streaming", "small-streaming", "medium-streaming", "tiny", "base"],
-                        help="Moonshine STT model")
-    parser.add_argument("--intent-threshold", type=float, default=0.65, help="Intent match threshold")
-    parser.add_argument("--embedding-model", default="embeddinggemma-300m", help="Intent embedding model")
-    parser.add_argument("--embedding-quantization", default="q4", help="Embedding quantization")
+    parser.add_argument(
+        "--stt-model",
+        default="small-streaming",
+        choices=[
+            "tiny-streaming",
+            "small-streaming",
+            "medium-streaming",
+            "tiny",
+            "base",
+        ],
+        help="Moonshine STT model",
+    )
+    parser.add_argument(
+        "--intent-threshold", type=float, default=0.65, help="Intent match threshold"
+    )
+    parser.add_argument(
+        "--embedding-model",
+        default="embeddinggemma-300m",
+        help="Intent embedding model",
+    )
+    parser.add_argument(
+        "--embedding-quantization", default="q4", help="Embedding quantization"
+    )
 
     return parser.parse_args()
 
@@ -244,8 +298,12 @@ def main():
         conf.USE_FAISS = True
         conf.USE_SEMANTIC_SEARCH = True
         conf.VISION_FPS = 1
-        _log.info("Jetson mode: model=%s, embedding=%s, fps=%s",
-                   conf.OLLAMA_MODEL, conf.EMBEDDING_DEVICE, conf.VISION_FPS)
+        _log.info(
+            "Jetson mode: model=%s, embedding=%s, fps=%s",
+            conf.OLLAMA_MODEL,
+            conf.EMBEDDING_DEVICE,
+            conf.VISION_FPS,
+        )
 
     # --- Build the app ---
     status_lines = []
@@ -258,7 +316,9 @@ def main():
     # Validate Ollama
     _log.info("[2/7] Validating Ollama (%s)...", conf.OLLAMA_MODEL)
     ollama_ok, ollama_proc = validate_ollama(conf)
-    status_lines.append(_status_line("LLM:", f"{conf.OLLAMA_MODEL} via Ollama", ollama_ok))
+    status_lines.append(
+        _status_line("LLM:", f"{conf.OLLAMA_MODEL} via Ollama", ollama_ok)
+    )
     if ollama_proc:
         lifecycle.register("ollama", ollama_proc.terminate)
     if not ollama_ok:
@@ -267,25 +327,45 @@ def main():
 
     # Vision
     _log.info("[3/7] Setting up vision...")
-    vision = attach_vision(orchestrator, context_manager, lifecycle, args, conf.VISION_FPS)
+    vision = attach_vision(
+        orchestrator, context_manager, lifecycle, args, conf.VISION_FPS
+    )
     if vision is not None:
-        status_lines.append(_status_line("Vision:", f"{vision.backend_name} (cam={args.camera})", vision.is_active))
+        status_lines.append(
+            _status_line(
+                "Vision:",
+                f"{vision.backend_name} (cam={args.camera})",
+                vision.is_active,
+            )
+        )
     else:
         status_lines.append(_status_line("Vision:", "disabled", False))
 
     # Serial
     _log.info("[4/7] Serial connection...")
-    status_lines.append(_status_line("Arduino:", args.serial_port or "simulation", serial_mgr.is_connected()))
+    status_lines.append(
+        _status_line(
+            "Arduino:", args.serial_port or "simulation", serial_mgr.is_connected()
+        )
+    )
 
     # API server
     _log.info("[5/7] API server...")
     api_srv = None
     if args.web_port > 0:
         from walle.api_server import APIServer
-        api_srv = APIServer(serial_mgr, llm_client=orchestrator, vision_service=vision, port=args.web_port)
+
+        api_srv = APIServer(
+            serial_mgr,
+            llm_client=orchestrator,
+            vision_service=vision,
+            port=args.web_port,
+        )
         api_srv.start()
         lifecycle.register("api-server", api_srv.stop)
-        status_lines.append(_status_line("API:", f"http://localhost:{args.web_port}", True))
+        status_lines.append(
+            _status_line("API:", f"http://localhost:{args.web_port}", True)
+        )
     else:
         status_lines.append(_status_line("API:", "disabled", False))
 
@@ -294,7 +374,9 @@ def main():
     tts_ok = False
     if not args.no_tts:
         tts_ok = _test_tts(args.tts_url)
-    tts_label = "Console" if args.no_tts else ("Mimic3" if tts_ok else "Console (fallback)")
+    tts_label = (
+        "Console" if args.no_tts else ("Mimic3" if tts_ok else "Console (fallback)")
+    )
     if not args.no_tts and not tts_ok:
         args.no_tts = True
     status_lines.append(_status_line("TTS:", tts_label, True))
@@ -325,7 +407,9 @@ def main():
 
     # Voice mode — custom signal handler because VoiceAssistant.run()
     # may not propagate KeyboardInterrupt cleanly through audio threads.
-    _halt = lambda *_: lifecycle.shutdown()
+    def _halt(*_):
+        lifecycle.shutdown()
+
     signal.signal(signal.SIGINT, _halt)
     signal.signal(signal.SIGTERM, _halt)
     print(f'  Say "{args.wake_word}" to begin!\n')
@@ -338,7 +422,7 @@ def main():
 def _text_mode_repl(orchestrator):
     print(f"\n{'=' * 50}")
     print(f"  WALL-E Text Mode | {conf.OLLAMA_MODEL} via Ollama")
-    print(f"  Type 'exit' or 'quit' to stop.")
+    print("  Type 'exit' or 'quit' to stop.")
     print(f"{'=' * 50}\n")
 
     try:
@@ -370,13 +454,13 @@ class _RobotBridge:
     """
 
     ACTION_MAP = {
-        "forward":  ("drive_forward",   {"speed": 50, "duration_ms": 1000}),
-        "backward": ("drive_backward",  {"speed": 50, "duration_ms": 1000}),
-        "left":     ("turn_left",       {"speed": 50, "duration_ms": 500}),
-        "right":    ("turn_right",      {"speed": 50, "duration_ms": 500}),
-        "stop":     ("stop_movement",   {}),
-        "wave":     ("wave_hello",      {}),
-        "dance":    ("express_emotion", {"emotion": "happy"}),
+        "forward": ("drive_forward", {"speed": 50, "duration_ms": 1000}),
+        "backward": ("drive_backward", {"speed": 50, "duration_ms": 1000}),
+        "left": ("turn_left", {"speed": 50, "duration_ms": 500}),
+        "right": ("turn_right", {"speed": 50, "duration_ms": 500}),
+        "stop": ("stop_movement", {}),
+        "wave": ("wave_hello", {}),
+        "dance": ("express_emotion", {"emotion": "happy"}),
     }
 
     def __init__(self, robot_exec):
@@ -386,7 +470,12 @@ class _RobotBridge:
         mapping = self.ACTION_MAP.get(action)
         if mapping:
             tool_name, args = mapping
-            _log.debug("RobotBridge: %s -> %s (confidence=%.0f%%)", action, tool_name, confidence * 100)
+            _log.debug(
+                "RobotBridge: %s -> %s (confidence=%.0f%%)",
+                action,
+                tool_name,
+                confidence * 100,
+            )
             self._robot.execute(tool_name, args)
         else:
             _log.warning("RobotBridge: unknown action '%s'", action)
@@ -396,10 +485,20 @@ class _RobotBridge:
 
 
 def _run_voice_mode(orchestrator, robot_exec, args, lifecycle: LifecycleManager):
-    from walle.voice.assistant import VoiceAssistant, ROBOT_INTENTS, Mimic3TTSEngine, ConsoleTTSEngine, ModelArch, BaseRobotController
+    from walle.voice.assistant import (
+        ROBOT_INTENTS,
+        ConsoleTTSEngine,
+        Mimic3TTSEngine,
+        ModelArch,
+        VoiceAssistant,
+    )
 
     robot_bridge = _RobotBridge(robot_exec)
-    tts = ConsoleTTSEngine() if args.no_tts else Mimic3TTSEngine(url=args.tts_url, voice=args.tts_voice)
+    tts = (
+        ConsoleTTSEngine()
+        if args.no_tts
+        else Mimic3TTSEngine(url=args.tts_url, voice=args.tts_voice)
+    )
 
     stt_arch_map = {
         "tiny-streaming": ModelArch.TINY_STREAMING,

@@ -19,18 +19,22 @@ import math
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
-from typing import List, Dict, Optional, Any, Callable
 from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional
 
-from .config import conf, MEMORY_DIR
+from .config import MEMORY_DIR, conf
 from .embeddings import get_embedding
-from .vector_index import FAISSManager, is_faiss_available
-from .repository import RecallRepository, ArchivalRepository, _connect_db
+from .repository import ArchivalRepository, RecallRepository, _connect_db
 from .search_chain import (
-    FAISSSearchHandler, FTS5SearchHandler, RecentSearchHandler,
-    ensure_fts5_table, insert_fts5, delete_fts5_before,
+    FAISSSearchHandler,
+    FTS5SearchHandler,
+    RecentSearchHandler,
+    delete_fts5_before,
+    ensure_fts5_table,
+    insert_fts5,
 )
+from .vector_index import FAISSManager, is_faiss_available
 
 _log = logging.getLogger("walle.memory")
 
@@ -41,6 +45,7 @@ _log = logging.getLogger("walle.memory")
 @dataclass
 class Block:
     """A reserved section of the LLM's context window."""
+
     label: str
     value: str
     limit: int
@@ -50,7 +55,7 @@ class Block:
 
     def __post_init__(self):
         if len(self.value) > self.limit:
-            self.value = self.value[:self.limit]
+            self.value = self.value[: self.limit]
         if not self.metadata:
             self.metadata = {
                 "created_at": datetime.now().isoformat(),
@@ -102,16 +107,35 @@ class Block:
 @dataclass
 class Memory:
     """Core Memory — always in context window."""
+
     blocks: List[Block] = field(default_factory=list)
-    db_path: str = field(default_factory=lambda: os.path.join(MEMORY_DIR, "walle_core_memory.db"))
+    db_path: str = field(
+        default_factory=lambda: os.path.join(MEMORY_DIR, "walle_core_memory.db")
+    )
 
     def __post_init__(self):
         if not self.blocks:
             if not self._load_from_db():
                 self.blocks = [
-                    Block("persona", "I am WALL-E, a robot companion.", 2000, "My identity and capabilities."),
-                    Block("human", "The human is my operator.", 2000, "User profile and preferences."),
-                    Block("system", "System initialized.", 1000, "System status.", read_only=True),
+                    Block(
+                        "persona",
+                        "I am WALL-E, a robot companion.",
+                        2000,
+                        "My identity and capabilities.",
+                    ),
+                    Block(
+                        "human",
+                        "The human is my operator.",
+                        2000,
+                        "User profile and preferences.",
+                    ),
+                    Block(
+                        "system",
+                        "System initialized.",
+                        1000,
+                        "System status.",
+                        read_only=True,
+                    ),
                 ]
                 self.save()
 
@@ -130,8 +154,14 @@ class Memory:
         if not rows:
             return False
         self.blocks = [
-            Block(label=r[0], value=r[1], limit=r[2], description=r[3],
-                  read_only=bool(r[4]), metadata=json.loads(r[5] or "{}"))
+            Block(
+                label=r[0],
+                value=r[1],
+                limit=r[2],
+                description=r[3],
+                read_only=bool(r[4]),
+                metadata=json.loads(r[5] or "{}"),
+            )
             for r in rows
         ]
         return True
@@ -142,14 +172,25 @@ class Memory:
             for b in self.blocks:
                 conn.execute(
                     "INSERT OR REPLACE INTO core_memory VALUES (?, ?, ?, ?, ?, ?)",
-                    (b.label, b.value, b.limit, b.description, int(b.read_only), json.dumps(b.metadata)),
+                    (
+                        b.label,
+                        b.value,
+                        b.limit,
+                        b.description,
+                        int(b.read_only),
+                        json.dumps(b.metadata),
+                    ),
                 )
 
     def get_block(self, label: str) -> Optional[Block]:
         return next((b for b in self.blocks if b.label == label), None)
 
     def compile(self) -> str:
-        return "<memory_blocks>\n" + "\n".join(b.compile() for b in self.blocks) + "\n</memory_blocks>"
+        return (
+            "<memory_blocks>\n"
+            + "\n".join(b.compile() for b in self.blocks)
+            + "\n</memory_blocks>"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +205,9 @@ class RecallMemory:
         self.use_semantic = use_semantic
         self._repo = RecallRepository(db_path=db_path)
         self.db_path = self._repo.db_path
-        self._embedding_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="emb")
+        self._embedding_pool = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="emb"
+        )
         self._pending_futures: set = set()
         self._pending_lock = threading.Lock()
 
@@ -174,8 +217,12 @@ class RecallMemory:
         # FAISS
         self.faiss_manager = None
         if use_semantic and conf.USE_FAISS and is_faiss_available():
-            faiss_path = os.path.join(MEMORY_DIR, conf.FAISS_INDEX_PATH.replace(".index", "_recall.index"))
-            self.faiss_manager = FAISSManager(dimension=conf.FAISS_DIMENSION, index_path=faiss_path)
+            faiss_path = os.path.join(
+                MEMORY_DIR, conf.FAISS_INDEX_PATH.replace(".index", "_recall.index")
+            )
+            self.faiss_manager = FAISSManager(
+                dimension=conf.FAISS_DIMENSION, index_path=faiss_path
+            )
             self._ensure_faiss_index()
 
         # Search chain: FAISS → FTS5 → Recent
@@ -206,9 +253,19 @@ class RecallMemory:
             self.faiss_manager.add(emb, rid)
         self.faiss_manager.save_async()
 
-    def insert(self, role: str, content: str, tools_used: list = None,
-               metadata: dict = None, defer_embedding: bool = False):
-        embedding = get_embedding(content) if (self.use_semantic and not defer_embedding) else None
+    def insert(
+        self,
+        role: str,
+        content: str,
+        tools_used: list = None,
+        metadata: dict = None,
+        defer_embedding: bool = False,
+    ):
+        embedding = (
+            get_embedding(content)
+            if (self.use_semantic and not defer_embedding)
+            else None
+        )
         row_id = self._repo.insert(role, content, embedding, tools_used, metadata)
 
         insert_fts5(self.db_path, "recall_memory", row_id, content)
@@ -221,9 +278,13 @@ class RecallMemory:
         if self.use_semantic and defer_embedding:
             with self._pending_lock:
                 if len(self._pending_futures) >= self._MAX_PENDING_EMBEDDINGS:
-                    _log.debug("Embedding queue full, skipping deferred for row %d", row_id)
+                    _log.debug(
+                        "Embedding queue full, skipping deferred for row %d", row_id
+                    )
                 else:
-                    future = self._embedding_pool.submit(self._generate_embedding_async, row_id, content)
+                    future = self._embedding_pool.submit(
+                        self._generate_embedding_async, row_id, content
+                    )
                     self._pending_futures.add(future)
                     future.add_done_callback(self._on_embedding_done)
 
@@ -246,13 +307,20 @@ class RecallMemory:
 
     def search(self, query: str = None, limit: int = 10) -> List[Dict]:
         self._sync_faiss_if_needed()
-        return self._search_chain.search(query, limit, self.db_path, table="recall_memory") or []
+        return (
+            self._search_chain.search(query, limit, self.db_path, table="recall_memory")
+            or []
+        )
 
     def get_count(self) -> int:
         return self._repo.get_count()
 
-    def compress_old_memories(self, summarizer_func: Callable[[str], str],
-                              archival_memory: 'ArchivalMemory', keep_recent: int = 50):
+    def compress_old_memories(
+        self,
+        summarizer_func: Callable[[str], str],
+        archival_memory: "ArchivalMemory",
+        keep_recent: int = 50,
+    ):
         count = self.get_count()
         if count <= keep_recent:
             return 0
@@ -281,6 +349,7 @@ class RecallMemory:
     def shutdown(self, timeout: float = 30):
         self._embedding_pool.shutdown(wait=False, cancel_futures=True)
         import time
+
         deadline = time.monotonic() + timeout
         with self._pending_lock:
             pending = list(self._pending_futures)
@@ -310,8 +379,12 @@ class ArchivalMemory:
 
         self.faiss_manager = None
         if use_semantic and conf.USE_FAISS and is_faiss_available():
-            faiss_path = os.path.join(MEMORY_DIR, conf.FAISS_INDEX_PATH.replace(".index", "_archival.index"))
-            self.faiss_manager = FAISSManager(dimension=conf.FAISS_DIMENSION, index_path=faiss_path)
+            faiss_path = os.path.join(
+                MEMORY_DIR, conf.FAISS_INDEX_PATH.replace(".index", "_archival.index")
+            )
+            self.faiss_manager = FAISSManager(
+                dimension=conf.FAISS_DIMENSION, index_path=faiss_path
+            )
             self._ensure_faiss_index()
 
         self._search_chain = FAISSSearchHandler(
@@ -341,7 +414,9 @@ class ArchivalMemory:
             self.faiss_manager.add(emb, rid)
         self.faiss_manager.save_async()
 
-    def insert(self, category: str, content: str, importance: int = 5, metadata: dict = None):
+    def insert(
+        self, category: str, content: str, importance: int = 5, metadata: dict = None
+    ):
         embedding = get_embedding(content) if self.use_semantic else None
         row_id = self._repo.insert(category, content, importance, embedding, metadata)
 
@@ -356,7 +431,10 @@ class ArchivalMemory:
         fetch_limit = limit * 3
         self._sync_faiss_if_needed()
         results = self._search_chain.search(
-            query, fetch_limit, self.db_path, table="archival_memory",
+            query,
+            fetch_limit,
+            self.db_path,
+            table="archival_memory",
             format_archival=self._apply_importance_decay,
         )
         if results:
@@ -372,7 +450,7 @@ class ArchivalMemory:
             if timestamp:
                 try:
                     if isinstance(timestamp, str):
-                        clean_ts = timestamp.replace('Z', '+00:00')
+                        clean_ts = timestamp.replace("Z", "+00:00")
                         ts = datetime.fromisoformat(clean_ts)
                         if ts.tzinfo is not None:
                             ts = ts.replace(tzinfo=None)
@@ -387,14 +465,16 @@ class ArchivalMemory:
                 importance * conf.IMPORTANCE_STATIC_WEIGHT
                 + recency_score * 10 * conf.IMPORTANCE_RECENCY_WEIGHT
             )
-            results.append({
-                "category": category,
-                "content": content,
-                "importance": importance,
-                "effective_importance": round(effective_importance, 2),
-                "age_days": round(age_days, 1),
-                "timestamp": str(timestamp) if timestamp else None,
-            })
+            results.append(
+                {
+                    "category": category,
+                    "content": content,
+                    "importance": importance,
+                    "effective_importance": round(effective_importance, 2),
+                    "age_days": round(age_days, 1),
+                    "timestamp": str(timestamp) if timestamp else None,
+                }
+            )
         results.sort(key=lambda x: x["effective_importance"], reverse=True)
         return results
 

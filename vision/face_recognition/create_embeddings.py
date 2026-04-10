@@ -18,7 +18,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Create TFLite face embeddings from enrolled face crops."
     )
-    parser.add_argument("--person", type=int, required=True, help="Person folder number to process.")
+    parser.add_argument(
+        "--person", type=int, required=True, help="Person folder number to process."
+    )
     parser.add_argument(
         "--edge-tpu",
         action=argparse.BooleanOptionalAction,

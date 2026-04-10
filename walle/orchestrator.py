@@ -20,8 +20,16 @@ class WallEOrchestrator:
     and chat() for the API server and text REPL.
     """
 
-    def __init__(self, chat_loop, comm_exec, recall_mem, context_manager,
-                 vision_service, serial_manager, tool_suite):
+    def __init__(
+        self,
+        chat_loop,
+        comm_exec,
+        recall_mem,
+        context_manager,
+        vision_service,
+        serial_manager,
+        tool_suite,
+    ):
         self._chat_loop = chat_loop
         self._comm_exec = comm_exec
         self.recall_mem = recall_mem
@@ -59,6 +67,7 @@ class WallEOrchestrator:
 
 def main():
     from walle.startup import main as startup_main
+
     startup_main()
 
 

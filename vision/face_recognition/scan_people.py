@@ -20,7 +20,6 @@ from .common import (
     resolve_data_dir,
 )
 
-
 DEFAULT_CAMERA_WIDTH = 1280
 DEFAULT_CAMERA_HEIGHT = 960
 DEFAULT_CAMERA_FPS = 30
@@ -30,8 +29,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Enroll one person by saving detected 96x96 face crops."
     )
-    parser.add_argument("--person", type=int, required=True, help="Person folder number to create.")
-    parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index.")
+    parser.add_argument(
+        "--person", type=int, required=True, help="Person folder number to create."
+    )
+    parser.add_argument(
+        "--camera-index", type=int, default=0, help="OpenCV camera index."
+    )
     parser.add_argument(
         "--edge-tpu",
         action=argparse.BooleanOptionalAction,
@@ -46,8 +49,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-width", type=int, default=DEFAULT_CAMERA_WIDTH)
     parser.add_argument("--camera-height", type=int, default=DEFAULT_CAMERA_HEIGHT)
     parser.add_argument("--fps", type=int, default=DEFAULT_CAMERA_FPS)
-    parser.add_argument("--threshold", type=float, default=0.9, help="Minimum face detection score to save a crop.")
-    parser.add_argument("--max-images", type=int, default=0, help="Stop after this many saved crops. 0 means unlimited.")
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.9,
+        help="Minimum face detection score to save a crop.",
+    )
+    parser.add_argument(
+        "--max-images",
+        type=int,
+        default=0,
+        help="Stop after this many saved crops. 0 means unlimited.",
+    )
     parser.add_argument(
         "--overwrite",
         action="store_true",
@@ -99,7 +112,9 @@ def run(args: argparse.Namespace) -> None:
 
             frame_height, frame_width = frame.shape[:2]
             image_rgb = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            detection_image = image_rgb.convert("RGB").resize((input_width, input_height), Image.LANCZOS)
+            detection_image = image_rgb.convert("RGB").resize(
+                (input_width, input_height), Image.LANCZOS
+            )
 
             detections = detect_faces(
                 interpreter,

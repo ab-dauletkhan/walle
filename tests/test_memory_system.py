@@ -13,19 +13,23 @@ Or directly: python test_memory_system.py
 """
 
 import os
-import time
-import json
+import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta
-from pathlib import Path
 
-from walle.memory.memory_system import Memory, Block, RecallMemory, ArchivalMemory
+from walle.memory.config import conf
 from walle.memory.embeddings import get_embedding
-from walle.memory.vector_index import FAISSManager, is_faiss_available as _is_faiss_available
+from walle.memory.memory_system import ArchivalMemory, Memory, RecallMemory
+from walle.memory.vector_index import (
+    FAISSManager,
+)
+from walle.memory.vector_index import (
+    is_faiss_available as _is_faiss_available,
+)
 
 _faiss_available = _is_faiss_available()
-from walle.memory.config import conf
 
 
 class TestCoreMemory(unittest.TestCase):
@@ -40,6 +44,7 @@ class TestCoreMemory(unittest.TestCase):
     def tearDown(self):
         """Cleanup temp files"""
         import shutil
+
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_default_blocks_created(self):
@@ -139,19 +144,20 @@ class TestRecallMemory(unittest.TestCase):
         """Create fresh recall memory with temp database"""
         self.temp_dir = tempfile.mkdtemp()
         self.db_path = os.path.join(self.temp_dir, "test_recall_memory.db")
-        
+
         # ISOLATION FIX: Patch global config to use temp FAISS index
         self.original_faiss_path = conf.FAISS_INDEX_PATH
         conf.FAISS_INDEX_PATH = os.path.join(self.temp_dir, "test_recall.index")
-        
+
         self.recall = RecallMemory(db_path=self.db_path, use_semantic=True)
 
     def tearDown(self):
         """Cleanup temp files and restore config"""
         # Restore global config
         conf.FAISS_INDEX_PATH = self.original_faiss_path
-        
+
         import shutil
+
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_insert_and_count(self):
@@ -168,7 +174,7 @@ class TestRecallMemory(unittest.TestCase):
         self.recall.insert(
             "assistant",
             "Let me search for that.",
-            tools_used=["consult_internet_for_facts"]
+            tools_used=["consult_internet_for_facts"],
         )
 
         # Verify it was stored
@@ -228,25 +234,24 @@ class TestArchivalMemory(unittest.TestCase):
         """Create fresh archival memory with temp database"""
         self.temp_dir = tempfile.mkdtemp()
         self.db_path = os.path.join(self.temp_dir, "test_archival_memory.db")
-        
+
         # ISOLATION FIX: Patch global config to use temp FAISS index
         self.original_faiss_path = conf.FAISS_INDEX_PATH
         conf.FAISS_INDEX_PATH = os.path.join(self.temp_dir, "test_archival.index")
-        
+
         self.archival = ArchivalMemory(db_path=self.db_path, use_semantic=True)
 
     def tearDown(self):
         """Cleanup temp files and restore config"""
         conf.FAISS_INDEX_PATH = self.original_faiss_path
         import shutil
+
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_insert_fact(self):
         """Test inserting a fact"""
         self.archival.insert(
-            category="preference",
-            content="User likes coffee",
-            importance=8
+            category="preference", content="User likes coffee", importance=8
         )
 
         self.assertEqual(self.archival.get_count(), 1)
@@ -255,13 +260,17 @@ class TestArchivalMemory(unittest.TestCase):
         """Test inserting facts with different categories"""
         self.archival.insert("preference", "User likes coffee", importance=8)
         self.archival.insert("personal_info", "User's name is Alex", importance=9)
-        self.archival.insert("conversation_summary", "Discussed AI topics", importance=3)
+        self.archival.insert(
+            "conversation_summary", "Discussed AI topics", importance=3
+        )
 
         self.assertEqual(self.archival.get_count(), 3)
 
     def test_search_by_content(self):
         """Test searching facts by content"""
-        self.archival.insert("preference", "User enjoys Python programming", importance=7)
+        self.archival.insert(
+            "preference", "User enjoys Python programming", importance=7
+        )
         self.archival.insert("preference", "User dislikes JavaScript", importance=5)
 
         results = self.archival.search("Python", limit=5)
@@ -293,7 +302,7 @@ class TestArchivalMemory(unittest.TestCase):
             old_time = (datetime.now() - timedelta(days=60)).isoformat()
             conn.execute(
                 "INSERT INTO archival_memory (timestamp, category, content, importance) VALUES (?, ?, ?, ?)",
-                (old_time, "test", "Old fact", 8)
+                (old_time, "test", "Old fact", 8),
             )
 
         results = self.archival.search("fact", limit=5)
@@ -304,13 +313,14 @@ class TestArchivalMemory(unittest.TestCase):
 
         if recent and old:
             # Recent fact should have higher effective importance
-            self.assertGreater(recent["effective_importance"], old["effective_importance"])
+            self.assertGreater(
+                recent["effective_importance"], old["effective_importance"]
+            )
             # Old fact should show age in days
             self.assertGreater(old["age_days"], 50)
 
     def test_effective_importance_calculation(self):
         """Test the effective importance calculation formula"""
-        import math
 
         # Insert a brand new fact
         self.archival.insert("test", "Brand new fact", importance=5)
@@ -321,7 +331,9 @@ class TestArchivalMemory(unittest.TestCase):
             result = results[0]
             # For a new fact (age ~0), recency_score ~1.0
             # effective = 5 * 0.7 + 1.0 * 10 * 0.3 = 3.5 + 3.0 = 6.5
-            expected = 5 * conf.IMPORTANCE_STATIC_WEIGHT + 10 * conf.IMPORTANCE_RECENCY_WEIGHT
+            expected = (
+                5 * conf.IMPORTANCE_STATIC_WEIGHT + 10 * conf.IMPORTANCE_RECENCY_WEIGHT
+            )
             self.assertAlmostEqual(result["effective_importance"], expected, delta=0.5)
 
 
@@ -336,6 +348,7 @@ class TestFAISSManager(unittest.TestCase):
     def tearDown(self):
         """Cleanup temp files"""
         import shutil
+
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     @unittest.skipIf(not _faiss_available, "FAISS not installed")
@@ -406,10 +419,12 @@ class TestFAISSManager(unittest.TestCase):
             # Time the search
             start = time.time()
             for _ in range(10):
-                results = manager.search(query_emb, k=10)
+                manager.search(query_emb, k=10)
             elapsed = (time.time() - start) / 10 * 1000  # ms per search
 
-            print(f"\n[FAISS Performance] Average search time: {elapsed:.2f}ms for 100 vectors")
+            print(
+                f"\n[FAISS Performance] Average search time: {elapsed:.2f}ms for 100 vectors"
+            )
 
             # Should be very fast (under 50ms)
             self.assertLess(elapsed, 50)
@@ -421,7 +436,7 @@ class TestToolCalling(unittest.TestCase):
     def setUp(self):
         """Setup for tool calling tests"""
         self.temp_dir = tempfile.mkdtemp()
-        
+
         # ISOLATION FIX
         self.original_faiss_path = conf.FAISS_INDEX_PATH
         conf.FAISS_INDEX_PATH = os.path.join(self.temp_dir, "test_tools.index")
@@ -430,6 +445,7 @@ class TestToolCalling(unittest.TestCase):
         """Cleanup"""
         conf.FAISS_INDEX_PATH = self.original_faiss_path
         import shutil
+
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_memory_tools_import(self):
@@ -451,10 +467,10 @@ class TestToolCalling(unittest.TestCase):
 
         executor = MemoryToolExecutor(memory, None, None)
 
-        result = executor.execute("core_memory_append", {
-            "label": "human",
-            "content": " User's favorite color is blue."
-        })
+        result = executor.execute(
+            "core_memory_append",
+            {"label": "human", "content": " User's favorite color is blue."},
+        )
 
         self.assertIn("success", result.lower())
         self.assertIn("blue", memory.get_block("human").value)
@@ -472,11 +488,10 @@ class TestToolCalling(unittest.TestCase):
 
         executor = MemoryToolExecutor(memory, None, None)
 
-        result = executor.execute("core_memory_replace", {
-            "label": "human",
-            "old_content": "coffee",
-            "new_content": "tea"
-        })
+        result = executor.execute(
+            "core_memory_replace",
+            {"label": "human", "old_content": "coffee", "new_content": "tea"},
+        )
 
         self.assertIn("success", result.lower())
         self.assertIn("tea", memory.get_block("human").value)
@@ -487,7 +502,7 @@ class TestToolCalling(unittest.TestCase):
 
         db_paths = {
             "core": os.path.join(self.temp_dir, "core.db"),
-            "archival": os.path.join(self.temp_dir, "archival.db")
+            "archival": os.path.join(self.temp_dir, "archival.db"),
         }
 
         memory = Memory(db_path=db_paths["core"])
@@ -495,11 +510,14 @@ class TestToolCalling(unittest.TestCase):
 
         executor = MemoryToolExecutor(memory, None, archival)
 
-        result = executor.execute("archival_memory_insert", {
-            "category": "preference",
-            "content": "User prefers dark mode",
-            "importance": 7
-        })
+        result = executor.execute(
+            "archival_memory_insert",
+            {
+                "category": "preference",
+                "content": "User prefers dark mode",
+                "importance": 7,
+            },
+        )
 
         self.assertIn("saved", result.lower())
         self.assertEqual(archival.get_count(), 1)
@@ -528,7 +546,7 @@ class TestSearchPerformance(unittest.TestCase):
     def setUp(self):
         """Setup test data"""
         self.temp_dir = tempfile.mkdtemp()
-        
+
         # ISOLATION FIX
         self.original_faiss_path = conf.FAISS_INDEX_PATH
         conf.FAISS_INDEX_PATH = os.path.join(self.temp_dir, "test_perf.index")
@@ -537,12 +555,12 @@ class TestSearchPerformance(unittest.TestCase):
         """Cleanup"""
         conf.FAISS_INDEX_PATH = self.original_faiss_path
         import shutil
+
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     @unittest.skipIf(not _faiss_available, "FAISS not installed")
     def test_faiss_vs_naive_performance(self):
         """Compare FAISS vs naive cosine similarity performance"""
-        import numpy as np
 
         db_path = os.path.join(self.temp_dir, "perf_test.db")
 
@@ -592,7 +610,7 @@ class TestIntegration(unittest.TestCase):
         self.core_db = os.path.join(self.temp_dir, "core.db")
         self.recall_db = os.path.join(self.temp_dir, "recall.db")
         self.archival_db = os.path.join(self.temp_dir, "archival.db")
-        
+
         # ISOLATION FIX: Patch global config to use temp FAISS index
         self.original_faiss_path = conf.FAISS_INDEX_PATH
         conf.FAISS_INDEX_PATH = os.path.join(self.temp_dir, "test_integration.index")
@@ -605,6 +623,7 @@ class TestIntegration(unittest.TestCase):
         """Cleanup"""
         conf.FAISS_INDEX_PATH = self.original_faiss_path
         import shutil
+
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_conversation_workflow(self):
@@ -621,11 +640,14 @@ class TestIntegration(unittest.TestCase):
         self.archival.insert(
             category="personal_info",
             content="User's name is Alex, a Python developer",
-            importance=9
+            importance=9,
         )
 
         # 4. Continue conversation
-        self.recall.insert("assistant", "Nice to meet you, Alex! I'd love to help with your Python projects.")
+        self.recall.insert(
+            "assistant",
+            "Nice to meet you, Alex! I'd love to help with your Python projects.",
+        )
         self.recall.insert("user", "Can you help me with machine learning?")
         self.recall.insert("assistant", "Of course! What ML topic interests you?")
 
@@ -673,17 +695,20 @@ class TestBackpressureAndShutdown(unittest.TestCase):
 
     def tearDown(self):
         import shutil
+
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_backpressure_skips_when_full(self):
         """When pending futures >= _MAX_PENDING_EMBEDDINGS, new deferred embeddings are skipped."""
         import threading
+
         recall = RecallMemory(db_path=self.db_path, use_semantic=True)
         original_max = recall._MAX_PENDING_EMBEDDINGS
         recall._MAX_PENDING_EMBEDDINGS = 2
 
         # Fill the queue with blocking futures
         block_event = threading.Event()
+
         def blocking_task():
             block_event.wait(timeout=10)
 
@@ -709,7 +734,9 @@ class TestBackpressureAndShutdown(unittest.TestCase):
         recall = RecallMemory(db_path=self.db_path, use_semantic=True)
 
         for i in range(5):
-            recall.insert("user", f"Test message {i} for shutdown test", defer_embedding=True)
+            recall.insert(
+                "user", f"Test message {i} for shutdown test", defer_embedding=True
+            )
 
         # Shutdown should complete without error or hang
         recall.shutdown(timeout=10)

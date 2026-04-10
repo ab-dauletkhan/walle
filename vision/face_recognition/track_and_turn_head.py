@@ -24,7 +24,6 @@ from .common import (
     resolve_data_dir,
 )
 
-
 DEFAULT_CAMERA_WIDTH = 640
 DEFAULT_CAMERA_HEIGHT = 480
 DEFAULT_CAMERA_FPS = 30
@@ -94,7 +93,10 @@ class HeadController:
         now = time.monotonic()
 
         if not force:
-            if self.last_sent_tick is not None and abs(tick - self.last_sent_tick) < MIN_SEND_DELTA:
+            if (
+                self.last_sent_tick is not None
+                and abs(tick - self.last_sent_tick) < MIN_SEND_DELTA
+            ):
                 return False
             if now - self.last_send_time < SEND_INTERVAL_SEC:
                 return False
@@ -131,7 +133,9 @@ class HeadController:
         if self.smoothed_x is None:
             self.smoothed_x = filtered_x
         else:
-            self.smoothed_x = (1.0 - SMOOTH_ALPHA) * self.smoothed_x + SMOOTH_ALPHA * filtered_x
+            self.smoothed_x = (
+                1.0 - SMOOTH_ALPHA
+            ) * self.smoothed_x + SMOOTH_ALPHA * filtered_x
 
         raw_error_px = self.smoothed_x - frame_center_x
         effective_error_px = raw_error_px
@@ -162,14 +166,18 @@ class HeadController:
         right_x = frame_width - edge_margin_px
         mapped_x = min(max(self.smoothed_x, left_x), right_x)
 
-        target_tick = np.interp(mapped_x, [left_x, right_x], [HEAD_LEFT_TICK, HEAD_RIGHT_TICK])
+        target_tick = np.interp(
+            mapped_x, [left_x, right_x], [HEAD_LEFT_TICK, HEAD_RIGHT_TICK]
+        )
 
         if desired_dir == 0:
             target_tick = self.current_tick
 
         target_tick = self.clamp_tick(target_tick)
         error_ratio = abs(effective_error_px) / max(1.0, frame_center_x)
-        dynamic_max_step = min(MAX_STEP_BASE + int(error_ratio * MAX_STEP_EXTRA), MAX_STEP_CAP)
+        dynamic_max_step = min(
+            MAX_STEP_BASE + int(error_ratio * MAX_STEP_EXTRA), MAX_STEP_CAP
+        )
 
         if desired_dir == 0:
             dynamic_max_step = 0
@@ -204,9 +212,13 @@ class HeadController:
         self.reset_tracking_state()
 
         if self.current_tick < HEAD_OPTICAL_CENTER_TICK:
-            new_tick = min(self.current_tick + RETURN_TO_CENTER_STEP, HEAD_OPTICAL_CENTER_TICK)
+            new_tick = min(
+                self.current_tick + RETURN_TO_CENTER_STEP, HEAD_OPTICAL_CENTER_TICK
+            )
         elif self.current_tick > HEAD_OPTICAL_CENTER_TICK:
-            new_tick = max(self.current_tick - RETURN_TO_CENTER_STEP, HEAD_OPTICAL_CENTER_TICK)
+            new_tick = max(
+                self.current_tick - RETURN_TO_CENTER_STEP, HEAD_OPTICAL_CENTER_TICK
+            )
         else:
             new_tick = self.current_tick
 
@@ -229,7 +241,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Track the strongest face and turn the robot head toward it."
     )
-    parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index.")
+    parser.add_argument(
+        "--camera-index", type=int, default=0, help="OpenCV camera index."
+    )
     parser.add_argument(
         "--edge-tpu",
         action=argparse.BooleanOptionalAction,
@@ -247,7 +261,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-height", type=int, default=DEFAULT_CAMERA_HEIGHT)
     parser.add_argument("--fps", type=int, default=DEFAULT_CAMERA_FPS)
     parser.add_argument("--detection-threshold", type=float, default=0.5)
-    parser.add_argument("--recognition-threshold", type=float, default=FACE_SCORE_THRESHOLD)
+    parser.add_argument(
+        "--recognition-threshold", type=float, default=FACE_SCORE_THRESHOLD
+    )
     parser.add_argument("--match-threshold", type=float, default=0.5)
     return parser
 
@@ -300,7 +316,9 @@ def run(args: argparse.Namespace) -> None:
             frame_height, frame_width = frame.shape[:2]
             frame_center_x = frame_width / 2.0
             image_rgb = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            detection_image = image_rgb.convert("RGB").resize((input_width, input_height), Image.LANCZOS)
+            detection_image = image_rgb.convert("RGB").resize(
+                (input_width, input_height), Image.LANCZOS
+            )
 
             start_time = time.monotonic()
             detections = detect_faces(
@@ -313,8 +331,22 @@ def run(args: argparse.Namespace) -> None:
             elapsed_ms = (time.monotonic() - start_time) * 1000
 
             annotate_detections(frame, detections, labels, cv2)
-            cv2.putText(frame, f"{elapsed_ms:.1f}ms", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv2.line(frame, (int(frame_center_x), 0), (int(frame_center_x), frame_height), (255, 255, 0), 2)
+            cv2.putText(
+                frame,
+                f"{elapsed_ms:.1f}ms",
+                (5, 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2,
+            )
+            cv2.line(
+                frame,
+                (int(frame_center_x), 0),
+                (int(frame_center_x), frame_height),
+                (255, 255, 0),
+                2,
+            )
 
             detection = best_detection(detections)
             if detection is not None and detection.score > args.recognition_threshold:
@@ -322,9 +354,23 @@ def run(args: argparse.Namespace) -> None:
                 face_center_y = (detection.ymin + detection.ymax) / 2.0
                 debug = head.update_from_face_x(face_center_x, frame_width)
 
-                cv2.circle(frame, (int(face_center_x), int(face_center_y)), 5, (0, 255, 0), -1)
-                cv2.circle(frame, (int(debug["filtered_x"]), int(face_center_y)), 5, (255, 0, 255), -1)
-                cv2.circle(frame, (int(debug["smoothed_x"]), int(face_center_y)), 5, (0, 165, 255), -1)
+                cv2.circle(
+                    frame, (int(face_center_x), int(face_center_y)), 5, (0, 255, 0), -1
+                )
+                cv2.circle(
+                    frame,
+                    (int(debug["filtered_x"]), int(face_center_y)),
+                    5,
+                    (255, 0, 255),
+                    -1,
+                )
+                cv2.circle(
+                    frame,
+                    (int(debug["smoothed_x"]), int(face_center_y)),
+                    5,
+                    (0, 165, 255),
+                    -1,
+                )
                 cv2.putText(
                     frame,
                     f"raw_err={debug['raw_error_px']:.1f} eff_err={debug['effective_error_px']:.1f}",
@@ -353,7 +399,9 @@ def run(args: argparse.Namespace) -> None:
                         people_embeddings,
                         args.match_threshold,
                     )
-                    print(f"person on pic: {match.name or 'Unknown'} ({match.confidence:.2f})")
+                    print(
+                        f"person on pic: {match.name or 'Unknown'} ({match.confidence:.2f})"
+                    )
             else:
                 debug = head.on_target_lost()
                 if debug["returning"]:

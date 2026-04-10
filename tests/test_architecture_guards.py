@@ -3,11 +3,12 @@
 import types
 
 import pytest
-
 from walle.memory.context_manager import ContextManager, VisualContext
 from walle.memory.vector_index import FAISSManager
 from walle.tools.registry import (
-    ToolSuiteFacade, ToolRegistry, CommunicationToolProvider, SchemaExecutorToolProvider,
+    SchemaExecutorToolProvider,
+    ToolRegistry,
+    ToolSuiteFacade,
 )
 from walle.vision.service import VisionService
 
@@ -83,15 +84,19 @@ def test_faiss_manager_index_id_snapshot_is_stable_copy():
 
 
 def test_tool_suite_facade_dispatches_via_registry():
-    from walle.tools.robot.executor import get_robot_control_tools
     from walle.tools.knowledge import get_knowledge_tools
+    from walle.tools.robot.executor import get_robot_control_tools
 
     robot = FakeExecutor({"drive_forward": "Driving"})
     knowledge = FakeExecutor({"consult_internet_for_facts": "facts"})
 
     registry = ToolRegistry()
     registry.register(SchemaExecutorToolProvider(get_robot_control_tools, robot))
-    registry.register(SchemaExecutorToolProvider(get_knowledge_tools, knowledge, request_heartbeat_after=True))
+    registry.register(
+        SchemaExecutorToolProvider(
+            get_knowledge_tools, knowledge, request_heartbeat_after=True
+        )
+    )
     facade = ToolSuiteFacade(registry)
 
     result = facade.execute_tool(

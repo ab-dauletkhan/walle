@@ -4,40 +4,45 @@ Handles multi-modal inputs: vision, sensors, environment
 Integrates with memory system to provide rich context to LLM
 """
 
-from typing import Dict, List, Optional, Any
 import copy
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
-import threading
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
 class VisualContext:
     """Context from vision systems"""
-    faces_detected: List[Dict] = field(default_factory=list)  # [{name, confidence, location}]
-    objects_detected: List[Dict] = field(default_factory=list)  # [{object, confidence, location}]
+
+    faces_detected: List[Dict] = field(
+        default_factory=list
+    )  # [{name, confidence, location}]
+    objects_detected: List[Dict] = field(
+        default_factory=list
+    )  # [{object, confidence, location}]
     scene_description: str = ""
     timestamp: datetime = field(default_factory=datetime.now)
-    
+
     def to_natural_language(self) -> str:
         """Convert visual context to natural language for LLM"""
         if not self.faces_detected and not self.objects_detected:
             return ""
-        
+
         parts = []
-        
+
         if self.faces_detected:
             if len(self.faces_detected) == 1:
                 face = self.faces_detected[0]
-                if face.get('name') and face.get('name') != "Unknown":
+                if face.get("name") and face.get("name") != "Unknown":
                     parts.append(f"I can see {face['name']}")
                 else:
                     parts.append("I can see a person")
             else:
                 known_faces = [
-                    f['name']
+                    f["name"]
                     for f in self.faces_detected
-                    if f.get('name') and f.get('name') != "Unknown"
+                    if f.get("name") and f.get("name") != "Unknown"
                 ]
                 unknown_faces = len(self.faces_detected) - len(known_faces)
                 if known_faces:
@@ -46,69 +51,73 @@ class VisualContext:
                     parts.append(f"I can see {unknown_faces} people")
                 if known_faces and unknown_faces:
                     parts.append(f"and {unknown_faces} other people")
-        
+
         if self.objects_detected:
-            interesting_objects = [obj['object'] for obj in self.objects_detected[:5]]  # Top 5
+            interesting_objects = [
+                obj["object"] for obj in self.objects_detected[:5]
+            ]  # Top 5
             if interesting_objects:
                 parts.append(f"I notice {', '.join(interesting_objects)}")
-        
+
         if self.scene_description:
             parts.append(f"Scene: {self.scene_description}")
-        
+
         return ". ".join(parts) + "." if parts else ""
 
 
 @dataclass
 class EnvironmentContext:
     """Context about the environment"""
+
     location: Optional[str] = None
     lighting: Optional[str] = None  # "bright", "dim", "dark"
     temperature: Optional[float] = None  # celsius
     battery_level: Optional[int] = None  # 0-100
     obstacles_nearby: bool = False
     timestamp: datetime = field(default_factory=datetime.now)
-    
+
     def to_natural_language(self) -> str:
         """Convert environment context to natural language"""
         parts = []
-        
+
         if self.location:
             parts.append(f"I'm in {self.location}")
-        
+
         if self.battery_level is not None:
             if self.battery_level < 20:
                 parts.append(f"⚠️ My battery is low ({self.battery_level}%)")
             elif self.battery_level < 50:
                 parts.append(f"My battery is at {self.battery_level}%")
-        
+
         if self.lighting:
             if self.lighting == "dark":
                 parts.append("It's quite dark here")
             elif self.lighting == "dim":
                 parts.append("The lighting is dim")
-        
+
         if self.obstacles_nearby:
             parts.append("⚠️ I detect obstacles nearby")
-        
+
         return ". ".join(parts) + "." if parts else ""
 
 
 @dataclass
 class InteractionContext:
     """Context about current interaction"""
+
     user_name: Optional[str] = None
     user_mood: Optional[str] = None  # Detected from tone/expression
     conversation_start: datetime = field(default_factory=datetime.now)
     last_interaction: Optional[datetime] = None
     interaction_count: int = 0
-    
+
     def to_natural_language(self) -> str:
         """Convert interaction context to natural language"""
         parts = []
-        
+
         if self.user_name:
             parts.append(f"Speaking with {self.user_name}")
-        
+
         if self.last_interaction:
             time_since = datetime.now() - self.last_interaction
             if time_since.total_seconds() < 3600:  # Less than an hour
@@ -121,16 +130,17 @@ class InteractionContext:
                 parts.append("We last spoke yesterday")
             else:
                 parts.append(f"We last spoke {time_since.days} days ago")
-        
+
         if self.user_mood:
             parts.append(f"User seems {self.user_mood}")
-        
+
         return ". ".join(parts) + "." if parts else ""
 
 
 @dataclass
 class RobotContext:
     """Current physical state of the robot."""
+
     motors_active: bool = False
     last_command: str = ""
     last_result: str = ""
@@ -178,20 +188,22 @@ class ContextManager:
         with self._lock:
             self.interaction = interaction_context
 
-    def update_robot(self, command: str = "", result: str = "", motors_active: bool = False):
+    def update_robot(
+        self, command: str = "", result: str = "", motors_active: bool = False
+    ):
         """Update robot physical state (thread-safe)."""
         with self._lock:
             if command:
                 self.robot.last_command = command
                 self.robot.last_result = result
             self.robot.motors_active = motors_active
-    
+
     def _generate_observations(self):
         """Generate spontaneous observations based on context changes"""
         # This is where curiosity-driven observations would be generated
         # Based on changes in visual or environmental context
         pass
-    
+
     def get_context_string(self) -> str:
         """
         Get complete context as natural language string (thread-safe).
@@ -207,12 +219,12 @@ class ContextManager:
             visual_str = self.visual.to_natural_language()
             if visual_str:
                 parts.append(f"Vision: {visual_str}")
-        
+
         if self.environment:
             env_str = self.environment.to_natural_language()
             if env_str:
                 parts.append(f"Environment: {env_str}")
-        
+
         if self.interaction:
             interaction_str = self.interaction.to_natural_language()
             if interaction_str:
@@ -224,9 +236,9 @@ class ContextManager:
 
         if len(parts) == 1:  # Only header
             return ""
-        
+
         return "\n".join(parts) + "\n"
-    
+
     def get_observations(self) -> List[str]:
         """Get list of observations for personality system"""
         with self._lock:
@@ -237,40 +249,47 @@ class ContextManager:
                     observations.append(f"I see a {obj['object']}")
 
             if self.environment:
-                if self.environment.battery_level and self.environment.battery_level < 30:
+                if (
+                    self.environment.battery_level
+                    and self.environment.battery_level < 30
+                ):
                     observations.append("My battery is getting low")
                 if self.environment.obstacles_nearby:
                     observations.append("There are obstacles around me")
 
             return observations
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize context for storage"""
         with self._lock:
             return {
-                'visual': copy.deepcopy(self.visual.__dict__) if self.visual else None,
-                'environment': copy.deepcopy(self.environment.__dict__) if self.environment else None,
-                'interaction': copy.deepcopy(self.interaction.__dict__) if self.interaction else None,
-                'observations': list(self.spontaneous_observations),
+                "visual": copy.deepcopy(self.visual.__dict__) if self.visual else None,
+                "environment": copy.deepcopy(self.environment.__dict__)
+                if self.environment
+                else None,
+                "interaction": copy.deepcopy(self.interaction.__dict__)
+                if self.interaction
+                else None,
+                "observations": list(self.spontaneous_observations),
             }
 
 
 # Sensor simulation helpers (for testing without actual hardware)
 class SensorSimulator:
     """Simulates sensor inputs for testing"""
-    
+
     @staticmethod
     def simulate_visual_context() -> VisualContext:
         """Simulate visual input"""
         return VisualContext(
             faces_detected=[],
             objects_detected=[
-                {'object': 'chair', 'confidence': 0.95, 'location': 'center'},
-                {'object': 'table', 'confidence': 0.87, 'location': 'left'}
+                {"object": "chair", "confidence": 0.95, "location": "center"},
+                {"object": "table", "confidence": 0.87, "location": "left"},
             ],
-            scene_description="indoor room with furniture"
+            scene_description="indoor room with furniture",
         )
-    
+
     @staticmethod
     def simulate_environment_context(battery: int = 75) -> EnvironmentContext:
         """Simulate environment sensors"""
@@ -279,14 +298,12 @@ class SensorSimulator:
             lighting="bright",
             temperature=22.5,
             battery_level=battery,
-            obstacles_nearby=False
+            obstacles_nearby=False,
         )
-    
+
     @staticmethod
     def simulate_interaction_context(user_name: str = None) -> InteractionContext:
         """Simulate interaction context"""
         return InteractionContext(
-            user_name=user_name,
-            user_mood=None,
-            interaction_count=0
+            user_name=user_name, user_mood=None, interaction_count=0
         )

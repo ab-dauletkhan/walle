@@ -37,13 +37,21 @@ def get_embedding_model():
             return _embedding_model
 
         try:
-            from sentence_transformers import SentenceTransformer
             import torch
+            from sentence_transformers import SentenceTransformer
 
-            _embedding_device = conf.EMBEDDING_DEVICE if torch.cuda.is_available() else "cpu"
+            _embedding_device = (
+                conf.EMBEDDING_DEVICE if torch.cuda.is_available() else "cpu"
+            )
 
-            _log.info("Loading embedding model: %s on %s...", conf.EMBEDDING_MODEL, _embedding_device)
-            _embedding_model = SentenceTransformer(conf.EMBEDDING_MODEL, device=_embedding_device)
+            _log.info(
+                "Loading embedding model: %s on %s...",
+                conf.EMBEDDING_MODEL,
+                _embedding_device,
+            )
+            _embedding_model = SentenceTransformer(
+                conf.EMBEDDING_MODEL, device=_embedding_device
+            )
 
             if _embedding_device == "cuda":
                 _embedding_model.half()

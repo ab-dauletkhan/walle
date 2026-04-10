@@ -8,10 +8,10 @@ The interface mirrors how Ollama/OpenAI streaming works:
 To switch to real Ollama, replace MockLLMClient with OllamaLLMClient.
 """
 
+import random
+import time
 from abc import ABC, abstractmethod
 from typing import Iterator
-import time
-import random
 
 
 class LLMClient(ABC):
