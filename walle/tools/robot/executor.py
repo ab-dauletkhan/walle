@@ -63,7 +63,10 @@ class RobotControlExecutor(BaseToolExecutor, RobotRuntime):
             self.simulation = True
 
     def execute(self, fn_name: str, args: dict) -> str:
-        return self._registry.execute(self, fn_name, args)
+        _log.info("tool=%s args=%s", fn_name, args)
+        result = self._registry.execute(self, fn_name, args)
+        _log.info("result=%s", result)
+        return result
 
     def send_command(self, cmd: str) -> str:
         if self._serial_manager is not None:
@@ -94,6 +97,16 @@ class RobotControlExecutor(BaseToolExecutor, RobotRuntime):
 
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)
+
+    def heartbeat(self) -> str | None:
+        if self._serial_manager is not None:
+            return self._serial_manager.heartbeat()
+        if self.simulation:
+            return "STATUS 248,560,140,475,270,250,290 M0,0 (simulated)"
+        return None
+
+    def set_idle_mode(self, enabled: bool) -> None:
+        self.send_command("M1" if enabled else "M0")
 
     def close(self):
         if self._serial_manager is not None:

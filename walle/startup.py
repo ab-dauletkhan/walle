@@ -115,6 +115,8 @@ def build_app(args) -> tuple:
         archival_mem=archival_mem,
         heartbeat=heartbeat,
         context_manager=context_manager,
+        on_turn_start=lambda: robot_exec.set_idle_mode(False),
+        on_turn_end=lambda: robot_exec.set_idle_mode(True),
     )
 
     # -- Register shutdown hooks --

@@ -128,17 +128,37 @@ class InteractionContext:
         return ". ".join(parts) + "." if parts else ""
 
 
+@dataclass
+class RobotContext:
+    """Current physical state of the robot."""
+    motors_active: bool = False
+    last_command: str = ""
+    last_result: str = ""
+    idle_mode: bool = False
+
+    def to_natural_language(self) -> str:
+        parts = []
+        if self.motors_active:
+            parts.append("Motors are currently running")
+        if self.last_command:
+            parts.append(f"Last action: {self.last_command} -> {self.last_result}")
+        if self.idle_mode:
+            parts.append("I'm in idle mode (autonomous animations)")
+        return ". ".join(parts) + "." if parts else ""
+
+
 class ContextManager:
     """
     Manages all contextual information for WALL-E
     Combines sensor data, environment, and interaction history
     """
-    
+
     def __init__(self):
         self._lock = threading.RLock()
         self.visual: Optional[VisualContext] = None
         self.environment: Optional[EnvironmentContext] = None
         self.interaction: Optional[InteractionContext] = None
+        self.robot: RobotContext = RobotContext()
         self.spontaneous_observations: List[str] = []
 
     def update_visual(self, visual_context: VisualContext):
@@ -157,6 +177,14 @@ class ContextManager:
         """Update interaction context (thread-safe)."""
         with self._lock:
             self.interaction = interaction_context
+
+    def update_robot(self, command: str = "", result: str = "", motors_active: bool = False):
+        """Update robot physical state (thread-safe)."""
+        with self._lock:
+            if command:
+                self.robot.last_command = command
+                self.robot.last_result = result
+            self.robot.motors_active = motors_active
     
     def _generate_observations(self):
         """Generate spontaneous observations based on context changes"""
@@ -189,7 +217,11 @@ class ContextManager:
             interaction_str = self.interaction.to_natural_language()
             if interaction_str:
                 parts.append(f"Interaction: {interaction_str}")
-        
+
+        robot_str = self.robot.to_natural_language()
+        if robot_str:
+            parts.append(f"Robot: {robot_str}")
+
         if len(parts) == 1:  # Only header
             return ""
         

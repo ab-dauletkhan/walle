@@ -125,6 +125,16 @@ int turnValue = 0;
 int turnOffset = 0;
 int motorDeadzone = 0;
 
+/// Timed motor stop — set by 'D' command
+// -- -- -- -- -- -- -- -- -- -- -- -- -- --
+unsigned long motorStopTime = 0;
+bool motorStopActive = false;
+
+
+/// Host watchdog — stop motors if no serial activity for 3 seconds
+// -- -- -- -- -- -- -- -- -- -- -- -- -- --
+#define WATCHDOG_TIMEOUT 3000
+unsigned long lastSerialActivity = 0;
 
 /// Runtime Variables
 // -- -- -- -- -- -- -- -- -- -- -- -- -- --
@@ -275,6 +285,8 @@ void readSerial() {
 
 void evaluateSerial() {
 
+	lastSerialActivity = millis();
+
 	// Evaluate integer number in the serial buffer
 	int number = atoi(serialBuffer);
 
@@ -287,6 +299,11 @@ void evaluateSerial() {
 	else if (firstChar == 'Y' && number >= -100 && number <= 100) moveValue = int(number * 2.55);       // Forward/reverse control
 	else if (firstChar == 'S' && number >= -100 && number <= 100) turnOffset = number;                  // Steering offset
 	else if (firstChar == 'O' && number >=    0 && number <= 250) motorDeadzone = int(number);          // Motor deadzone offset
+	else if (firstChar == 'D' && number > 0) {                                                           // Auto-stop after N ms (capped at 5s for safety)
+		unsigned long cap = min((unsigned long)number, 5000UL);
+		motorStopTime = millis() + cap;
+		motorStopActive = true;
+	}
 
 
 	// Animations
@@ -724,6 +741,24 @@ void loop() {
 	// -- -- -- -- -- -- -- -- -- -- -- -- -- --
 	if (Serial.available() > 0){
 		readSerial();
+	}
+
+	// Auto-stop motors when timed duration expires
+	// -- -- -- -- -- -- -- -- -- -- -- -- -- --
+	if (motorStopActive && millis() >= motorStopTime) {
+		moveValue = 0;
+		turnValue = 0;
+		motorStopActive = false;
+		Serial.println(F("OK"));  // signal completion to host
+	}
+
+	// Watchdog — stop motors if host is silent
+	// -- -- -- -- -- -- -- -- -- -- -- -- -- --
+	if ((moveValue != 0 || turnValue != 0) && millis() - lastSerialActivity > WATCHDOG_TIMEOUT) {
+		moveValue = 0;
+		turnValue = 0;
+		motorStopActive = false;
+		Serial.println(F("WATCHDOG"));
 	}
 
 

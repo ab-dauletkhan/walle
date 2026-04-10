@@ -19,6 +19,10 @@ from walle.memory.context_manager import InteractionContext, SensorSimulator
 
 _log = logging.getLogger("walle.chat")
 
+_MOTOR_TOOLS = frozenset({
+    "drive_forward", "drive_backward", "turn_left", "turn_right",
+    "stop_movement", "get_robot_status",
+})
 
 # ---------------------------------------------------------------------------
 # Data types for streaming tool calls
@@ -137,6 +141,8 @@ class ChatLoop:
         archival_mem,
         heartbeat,
         context_manager,
+        on_turn_start=None,
+        on_turn_end=None,
     ):
         self._llm = llm_streamer
         self._tool_suite = tool_suite
@@ -148,6 +154,8 @@ class ChatLoop:
         self._archival_mem = archival_mem
         self._heartbeat = heartbeat
         self._context_manager = context_manager
+        self._on_turn_start = on_turn_start
+        self._on_turn_end = on_turn_end
         self._compression_lock = threading.Lock()
 
     @property
@@ -156,6 +164,9 @@ class ChatLoop:
 
     def run(self, user_input: str) -> Optional[str]:
         """Run one full MemGPT-style chat turn. Returns the message for the user."""
+        if self._on_turn_start:
+            self._on_turn_start()
+
         # Drop any stale message from a prior interrupted turn
         self._comm_exec.get_last_message()
 
@@ -184,14 +195,23 @@ class ChatLoop:
         self._start_compression_if_needed()
 
         # 5. Tool execution loop
-        return self._tool_loop(memory_context)
+        result = self._tool_loop(memory_context)
+
+        if self._on_turn_end:
+            self._on_turn_end()
+
+        return result
+
+    _MAX_ITERATIONS = 20
+    _MAX_STALE = 3
 
     def _tool_loop(self, memory_context: str) -> Optional[str]:
-        """Inner loop: stream LLM → execute tools → repeat until send_message."""
+        """Inner loop: call LLM → execute tools → repeat until send_message."""
         iteration = 0
+        stale_count = 0
         user_received_message = False
 
-        while iteration < 10:
+        while iteration < self._MAX_ITERATIONS:
             iteration += 1
             tools = self._tool_suite.build_schemas()
             system_prompt = self._prompt_builder.build(memory_context)
@@ -204,7 +224,11 @@ class ChatLoop:
                 if content:
                     self._session.add("assistant", content)
                     if not user_received_message:
-                        _log.debug("No send_message called, prompting...")
+                        stale_count += 1
+                        if stale_count >= self._MAX_STALE:
+                            _log.debug("Stale after %d attempts without send_message", stale_count)
+                            break
+                        _log.debug("No send_message called, prompting... (%d/%d)", stale_count, self._MAX_STALE)
                         continue
                 break
 
@@ -225,6 +249,7 @@ class ChatLoop:
                 continue
 
             self._session.add("assistant", content or "", tool_calls)
+            stale_count = 0
             hb_req = False
 
             for tc, args in parsed_calls:
@@ -238,6 +263,14 @@ class ChatLoop:
                     _log.debug("send_message: %s", execution.user_message[:80])
                     self._recall_mem.insert("assistant", execution.user_message)
                     user_received_message = True
+
+                # Update robot context for movement tools
+                if tc.function.name in _MOTOR_TOOLS:
+                    self._context_manager.update_robot(
+                        command=tc.function.name,
+                        result=execution.tool_result,
+                        motors_active="continuous" in execution.tool_result,
+                    )
 
                 hb_req = hb_req or execution.heartbeat_requested
                 self._session.add_tool_result(tc.id, tc.function.name, execution.tool_result)
