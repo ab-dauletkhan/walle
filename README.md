@@ -21,6 +21,7 @@
 8. [Startup & Shutdown Sequences](#8-startup--shutdown-sequences)
 9. [Dependencies](#9-dependencies)
 10. [Resource Budget (8 GB Jetson)](#10-resource-budget-8-gb-jetson)
+11. [CI/CD](#11-cicd)
 
 ---
 
@@ -732,3 +733,51 @@ Jetson/Linux host before `--edge-tpu` commands can run.
 - Memory compression (keeps recall under 40 messages)
 - Embedding queue backpressure (max 50 pending, prevents OOM)
 - Conversation history capped at 20 messages (voice mode)
+
+---
+
+## 11. CI/CD
+
+GitHub Actions workflows live in `.github/workflows`.
+
+### 11.1 CI
+
+`ci.yml` runs automatically on pull requests and pushes to `master` or
+`cleanup`.
+
+It checks:
+
+```
+uv sync --extra dev --extra vision-coral --frozen
+uv run ruff check .
+uv run ruff format --check walle vision tests legacy
+uv run ty check --output-format concise
+uv run python -m compileall -q walle vision tests legacy
+uv run pytest tests/test_integration_imports.py tests/test_architecture_guards.py -q
+```
+
+It also smoke-tests the face-recognition CLI `--help` commands.
+
+### 11.2 Jetson Deploy
+
+`deploy-jetson.yml` is manual. It SSHes into an existing Jetson clone, pulls the
+selected branch, runs `uv sync --extra jetson --frozen`, and can optionally
+restart a systemd service.
+
+Required repository secret:
+
+```
+JETSON_SSH_KEY
+```
+
+Manual workflow inputs:
+
+| Input | Meaning |
+|-------|---------|
+| `host` | Jetson hostname or IP address |
+| `user` | SSH user |
+| `ssh_port` | SSH port |
+| `app_dir` | Existing repo path on the Jetson |
+| `branch` | Branch to deploy |
+| `restart_service` | Whether to restart systemd |
+| `service_name` | systemd service name |
