@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Python checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Sync dependencies
+        run: uv sync --extra dev --extra vision-coral --frozen
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff format
+        run: uv run ruff format --check walle vision tests legacy
+
+      - name: ty type check
+        run: uv run ty check --output-format concise
+
+      - name: Compile Python modules
+        run: uv run python -m compileall -q walle vision tests legacy
+
+      - name: Run focused tests
+        run: uv run pytest tests/test_integration_imports.py tests/test_architecture_guards.py -q
+
+      - name: Smoke test face CLI entry points
+        run: |
+          uv run walle-face-scan --help
+          uv run walle-face-embeddings --help
+          uv run walle-face-recognize --help
+          uv run walle-face-track-head --help

@@ -3,15 +3,17 @@ WALL-E Serial Manager
 Thread-safe shared serial connection to Arduino.
 Used by both the LLM tool pipeline (RobotControlExecutor) and the web API bridge.
 """
+
 import logging
-import time
 import threading
+import time
 from typing import Optional
 
 _log = logging.getLogger("walle.serial")
 
 try:
     import serial
+
     SERIAL_AVAILABLE = True
 except ImportError:
     SERIAL_AVAILABLE = False
@@ -100,7 +102,11 @@ class SerialManager:
                     old_timeout = self._conn.timeout
                     self._conn.timeout = min(remaining, 0.5)
                     try:
-                        line = self._conn.readline().decode("utf-8", errors="ignore").strip()
+                        line = (
+                            self._conn.readline()
+                            .decode("utf-8", errors="ignore")
+                            .strip()
+                        )
                     finally:
                         self._conn.timeout = old_timeout
                     if line == "OK":
@@ -147,7 +153,11 @@ class SerialManager:
                     old_timeout = self._conn.timeout
                     self._conn.timeout = min(remaining, 0.5)
                     try:
-                        line = self._conn.readline().decode("utf-8", errors="ignore").strip()
+                        line = (
+                            self._conn.readline()
+                            .decode("utf-8", errors="ignore")
+                            .strip()
+                        )
                     finally:
                         self._conn.timeout = old_timeout
                     if line.startswith("STATUS"):

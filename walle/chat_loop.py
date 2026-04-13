@@ -7,8 +7,8 @@ from object construction and lifecycle management.
 
 import json
 import logging
-import time
 import threading
+import time
 from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -19,10 +19,17 @@ from walle.memory.context_manager import InteractionContext, SensorSimulator
 
 _log = logging.getLogger("walle.chat")
 
-_MOTOR_TOOLS = frozenset({
-    "drive_forward", "drive_backward", "turn_left", "turn_right",
-    "stop_movement", "get_robot_status",
-})
+_MOTOR_TOOLS = frozenset(
+    {
+        "drive_forward",
+        "drive_backward",
+        "turn_left",
+        "turn_right",
+        "stop_movement",
+        "get_robot_status",
+    }
+)
+
 
 # ---------------------------------------------------------------------------
 # Data types for streaming tool calls
@@ -54,7 +61,9 @@ class ChatSession:
         self.history.append(msg)
 
     def add_tool_result(self, tool_id, name, content):
-        self.history.append({"role": "tool", "tool_call_id": tool_id, "name": name, "content": content})
+        self.history.append(
+            {"role": "tool", "tool_call_id": tool_id, "name": name, "content": content}
+        )
 
     def get_messages(self, system_prompt: str):
         return [{"role": "system", "content": system_prompt}] + list(self.history)
@@ -90,29 +99,38 @@ class LLMStreamer:
                 tool_calls_list = []
                 if choice.message.tool_calls:
                     for tc in choice.message.tool_calls:
-                        tool_calls_list.append(ToolCallEnvelope(
-                            id=tc.id,
-                            function=ToolFunctionCall(
-                                name=tc.function.name,
-                                arguments=tc.function.arguments or "{}",
-                            ),
-                        ))
+                        tool_calls_list.append(
+                            ToolCallEnvelope(
+                                id=tc.id,
+                                function=ToolFunctionCall(
+                                    name=tc.function.name,
+                                    arguments=tc.function.arguments or "{}",
+                                ),
+                            )
+                        )
 
                 return content, tool_calls_list
 
             except Exception as e:
-                _log.warning("LLM error (attempt %d/%d): %s", attempt + 1, max_retries, e)
+                _log.warning(
+                    "LLM error (attempt %d/%d): %s", attempt + 1, max_retries, e
+                )
                 time.sleep(1)
 
         _log.error("Failed to generate LLM response after %d retries", max_retries)
-        return "I'm having trouble reaching my brain right now. Please check that Ollama is running.", []
+        return (
+            "I'm having trouble reaching my brain right now. Please check that Ollama is running.",
+            [],
+        )
 
     def summarize(self, text: str) -> str:
         """Generate a concise summary for memory compression."""
         try:
             resp = self._client.chat.completions.create(
                 model=self._model,
-                messages=[{"role": "user", "content": f"Summarize this concisely:\n{text}"}],
+                messages=[
+                    {"role": "user", "content": f"Summarize this concisely:\n{text}"}
+                ],
                 max_tokens=200,
             )
             return resp.choices[0].message.content
@@ -172,10 +190,12 @@ class ChatLoop:
 
         # 1. Context update
         interaction_count = self._recall_mem.get_count()
-        self._context_manager.update_interaction(InteractionContext(
-            last_interaction=datetime.now(),
-            interaction_count=interaction_count,
-        ))
+        self._context_manager.update_interaction(
+            InteractionContext(
+                last_interaction=datetime.now(),
+                interaction_count=interaction_count,
+            )
+        )
         if interaction_count % 5 == 0:
             self._context_manager.update_environment(
                 SensorSimulator.simulate_environment_context(
@@ -226,9 +246,16 @@ class ChatLoop:
                     if not user_received_message:
                         stale_count += 1
                         if stale_count >= self._MAX_STALE:
-                            _log.debug("Stale after %d attempts without send_message", stale_count)
+                            _log.debug(
+                                "Stale after %d attempts without send_message",
+                                stale_count,
+                            )
                             break
-                        _log.debug("No send_message called, prompting... (%d/%d)", stale_count, self._MAX_STALE)
+                        _log.debug(
+                            "No send_message called, prompting... (%d/%d)",
+                            stale_count,
+                            self._MAX_STALE,
+                        )
                         continue
                 break
 
@@ -273,7 +300,9 @@ class ChatLoop:
                     )
 
                 hb_req = hb_req or execution.heartbeat_requested
-                self._session.add_tool_result(tc.id, tc.function.name, execution.tool_result)
+                self._session.add_tool_result(
+                    tc.id, tc.function.name, execution.tool_result
+                )
 
             if user_received_message:
                 break

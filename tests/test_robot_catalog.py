@@ -63,7 +63,9 @@ class TestRobotToolRegistry(unittest.TestCase):
 
         self.assertEqual(self.runtime.commands[0], "L40")
         self.assertTrue(all(not cmd.startswith("B") for cmd in self.runtime.commands))
-        self.assertTrue(all(cmd.startswith(("L", "R")) for cmd in self.runtime.commands))
+        self.assertTrue(
+            all(cmd.startswith(("L", "R")) for cmd in self.runtime.commands)
+        )
         self.assertEqual(result, "Waved hello")
 
     def test_reset_to_neutral_uses_firmware_animation(self):

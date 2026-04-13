@@ -1,9 +1,7 @@
-import json
 import logging
-import re
 
-from walle.tools.base_executor import BaseToolExecutor
 from walle.memory.config import conf
+from walle.tools.base_executor import BaseToolExecutor
 
 _log = logging.getLogger("walle.knowledge")
 
@@ -11,6 +9,7 @@ try:
     from duckduckgo_search import DDGS
 except ImportError:
     DDGS = None
+
 
 def get_knowledge_tools():
     return [
@@ -24,14 +23,15 @@ def get_knowledge_tools():
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Search query. Use 'current' keyword for living people."
+                            "description": "Search query. Use 'current' keyword for living people.",
                         }
                     },
-                    "required": ["query"]
-                }
-            }
+                    "required": ["query"],
+                },
+            },
         }
     ]
+
 
 class KnowledgeToolExecutor(BaseToolExecutor):
     """Executor for knowledge/search tools."""
@@ -44,47 +44,73 @@ class KnowledgeToolExecutor(BaseToolExecutor):
         """
         Reliably filters out non-English results without blocking short facts.
         """
-        text = (result.get('title', '') + ' ' + result.get('body', '')).lower()
-        if not text: return False
+        text = (result.get("title", "") + " " + result.get("body", "")).lower()
+        if not text:
+            return False
 
         # 1. CJK (Asian) Character Density Check
         # This catches Chinese/Japanese/Korean results immediately
-        cjk_chars = sum(1 for char in text if '\u4e00' <= char <= '\u9fff' or 
-                       '\u3040' <= char <= '\u309f' or 
-                       '\uac00' <= char <= '\ud7af')
+        cjk_chars = sum(
+            1
+            for char in text
+            if "\u4e00" <= char <= "\u9fff"
+            or "\u3040" <= char <= "\u309f"
+            or "\uac00" <= char <= "\ud7af"
+        )
         if len(text) > 0 and (cjk_chars / len(text)) > 0.05:
-            return False 
+            return False
 
         # 2. Cyrillic (Russian/Kazakh) Character Check
         # If you are in Kazakhstan, DuckDuckGo sends Russian results even with "english" keyword.
-        cyrillic_chars = sum(1 for char in text if '\u0400' <= char <= '\u04FF')
+        cyrillic_chars = sum(1 for char in text if "\u0400" <= char <= "\u04ff")
         if len(text) > 0 and (cyrillic_chars / len(text)) > 0.05:
             return False
 
         # 3. Relaxed English Check
         # Just one common word is enough to confirm it's not gibberish
-        common_words = ['the', 'is', 'and', 'to', 'in', 'of', 'for', 'with', 'president', 'he', 'she']
+        common_words = [
+            "the",
+            "is",
+            "and",
+            "to",
+            "in",
+            "of",
+            "for",
+            "with",
+            "president",
+            "he",
+            "she",
+        ]
         if not any(f" {w} " in text for w in common_words):
-            return False 
-            
+            return False
+
         return True
 
     def _search_web(self, query: str) -> str:
         if DDGS is None:
-            _log.warning("duckduckgo_search not installed. Install with: pip install duckduckgo-search")
+            _log.warning(
+                "duckduckgo_search not installed. Install with: pip install duckduckgo-search"
+            )
             return "❌ SYSTEM: Web search not available. Install duckduckgo-search package."
 
         # Logic: Only append 'english' if the query is long enough to likely return foreign results.
         # Short financial/weather queries usually work better raw.
 
         clean_query = query.replace("2025", "").strip()
-        
+
         # Heuristic: If it's about 'price', 'weather', or 'time', DON'T add 'english'
-        if any(x in clean_query.lower() for x in ['price', 'weather', 'time', 'usd', 'bitcoin']):
+        if any(
+            x in clean_query.lower()
+            for x in ["price", "weather", "time", "usd", "bitcoin"]
+        ):
             search_query = clean_query
         else:
-            search_query = f"{clean_query} english" if "english" not in clean_query.lower() else clean_query
-            
+            search_query = (
+                f"{clean_query} english"
+                if "english" not in clean_query.lower()
+                else clean_query
+            )
+
         _log.debug("Searching: '%s'...", search_query)
 
         best_results = []
@@ -94,33 +120,37 @@ class KnowledgeToolExecutor(BaseToolExecutor):
                 # Multi-Region Fallback
                 for region in conf.SEARCH_REGIONS:
                     try:
-                        raw_results = list(ddgs.text(
-                            search_query, 
-                            region=region, 
-                            safesearch='moderate', 
-                            max_results=8
-                        ))
-                        
+                        raw_results = list(
+                            ddgs.text(
+                                search_query,
+                                region=region,
+                                safesearch="moderate",
+                                max_results=8,
+                            )
+                        )
+
                         valid = [r for r in raw_results if self._is_english_result(r)]
-                        
+
                         if valid:
-                            best_results = valid[:conf.MAX_SEARCH_RESULTS]
-                            break 
-                            
+                            best_results = valid[: conf.MAX_SEARCH_RESULTS]
+                            break
+
                     except Exception as e:
                         _log.debug("Region %s failed: %s", region, e)
                         continue
-            
+
             if not best_results:
                 return "❌ SYSTEM: No relevant English results found."
 
             formatted = f"🔍 SEARCH RESULTS for '{clean_query}':\n"
             for i, res in enumerate(best_results, 1):
                 formatted += f"\n[{i}] {res['title']}\n    Source: {res.get('href', 'N/A')}\n    Summary: {res['body']}\n"
-            
-            formatted += "\n[Use these facts to answer in 1-3 sentences. Cite with [1].]"
+
+            formatted += (
+                "\n[Use these facts to answer in 1-3 sentences. Cite with [1].]"
+            )
             return formatted
-            
+
         except Exception as e:
             _log.debug("Search Error: %s", e)
             return f"Search failed: {str(e)}"

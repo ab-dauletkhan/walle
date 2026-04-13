@@ -1,82 +1,65 @@
-import os
-import re
+from __future__ import annotations
+
+import argparse
+import sys
 import time
 from collections import deque
 
-import cv2
 import numpy as np
-import serial
-from PIL import Image
-from tflite_runtime.interpreter import Interpreter, load_delegate
 
-# Lower resolution usually reduces end-to-end latency.
-# If detection quality becomes too poor, try 960x720 or 1280x960 again.
-CAMERA_WIDTH = 640
-CAMERA_HEIGHT = 480
+from .common import (
+    PEOPLE_LABELS_PATH,
+    FaceRecognitionError,
+    annotate_detections,
+    best_detection,
+    create_detection_interpreter,
+    create_embedding_interpreter,
+    detect_faces,
+    input_size,
+    load_labels,
+    load_people_embeddings,
+    recognize_detection,
+    recommended_live_edge_tpu_modes,
+    require_cv2,
+    require_pil_image,
+    resolve_data_dir,
+)
+from .coral_runtime import reexec_module_with_coral_python, should_delegate_edge_tpu
 
-# =========================
-# Serial / head config
-# =========================
-SERIAL_PORT = "/dev/ttyCH341USB0"  # change if needed
-SERIAL_BAUD = 115200
+DEFAULT_CAMERA_WIDTH = 640
+DEFAULT_CAMERA_HEIGHT = 480
+DEFAULT_CAMERA_FPS = 30
+
+DEFAULT_SERIAL_PORT = "/dev/ttyCH341USB0"
+DEFAULT_SERIAL_BAUD = 115200
 SERIAL_STARTUP_WAIT_SEC = 2.5
 
 HEAD_CHANNEL = 2
-
-# Your calibrated values
 HEAD_RIGHT_TICK = 150
 HEAD_CENTER_TICK = 350
 HEAD_LEFT_TICK = 550
-
 HEAD_MIN_TICK = min(HEAD_RIGHT_TICK, HEAD_LEFT_TICK)
 HEAD_MAX_TICK = max(HEAD_RIGHT_TICK, HEAD_LEFT_TICK)
-
-# Optical center trim if needed
 HEAD_CENTER_TRIM = 0
 HEAD_OPTICAL_CENTER_TICK = HEAD_CENTER_TICK + HEAD_CENTER_TRIM
 
-# If head turns the wrong way, flip to -1
-HEAD_DIRECTION = 1
-
-# =========================
-# Detection threshold
-# =========================
 FACE_SCORE_THRESHOLD = 0.80
-
-# =========================
-# Stabilization / control
-# =========================
-# Use a tiny recent window, not a big average
 MEDIAN_WINDOW = 3
 SMOOTH_ALPHA = 0.45
-
-# Center stability
 DEADBAND_PX = 30
 REVERSE_HYSTERESIS_PX = 15
-
-# PD controller
-KP_TICKS = 90.0
-KD_TICKS_PER_SEC = 14.0
-
-# Serial pacing
 SEND_INTERVAL_SEC = 0.03
 MIN_SEND_DELTA = 1
-
-# Small dynamic steps near center
 MAX_STEP_BASE = 1
 MAX_STEP_EXTRA = 6
 MAX_STEP_CAP = 6
-
-# Lost target behavior
 LOST_TARGET_TIMEOUT_SEC = 1.8
 RETURN_TO_CENTER_STEP = 1
-
-
 EDGE_MARGIN_RATIO = 0.18
 
 
 class HeadController:
-    def __init__(self, port, baud):
+    def __init__(self, port: str, baud: int):
         self.enabled = False
         self.ser = None
 
@@ -86,23 +69,22 @@ class HeadController:
 
         self.recent_face_x = deque(maxlen=MEDIAN_WINDOW)
         self.smoothed_x = None
-
-        self.prev_error_norm = 0.0
-        self.prev_control_time = None
         self.last_target_time = 0.0
-
-        # +1 means last command moved left (tick increased)
-        # -1 means last command moved right (tick decreased)
         self.last_command_dir = 0
 
         try:
+            import serial
+
             self.ser = serial.Serial(port, baud, timeout=1)
             time.sleep(SERIAL_STARTUP_WAIT_SEC)
             self.enabled = True
             print(f"Serial connected: {port} @ {baud}")
             self.send_tick(self.current_tick, force=True)
-        except Exception as e:
-            print(f"WARNING: serial not available: {e}")
+        except ImportError as exc:
+            print(f"WARNING: pyserial is not installed: {exc}")
+            print("Head control disabled; vision still runs.")
+        except Exception as exc:
+            print(f"WARNING: serial not available: {exc}")
             print("Head control disabled; vision still runs.")
 
     def clamp_tick(self, tick):
@@ -141,19 +123,15 @@ class HeadController:
     def reset_tracking_state(self):
         self.recent_face_x.clear()
         self.smoothed_x = None
-        self.prev_error_norm = 0.0
-        self.prev_control_time = None
         self.last_command_dir = 0
 
     def update_from_face_x(self, face_center_x, frame_width):
         now = time.monotonic()
         frame_center_x = frame_width / 2.0
 
-        # Median-of-3 to reject jitter spikes
         self.recent_face_x.append(face_center_x)
         filtered_x = float(np.median(self.recent_face_x))
 
-        # Small EMA on top
         if self.smoothed_x is None:
             self.smoothed_x = filtered_x
         else:
@@ -164,16 +142,12 @@ class HeadController:
         raw_error_px = self.smoothed_x - frame_center_x
         effective_error_px = raw_error_px
 
-        # Desired direction:
-        # face left  -> tick should increase -> +1
-        # face right -> tick should decrease -> -1
         desired_dir = 0
         if raw_error_px < -DEADBAND_PX:
             desired_dir = +1
         elif raw_error_px > DEADBAND_PX:
             desired_dir = -1
 
-        # Reverse hysteresis: do not instantly flip around the center
         if (
             self.last_command_dir != 0
             and desired_dir != 0
@@ -183,46 +157,34 @@ class HeadController:
             desired_dir = 0
             effective_error_px = 0.0
 
-        # Standard deadband
         if abs(raw_error_px) < DEADBAND_PX:
             desired_dir = 0
             effective_error_px = 0.0
 
         self.last_target_time = now
 
-        # Map face position to the FULL servo range
-        # We do not require the face center to touch the exact image edge.
         edge_margin_px = frame_width * EDGE_MARGIN_RATIO
         left_x = edge_margin_px
         right_x = frame_width - edge_margin_px
-
         mapped_x = min(max(self.smoothed_x, left_x), right_x)
 
-        # left image side  -> left servo tick
-        # right image side -> right servo tick
         target_tick = np.interp(
-            mapped_x,
-            [left_x, right_x],
-            [HEAD_LEFT_TICK, HEAD_RIGHT_TICK],
+            mapped_x, [left_x, right_x], [HEAD_LEFT_TICK, HEAD_RIGHT_TICK]
         )
 
-        # If inside deadband / hysteresis hold current position
         if desired_dir == 0:
             target_tick = self.current_tick
 
         target_tick = self.clamp_tick(target_tick)
-
-        # Small dynamic step: tiny near center, larger farther away
         error_ratio = abs(effective_error_px) / max(1.0, frame_center_x)
-        dynamic_max_step = MAX_STEP_BASE + int(error_ratio * MAX_STEP_EXTRA)
-        dynamic_max_step = min(dynamic_max_step, MAX_STEP_CAP)
+        dynamic_max_step = min(
+            MAX_STEP_BASE + int(error_ratio * MAX_STEP_EXTRA), MAX_STEP_CAP
+        )
 
-        # If holding position, don't move
         if desired_dir == 0:
             dynamic_max_step = 0
 
         tick_error = target_tick - self.current_tick
-
         if tick_error > dynamic_max_step:
             tick_error = dynamic_max_step
         elif tick_error < -dynamic_max_step:
@@ -230,8 +192,7 @@ class HeadController:
         else:
             tick_error = int(round(tick_error))
 
-        new_tick = self.current_tick + tick_error
-        sent = self.send_tick(new_tick)
+        self.send_tick(self.current_tick + tick_error)
 
         return {
             "filtered_x": filtered_x,
@@ -242,17 +203,13 @@ class HeadController:
             "new_tick": self.current_tick,
             "dynamic_max_step": dynamic_max_step,
             "desired_dir": desired_dir,
-            "sent": sent,
         }
 
     def on_target_lost(self):
         now = time.monotonic()
 
         if now - self.last_target_time < LOST_TARGET_TIMEOUT_SEC:
-            return {
-                "returning": False,
-                "new_tick": self.current_tick,
-            }
+            return {"returning": False, "new_tick": self.current_tick}
 
         self.reset_tracking_state()
 
@@ -267,13 +224,8 @@ class HeadController:
         else:
             new_tick = self.current_tick
 
-        sent = self.send_tick(new_tick)
-
-        return {
-            "returning": True,
-            "new_tick": self.current_tick,
-            "sent": sent,
-        }
+        self.send_tick(new_tick)
+        return {"returning": True, "new_tick": self.current_tick}
 
     def close(self):
         try:
@@ -287,70 +239,131 @@ class HeadController:
             pass
 
 
-def main():
-    ifEdgeTPU_1_else_0 = 1
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Track the strongest face and turn the robot head toward it."
+    )
+    parser.add_argument(
+        "--camera-index", type=int, default=0, help="OpenCV camera index."
+    )
+    parser.add_argument(
+        "--edge-tpu",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use Edge TPU acceleration for live tracking. On Linux ARM, defaults to TPU detector + CPU embedder.",
+    )
+    parser.add_argument(
+        "--detector-edge-tpu",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override Edge TPU usage for the face detector.",
+    )
+    parser.add_argument(
+        "--embedder-edge-tpu",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override Edge TPU usage for the face embedding model.",
+    )
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="Directory for scanned_people data. Defaults to vision/face_recognition/scanned_people.",
+    )
+    parser.add_argument("--serial-port", default=DEFAULT_SERIAL_PORT)
+    parser.add_argument("--serial-baud", type=int, default=DEFAULT_SERIAL_BAUD)
+    parser.add_argument("--camera-width", type=int, default=DEFAULT_CAMERA_WIDTH)
+    parser.add_argument("--camera-height", type=int, default=DEFAULT_CAMERA_HEIGHT)
+    parser.add_argument("--fps", type=int, default=DEFAULT_CAMERA_FPS)
+    parser.add_argument("--detection-threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--recognition-threshold", type=float, default=FACE_SCORE_THRESHOLD
+    )
+    parser.add_argument("--match-threshold", type=float, default=0.5)
+    return parser
 
-    labels = load_labels("coco_labels.txt")
-    people_lables = load_labels("people_labels.txt")
-    preloaded_embeddings = preload_embeddings("scanned_people/")
 
-    if ifEdgeTPU_1_else_0 == 1:
-        interpreter = Interpreter(
-            model_path="models/ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite",
-            experimental_delegates=[load_delegate("libedgetpu.so.1.0")],
+def open_camera(cv2, camera_index: int):
+    if hasattr(cv2, "CAP_V4L2"):
+        cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+        if cap.isOpened():
+            return cap
+        cap.release()
+    return cv2.VideoCapture(camera_index)
+
+
+def run(args: argparse.Namespace) -> None:
+    cv2 = require_cv2()
+    Image = require_pil_image()
+
+    data_dir = resolve_data_dir(args.data_dir)
+    labels = load_labels()
+    people_labels = load_labels(PEOPLE_LABELS_PATH)
+    people_embeddings = load_people_embeddings(data_dir, required=False)
+    if not people_embeddings:
+        print(
+            f"WARNING: no embeddings found under {data_dir}; tracking will run without person names."
         )
-    else:
-        interpreter = Interpreter(
-            model_path="models/ssd_mobilenet_v2_face_quant_postprocess.tflite"
-        )
 
-    interpreter.allocate_tensors()
-    _, input_height, input_width, _ = interpreter.get_input_details()[0]["shape"]
+    default_detector_edge_tpu, default_embedder_edge_tpu = (
+        recommended_live_edge_tpu_modes(args.edge_tpu)
+    )
+    detector_edge_tpu = (
+        default_detector_edge_tpu
+        if args.detector_edge_tpu is None
+        else args.detector_edge_tpu
+    )
+    embedder_edge_tpu = (
+        default_embedder_edge_tpu
+        if args.embedder_edge_tpu is None
+        else args.embedder_edge_tpu
+    )
 
-    if ifEdgeTPU_1_else_0 == 1:
-        interpreter_emb = Interpreter(
-            model_path="models/Mobilenet1_triplet1589223569_triplet_quant_edgetpu.tflite",
-            experimental_delegates=[load_delegate("libedgetpu.so.1.0")],
-        )
-    else:
-        interpreter_emb = Interpreter(
-            model_path="models/Mobilenet1_triplet1589223569_triplet_quant.tflite"
-        )
+    detection_interpreter = create_detection_interpreter(detector_edge_tpu)
+    embedding_interpreter = create_embedding_interpreter(embedder_edge_tpu)
+    input_width, input_height = input_size(detection_interpreter)
 
-    interpreter_emb.allocate_tensors()
+    cap = open_camera(cv2, args.camera_index)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.camera_width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.camera_height)
+    cap.set(cv2.CAP_PROP_FPS, args.fps)
+    if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
     if not cap.isOpened():
-        cap = cv2.VideoCapture(0)
+        raise FaceRecognitionError(f"Could not open camera index {args.camera_index}.")
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-    head = HeadController(SERIAL_PORT, SERIAL_BAUD)
+    head = HeadController(args.serial_port, args.serial_baud)
+    print(
+        "Runtime: "
+        f"detector={'Edge TPU' if detector_edge_tpu else 'CPU'}, "
+        f"embedder={'Edge TPU' if embedder_edge_tpu else 'CPU'}"
+    )
+    print("Press q to stop.")
 
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("Failed to grab frame")
-                break
+                raise FaceRecognitionError("Failed to grab frame from camera.")
 
             frame_height, frame_width = frame.shape[:2]
             frame_center_x = frame_width / 2.0
-
-            image_large = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            image = image_large.convert("RGB").resize(
+            image_rgb = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            detection_image = image_rgb.convert("RGB").resize(
                 (input_width, input_height), Image.LANCZOS
             )
 
             start_time = time.monotonic()
-            results = detect_objects(interpreter, image, 0.5)
+            detections = detect_faces(
+                detection_interpreter,
+                detection_image,
+                args.detection_threshold,
+                frame_width,
+                frame_height,
+            )
             elapsed_ms = (time.monotonic() - start_time) * 1000
 
-            annotate_objects(frame, results, labels, frame_width, frame_height)
-
+            annotate_detections(frame, detections, labels, cv2)
             cv2.putText(
                 frame,
                 f"{elapsed_ms:.1f}ms",
@@ -360,7 +373,6 @@ def main():
                 (0, 255, 0),
                 2,
             )
-
             cv2.line(
                 frame,
                 (int(frame_center_x), 0),
@@ -369,21 +381,10 @@ def main():
                 2,
             )
 
-            ymin, xmin, ymax, xmax, score = get_best_box_param(
-                results, frame_width, frame_height
-            )
-
-            print(f"frame_width: {frame_width}, frame_height: {frame_height}")
-
-            if score > FACE_SCORE_THRESHOLD:
-                print(
-                    f"x_left_face: {xmin}, x_right_face: {xmax}, "
-                    f"y_top_face: {ymin}, y_bottom_face: {ymax}"
-                )
-
-                face_center_x = (xmin + xmax) / 2.0
-                face_center_y = (ymin + ymax) / 2.0
-
+            detection = best_detection(detections)
+            if detection is not None and detection.score > args.recognition_threshold:
+                face_center_x = (detection.xmin + detection.xmax) / 2.0
+                face_center_y = (detection.ymin + detection.ymax) / 2.0
                 debug = head.update_from_face_x(face_center_x, frame_width)
 
                 cv2.circle(
@@ -403,7 +404,6 @@ def main():
                     (0, 165, 255),
                     -1,
                 )
-
                 cv2.putText(
                     frame,
                     f"raw_err={debug['raw_error_px']:.1f} eff_err={debug['effective_error_px']:.1f}",
@@ -422,20 +422,21 @@ def main():
                     (255, 255, 255),
                     2,
                 )
-                cv2.putText(
-                    frame,
-                    f"step_cap={debug['dynamic_max_step']}",
-                    (5, 100),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (255, 255, 0),
-                    2,
-                )
 
+                if people_embeddings:
+                    match = recognize_detection(
+                        embedding_interpreter,
+                        np.asarray(image_rgb),
+                        detection,
+                        people_labels,
+                        people_embeddings,
+                        args.match_threshold,
+                    )
+                    print(
+                        f"person on pic: {match.name or 'Unknown'} ({match.confidence:.2f})"
+                    )
             else:
-                print("face: NOT DETECTED")
                 debug = head.on_target_lost()
-
                 if debug["returning"]:
                     cv2.putText(
                         frame,
@@ -447,23 +448,6 @@ def main():
                         2,
                     )
 
-            if score > FACE_SCORE_THRESHOLD:
-                img = np.array(image_large)
-                img_cut = img[ymin:ymax, xmin:xmax, :]
-
-                if (
-                    img_cut is not None
-                    and img_cut.size != 0
-                    and img_cut.shape[0] > 0
-                    and img_cut.shape[1] > 0
-                ):
-                    img_cut = cv2.resize(
-                        img_cut, dsize=(96, 96), interpolation=cv2.INTER_CUBIC
-                    ).astype("uint8")
-                    img_cut = img_cut.reshape(1, 96, 96, 3) / 255.0
-                    emb = img_to_emb(interpreter_emb, img_cut)
-                    get_person_from_embedding(people_lables, emb, preloaded_embeddings)
-
             cv2.putText(
                 frame,
                 f"head_tick={head.current_tick}",
@@ -473,157 +457,30 @@ def main():
                 (0, 255, 255),
                 2,
             )
-
-            cv2.imshow("Face Recognition", frame)
+            cv2.imshow("Face Recognition Head Tracking", frame)
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
-
     finally:
         cap.release()
         cv2.destroyAllWindows()
         head.close()
 
 
-def preload_embeddings(path, num_emb_check=20):
-    folders = sorted(os.listdir(path))
-    embeddings = {}
-    for folder in folders:
-        emb_path = os.path.join(path, folder, "embeddings")
-        files = sorted(os.listdir(emb_path))[:num_emb_check]
-        embeddings[folder] = [np.load(os.path.join(emb_path, f)) for f in files]
-        print(f"Loaded {len(embeddings[folder])} embeddings for {folder}")
-    return embeddings
-
-
-def get_person_from_embedding(people_lables, emb, preloaded_embeddings):
-    folders = sorted(preloaded_embeddings.keys())
-    averages = np.zeros(len(folders))
-
-    for i, folder in enumerate(folders):
-        embs = preloaded_embeddings[folder]
-        diffs = np.array([np.sum((emb - e) ** 2) for e in embs])
-        averages[i] = diffs.mean()
-
-    who_is_on_pic = 0
-    lowest_norm_found = 999
-    for run, average in enumerate(averages):
-        if average < 0.9 and average < lowest_norm_found:
-            lowest_norm_found = average
-            who_is_on_pic = run + 1
-        print(average)
-
-    print("person on pic: ", people_lables[who_is_on_pic])
-
-
-def load_labels(path):
-    with open(path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-        labels = {}
-        for row_number, content in enumerate(lines):
-            pair = re.split(r"[:\s]+", content.strip(), maxsplit=1)
-            if len(pair) == 2 and pair[0].strip().isdigit():
-                labels[int(pair[0])] = pair[1].strip()
-            else:
-                labels[row_number] = pair[0].strip()
-    return labels
-
-
-def set_input_tensor(interpreter, image):
-    tensor_index = interpreter.get_input_details()[0]["index"]
-    input_tensor = interpreter.tensor(tensor_index)()[0]
-    input_tensor[:, :] = image
-
-
-def get_output_tensor(interpreter, index):
-    output_details = interpreter.get_output_details()[index]
-    tensor = np.squeeze(interpreter.get_tensor(output_details["index"]))
-    return tensor
-
-
-def set_input_tensor_emb(interpreter, input):
-    input_details = interpreter.get_input_details()[0]
-    tensor_index = input_details["index"]
-    scale, zero_point = input_details["quantization"]
-    input_tensor = interpreter.tensor(tensor_index)()[0]
-    input_tensor[:, :] = np.uint8(input / scale + zero_point)
-
-
-def img_to_emb(interpreter, input):
-    set_input_tensor_emb(interpreter, input)
-    interpreter.invoke()
-    output_details = interpreter.get_output_details()[0]
-    emb = interpreter.get_tensor(output_details["index"])
-    scale, zero_point = output_details["quantization"]
-    emb = scale * (emb - zero_point)
-    return emb
-
-
-def detect_objects(interpreter, image, threshold):
-    set_input_tensor(interpreter, image)
-    interpreter.invoke()
-
-    boxes = get_output_tensor(interpreter, 0)
-    classes = get_output_tensor(interpreter, 1)
-    scores = get_output_tensor(interpreter, 2)
-    count = int(get_output_tensor(interpreter, 3))
-
-    results = []
-    for i in range(count):
-        if scores[i] >= threshold:
-            result = {
-                "bounding_box": boxes[i],
-                "class_id": classes[i],
-                "score": scores[i],
-            }
-            results.append(result)
-    return results
-
-
-def get_best_box_param(results, frame_width, frame_height):
-    best_boxvalue = 0
-    xmin = 0
-    xmax = 1
-    ymin = 0
-    ymax = 1
-
-    for obj in results:
-        if obj["score"] > best_boxvalue:
-            best_boxvalue = obj["score"]
-            ymin, xmin, ymax, xmax = obj["bounding_box"]
-
-            xmin = max(0.0, xmin)
-            xmax = min(1.0, xmax)
-            ymin = max(0.0, ymin)
-            ymax = min(1.0, ymax)
-
-            xmin = int(xmin * frame_width)
-            xmax = int(xmax * frame_width)
-            ymin = int(ymin * frame_height)
-            ymax = int(ymax * frame_height)
-
-    return ymin, xmin, ymax, xmax, best_boxvalue
-
-
-def annotate_objects(frame, results, labels, frame_width, frame_height):
-    for obj in results:
-        ymin, xmin, ymax, xmax = obj["bounding_box"]
-        xmin = int(xmin * frame_width)
-        xmax = int(xmax * frame_width)
-        ymin = int(ymin * frame_height)
-        ymax = int(ymax * frame_height)
-
-        cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
-        cv2.putText(
-            frame,
-            "%s %.2f" % (labels[obj["class_id"]], obj["score"]),
-            (xmin, ymin - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 0),
-            2,
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if should_delegate_edge_tpu(args.edge_tpu):
+        return reexec_module_with_coral_python(
+            "vision.face_recognition.track_and_turn_head", argv or sys.argv[1:]
         )
+    try:
+        run(args)
+    except FaceRecognitionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -3,12 +3,13 @@ WALL-E API Server
 Lightweight Flask bridge for web interface and external control.
 Runs on a separate port (default 5001) alongside the main orchestrator.
 """
+
 import logging
 import re
 import threading
 from typing import Optional
 
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 
 _log = logging.getLogger("walle.api")
 
@@ -25,7 +26,7 @@ def create_app(serial_manager, llm_client=None, vision_service=None):
         cmd = data.get("command", "").strip()
         if not cmd:
             return jsonify({"error": "Missing 'command' field"}), 400
-        if len(cmd) > 20 or not re.match(r'^[A-Za-z0-9\n\s?-]+$', cmd):
+        if len(cmd) > 20 or not re.match(r"^[A-Za-z0-9\n\s?-]+$", cmd):
             return jsonify({"error": "Invalid command format"}), 400
         result = serial_manager.send_command(cmd)
         return jsonify({"status": result})
@@ -33,10 +34,12 @@ def create_app(serial_manager, llm_client=None, vision_service=None):
     @app.route("/status", methods=["GET"])
     def get_status():
         """Return robot connection status."""
-        return jsonify({
-            "connected": serial_manager.is_connected(),
-            "simulation": serial_manager.simulation,
-        })
+        return jsonify(
+            {
+                "connected": serial_manager.is_connected(),
+                "simulation": serial_manager.simulation,
+            }
+        )
 
     @app.route("/chat", methods=["POST"])
     def chat():
@@ -67,13 +70,15 @@ def create_app(serial_manager, llm_client=None, vision_service=None):
         visual = ctx.visual
         if visual is None:
             return jsonify({"faces": [], "objects": [], "scene": "", "description": ""})
-        return jsonify({
-            "faces": visual.faces_detected,
-            "objects": visual.objects_detected,
-            "scene": visual.scene_description,
-            "description": visual.to_natural_language(),
-            "timestamp": visual.timestamp.isoformat(),
-        })
+        return jsonify(
+            {
+                "faces": visual.faces_detected,
+                "objects": visual.objects_detected,
+                "scene": visual.scene_description,
+                "description": visual.to_natural_language(),
+                "timestamp": visual.timestamp.isoformat(),
+            }
+        )
 
     return app
 
@@ -81,7 +86,9 @@ def create_app(serial_manager, llm_client=None, vision_service=None):
 class APIServer:
     """Runs the Flask API in a background thread."""
 
-    def __init__(self, serial_manager, llm_client=None, vision_service=None, port: int = 5001):
+    def __init__(
+        self, serial_manager, llm_client=None, vision_service=None, port: int = 5001
+    ):
         self._port = port
         self._app = create_app(serial_manager, llm_client, vision_service)
         self._thread: Optional[threading.Thread] = None
@@ -99,6 +106,7 @@ class APIServer:
     def _run(self) -> None:
         # Suppress Flask's default startup banner
         import logging
+
         log = logging.getLogger("werkzeug")
         log.setLevel(logging.WARNING)
         self._app.run(host="0.0.0.0", port=self._port, threaded=True)

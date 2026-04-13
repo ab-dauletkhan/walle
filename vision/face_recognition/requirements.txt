@@ -1,7 +1,0 @@
-opencv-python
-numpy
-
-Pillow
-
-#tflite-runtime
-

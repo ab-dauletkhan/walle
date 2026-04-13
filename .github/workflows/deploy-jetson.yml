@@ -1,0 +1,105 @@
+name: Deploy Jetson
+
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: "Jetson hostname or IP address"
+        required: true
+        type: string
+      user:
+        description: "SSH user"
+        required: true
+        default: "jetson"
+        type: string
+      ssh_port:
+        description: "SSH port"
+        required: true
+        default: "22"
+        type: string
+      app_dir:
+        description: "Existing repo path on the Jetson"
+        required: true
+        default: "/home/jetson/walle"
+        type: string
+      branch:
+        description: "Branch to deploy"
+        required: true
+        default: "master"
+        type: string
+      restart_service:
+        description: "Restart the systemd service after syncing"
+        required: true
+        default: false
+        type: boolean
+      service_name:
+        description: "systemd service name"
+        required: true
+        default: "walle"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-jetson
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Jetson
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: jetson
+
+    steps:
+      - name: Configure SSH
+        env:
+          JETSON_SSH_KEY: ${{ secrets.JETSON_SSH_KEY }}
+          JETSON_HOST: ${{ inputs.host }}
+          JETSON_PORT: ${{ inputs.ssh_port }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$JETSON_SSH_KEY" ]; then
+            echo "::error::Missing repository secret JETSON_SSH_KEY"
+            exit 1
+          fi
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "$JETSON_SSH_KEY" > ~/.ssh/jetson_key
+          chmod 600 ~/.ssh/jetson_key
+          ssh-keyscan -p "$JETSON_PORT" -H "$JETSON_HOST" >> ~/.ssh/known_hosts
+
+      - name: Pull branch and sync uv environment
+        env:
+          JETSON_HOST: ${{ inputs.host }}
+          JETSON_USER: ${{ inputs.user }}
+          JETSON_PORT: ${{ inputs.ssh_port }}
+          APP_DIR: ${{ inputs.app_dir }}
+          BRANCH: ${{ inputs.branch }}
+          RESTART_SERVICE: ${{ inputs.restart_service }}
+          SERVICE_NAME: ${{ inputs.service_name }}
+        run: |
+          set -euo pipefail
+
+          ssh -i ~/.ssh/jetson_key -p "$JETSON_PORT" "$JETSON_USER@$JETSON_HOST" \
+            'bash -s' -- "$APP_DIR" "$BRANCH" "$RESTART_SERVICE" "$SERVICE_NAME" <<'REMOTE'
+          set -euo pipefail
+
+          app_dir="$1"
+          branch="$2"
+          restart_service="$3"
+          service_name="$4"
+
+          cd "$app_dir"
+          git fetch origin "$branch"
+          git checkout "$branch"
+          git pull --ff-only origin "$branch"
+          uv sync --extra jetson --frozen
+
+          if [ "$restart_service" = "true" ]; then
+            sudo systemctl restart "$service_name"
+            sudo systemctl status "$service_name" --no-pager
+          fi
+          REMOTE

@@ -2,6 +2,7 @@
 Base Tool Executor class for WALL-E
 Provides common execute() pattern for all tool executors.
 """
+
 from abc import ABC
 from typing import Dict, List
 
@@ -13,6 +14,7 @@ class BaseToolExecutor(ABC):
     Subclasses implement methods with naming pattern: {method_prefix}{tool_name}
     Default prefix is "_", override method_prefix for different patterns.
     """
+
     method_prefix: str = "_"
 
     def execute(self, fn_name: str, args: dict) -> str:

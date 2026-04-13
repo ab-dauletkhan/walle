@@ -45,7 +45,8 @@ vision-cpu = [
 vision-coral = [
     "opencv-python>=4.8",
     "pillow>=10.0",
-    # tflite-runtime and pycoral installed separately (platform-specific wheels)
+    # tflite-runtime must match the target's Coral/Jetson stack.
+    # Install a known-good version on-device instead of forcing one here.
 ]
 
 # Voice — STT + TTS
@@ -74,6 +75,8 @@ ml = [
 # Development
 dev = [
     "pytest>=8.0",
+    "ruff>=0.15.10",
+    "ty>=0.0.29",
 ]
 
 # Everything except Jetson-specific torch
@@ -88,6 +91,10 @@ jetson = [
 
 [project.scripts]
 walle = "walle.startup:main"
+walle-face-scan = "vision.face_recognition.scan_people:main"
+walle-face-embeddings = "vision.face_recognition.create_embeddings:main"
+walle-face-recognize = "vision.face_recognition.recognize_face:main"
+walle-face-track-head = "vision.face_recognition.track_and_turn_head:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -99,5 +106,21 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+src = ["walle", "vision", "tests", "legacy"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ty.src]
+include = ["vision/face_recognition"]
+
 [tool.hatch.build.targets.wheel]
-packages = ["walle"]
+packages = ["walle", "vision"]

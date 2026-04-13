@@ -11,14 +11,11 @@ from typing import Protocol, Sequence
 
 
 class RobotRuntime(Protocol):
-    def send_command(self, cmd: str) -> str:
-        ...
+    def send_command(self, cmd: str) -> str: ...
 
-    def sleep(self, seconds: float) -> None:
-        ...
+    def sleep(self, seconds: float) -> None: ...
 
-    def heartbeat(self) -> str | None:
-        ...
+    def heartbeat(self) -> str | None: ...
 
 
 @dataclass(frozen=True)
@@ -93,7 +90,9 @@ class RobotAction(ABC):
 
 
 class TimedAxisAction(RobotAction):
-    def __init__(self, spec: RobotToolSpec, axis: str, direction: int, action_label: str):
+    def __init__(
+        self, spec: RobotToolSpec, axis: str, direction: int, action_label: str
+    ):
         super().__init__(spec)
         self._axis = axis
         self._direction = direction
@@ -254,10 +253,14 @@ def build_default_robot_registry() -> RobotToolRegistry:
                     "set_head_rotation",
                     "Call when the user asks to look left/right or face a direction. "
                     "Sets head rotation angle. Returns confirmation with final position.",
-                    {"position": {
-                        "type": "integer", "minimum": 0, "maximum": 100,
-                        "description": "Head angle: 0=full left, 50=center, 100=full right. Example: 25=slightly left.",
-                    }},
+                    {
+                        "position": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 100,
+                            "description": "Head angle: 0=full left, 50=center, 100=full right. Example: 25=slightly left.",
+                        }
+                    },
                     ("position",),
                 ),
                 command_prefix="G",
@@ -268,10 +271,14 @@ def build_default_robot_registry() -> RobotToolRegistry:
                     "set_neck_position",
                     "Call when the user asks to look up/down or nod. "
                     "Sets neck tilt angle. Returns confirmation with final position.",
-                    {"position": {
-                        "type": "integer", "minimum": 0, "maximum": 100,
-                        "description": "Neck tilt: 0=looking down, 50=level, 100=looking up. Example: 80=looking up.",
-                    }},
+                    {
+                        "position": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 100,
+                            "description": "Neck tilt: 0=looking down, 50=level, 100=looking up. Example: 80=looking up.",
+                        }
+                    },
                     ("position",),
                 )
             ),
@@ -282,11 +289,15 @@ def build_default_robot_registry() -> RobotToolRegistry:
                     "Sets both arm positions independently. Returns confirmation.",
                     {
                         "left": {
-                            "type": "integer", "minimum": 0, "maximum": 100,
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 100,
                             "description": "Left arm: 0=fully lowered, 50=horizontal, 100=fully raised.",
                         },
                         "right": {
-                            "type": "integer", "minimum": 0, "maximum": 100,
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 100,
                             "description": "Right arm: 0=fully lowered, 50=horizontal, 100=fully raised.",
                         },
                     },
@@ -302,11 +313,15 @@ def build_default_robot_registry() -> RobotToolRegistry:
                     "Returns distance estimate. Reference: speed=50 for 1000ms covers ~30cm.",
                     {
                         "speed": {
-                            "type": "integer", "minimum": 10, "maximum": 100,
+                            "type": "integer",
+                            "minimum": 10,
+                            "maximum": 100,
                             "description": "Motor power in percent. 30=slow, 50=normal, 80=fast.",
                         },
                         "duration_ms": {
-                            "type": "integer", "minimum": 100, "maximum": 5000,
+                            "type": "integer",
+                            "minimum": 100,
+                            "maximum": 5000,
                             "description": "Duration in ms, max 5000 per call. For longer moves, call multiple times. Example: 1000=1s.",
                         },
                     },
@@ -324,11 +339,15 @@ def build_default_robot_registry() -> RobotToolRegistry:
                     "Returns distance estimate. Reference: speed=50 for 1000ms covers ~30cm.",
                     {
                         "speed": {
-                            "type": "integer", "minimum": 10, "maximum": 100,
+                            "type": "integer",
+                            "minimum": 10,
+                            "maximum": 100,
                             "description": "Motor power in percent. 30=slow, 50=normal, 80=fast.",
                         },
                         "duration_ms": {
-                            "type": "integer", "minimum": 100, "maximum": 5000,
+                            "type": "integer",
+                            "minimum": 100,
+                            "maximum": 5000,
                             "description": "Duration in ms, max 5000 per call. For longer moves, call multiple times. Example: 1000=1s.",
                         },
                     },
@@ -346,11 +365,15 @@ def build_default_robot_registry() -> RobotToolRegistry:
                     "Returns angle estimate. Reference at speed=50: 500ms=~90°, 1000ms=~180°, 2000ms=~360°.",
                     {
                         "speed": {
-                            "type": "integer", "minimum": 10, "maximum": 100,
+                            "type": "integer",
+                            "minimum": 10,
+                            "maximum": 100,
                             "description": "Motor power in percent. 50=normal turning speed.",
                         },
                         "duration_ms": {
-                            "type": "integer", "minimum": 100, "maximum": 5000,
+                            "type": "integer",
+                            "minimum": 100,
+                            "maximum": 5000,
                             "description": "Duration in ms, max 5000 per call. For longer turns, call multiple times. 500=~90°, 1000=~180°, 2000=~360°.",
                         },
                     },
@@ -368,11 +391,15 @@ def build_default_robot_registry() -> RobotToolRegistry:
                     "Returns angle estimate. Reference at speed=50: 500ms=~90°, 1000ms=~180°, 2000ms=~360°.",
                     {
                         "speed": {
-                            "type": "integer", "minimum": 10, "maximum": 100,
+                            "type": "integer",
+                            "minimum": 10,
+                            "maximum": 100,
                             "description": "Motor power in percent. 50=normal turning speed.",
                         },
                         "duration_ms": {
-                            "type": "integer", "minimum": 100, "maximum": 5000,
+                            "type": "integer",
+                            "minimum": 100,
+                            "maximum": 5000,
                             "description": "Duration in ms, max 5000 per call. For longer turns, call multiple times. 500=~90°, 1000=~180°, 2000=~360°.",
                         },
                     },
@@ -396,10 +423,13 @@ def build_default_robot_registry() -> RobotToolRegistry:
                     "Call when the user asks to show a feeling or when contextually appropriate "
                     "(e.g. greet with happy, apologize with sad). "
                     "Sets head, neck, and arm positions to match the emotion.",
-                    {"emotion": {
-                        "type": "string", "enum": ["happy", "sad", "neutral"],
-                        "description": "happy=head up, arms raised. sad=head down, arms lowered. neutral=relaxed centered pose.",
-                    }},
+                    {
+                        "emotion": {
+                            "type": "string",
+                            "enum": ["happy", "sad", "neutral"],
+                            "description": "happy=head up, arms raised. sad=head down, arms lowered. neutral=relaxed centered pose.",
+                        }
+                    },
                     ("emotion",),
                 )
             ),
@@ -408,10 +438,13 @@ def build_default_robot_registry() -> RobotToolRegistry:
                     "scan_surroundings",
                     "Call when the user asks to look around or check the environment. "
                     "Sweeps head left→center→right→center. Returns completion status.",
-                    {"speed": {
-                        "type": "string", "enum": ["slow", "normal", "fast"],
-                        "description": "Pause between positions: slow=1.5s, normal=0.8s, fast=0.4s.",
-                    }},
+                    {
+                        "speed": {
+                            "type": "string",
+                            "enum": ["slow", "normal", "fast"],
+                            "description": "Pause between positions: slow=1.5s, normal=0.8s, fast=0.4s.",
+                        }
+                    },
                     ("speed",),
                 )
             ),

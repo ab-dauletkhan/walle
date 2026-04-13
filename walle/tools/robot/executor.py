@@ -14,6 +14,7 @@ _log = logging.getLogger("walle.robot")
 
 try:
     import serial
+
     SERIAL_AVAILABLE = True
 except ImportError:
     SERIAL_AVAILABLE = False

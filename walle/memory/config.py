@@ -1,17 +1,25 @@
 import logging
 import os
+import platform
 import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field, fields
-from pathlib import Path
 from typing import List, Optional
 
 # Project root (two levels up from walle/memory/)
-_PROJECT_ROOT: str = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_PROJECT_ROOT: str = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 # Data directory for runtime files (databases, indices, personality)
 MEMORY_DIR: str = os.path.join(_PROJECT_ROOT, "data")
+
+
+def _default_vision_embedder_edge_tpu() -> bool:
+    machine = platform.machine().lower()
+    return not (platform.system() == "Linux" and machine in {"aarch64", "arm64"})
+
 
 @dataclass
 class Config:
@@ -32,36 +40,43 @@ class Config:
     # --- Memory Settings ---
     MAX_CONTEXT_MESSAGES: int = 10  # Rolling context window
     USE_SEMANTIC_SEARCH: bool = True  # Enable with lightweight embeddings
-    RECALL_MEMORY_LIMIT: int = 40     # Compress to archival after this limit
+    RECALL_MEMORY_LIMIT: int = 40  # Compress to archival after this limit
 
     # --- FAISS Settings (Fast Vector Search) ---
-    USE_FAISS: bool = True                       # Enable FAISS for O(log n) search
+    USE_FAISS: bool = True  # Enable FAISS for O(log n) search
     FAISS_INDEX_PATH: str = "walle_faiss.index"  # Persistent index file
-    FAISS_DIMENSION: int = 384                   # all-MiniLM-L6-v2 output dimension
-    FAISS_REBUILD_THRESHOLD: int = 100           # Rebuild index after N insertions
+    FAISS_DIMENSION: int = 384  # all-MiniLM-L6-v2 output dimension
+    FAISS_REBUILD_THRESHOLD: int = 100  # Rebuild index after N insertions
 
     # --- Importance Decay Settings ---
-    IMPORTANCE_DECAY_HALF_LIFE: float = 30.0     # Days until recency score halves
-    IMPORTANCE_STATIC_WEIGHT: float = 0.7        # Weight for static importance (0-1)
-    IMPORTANCE_RECENCY_WEIGHT: float = 0.3       # Weight for recency score (0-1)
+    IMPORTANCE_DECAY_HALF_LIFE: float = 30.0  # Days until recency score halves
+    IMPORTANCE_STATIC_WEIGHT: float = 0.7  # Weight for static importance (0-1)
+    IMPORTANCE_RECENCY_WEIGHT: float = 0.3  # Weight for recency score (0-1)
 
     # --- Search Settings ---
     MAX_SEARCH_RESULTS: int = 5
     SEARCH_REGIONS: List[str] = field(default_factory=lambda: ["wt-wt", "us-en"])
     # --- Vision Thresholds ---
-    VISION_FACE_DETECTION_THRESHOLD: float = 0.5   # Min score from face detector
-    VISION_FACE_RECOGNITION_MIN: float = 0.8       # Min detection score to attempt recognition
-    VISION_FACE_MATCH_THRESHOLD: float = 0.5       # Cosine similarity for Coral backend
-    VISION_CPU_FACE_MATCH_THRESHOLD: float = 0.6   # Cosine similarity for CPU backend
+    VISION_FACE_DETECTION_THRESHOLD: float = 0.5  # Min score from face detector
+    VISION_FACE_RECOGNITION_MIN: float = (
+        0.8  # Min detection score to attempt recognition
+    )
+    VISION_FACE_MATCH_THRESHOLD: float = 0.5  # Cosine similarity for Coral backend
+    VISION_CPU_FACE_MATCH_THRESHOLD: float = 0.6  # Cosine similarity for CPU backend
+    VISION_DETECTOR_EDGE_TPU: bool = True
+    VISION_EMBEDDER_EDGE_TPU: bool = _default_vision_embedder_edge_tpu()
+    VISION_CORAL_ENABLED: bool = True
+    VISION_CORAL_WORKER_TIMEOUT_MS: int = 5000
+    VISION_CORAL_WORKER_MAX_RESTARTS: int = 3
 
     # --- STT / Voice Thresholds ---
-    INTENT_MATCH_THRESHOLD: float = 0.65           # Semantic intent recognition
-    ECHO_OVERLAP_THRESHOLD: float = 0.4            # Echo suppression word overlap
-    ECHO_SUPPRESS_WINDOW: float = 8.0              # Echo suppression window (seconds)
-    ECHO_COOLDOWN: float = 2.0                     # Post-TTS silence (seconds)
+    INTENT_MATCH_THRESHOLD: float = 0.65  # Semantic intent recognition
+    ECHO_OVERLAP_THRESHOLD: float = 0.4  # Echo suppression word overlap
+    ECHO_SUPPRESS_WINDOW: float = 8.0  # Echo suppression window (seconds)
+    ECHO_COOLDOWN: float = 2.0  # Post-TTS silence (seconds)
 
     # --- Vision Processing ---
-    VISION_FPS: int = 2                              # Camera processing rate
+    VISION_FPS: int = 2  # Camera processing rate
 
     # --- Robot Settings ---
     SERIAL_PORT: str = None
@@ -115,11 +130,14 @@ def validate_ollama(config: "Config") -> tuple[bool, Optional[subprocess.Popen]]
         try:
             models = [
                 m["name"]
-                for m in requests.get(
-                    f"{config.OLLAMA_BASE_URL}/api/tags", timeout=5
-                ).json().get("models", [])
+                for m in requests.get(f"{config.OLLAMA_BASE_URL}/api/tags", timeout=5)
+                .json()
+                .get("models", [])
             ]
-            return config.OLLAMA_MODEL in models or f"{config.OLLAMA_MODEL}:latest" in models
+            return (
+                config.OLLAMA_MODEL in models
+                or f"{config.OLLAMA_MODEL}:latest" in models
+            )
         except Exception:
             return False
 
@@ -164,6 +182,7 @@ def validate_ollama(config: "Config") -> tuple[bool, Optional[subprocess.Popen]]
     log.info("Ollama ready — %s", config.OLLAMA_MODEL)
     return True, process
 
+
 conf = Config.load()
 
 
@@ -199,10 +218,12 @@ def setup_logging(run_mode: str = None) -> None:
     try:
         fh = logging.FileHandler(log_path, encoding="utf-8")
         fh.setLevel(logging.DEBUG)
-        fh.setFormatter(logging.Formatter(
-            "%(asctime)s  %(name)-28s  %(levelname)-7s  %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        ))
+        fh.setFormatter(
+            logging.Formatter(
+                "%(asctime)s  %(name)-28s  %(levelname)-7s  %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
         root_logger.addHandler(fh)
     except OSError:
         root_logger.warning("Could not open log file %s", log_path)

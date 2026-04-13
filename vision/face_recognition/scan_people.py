@@ -1,214 +1,165 @@
-"""
-Use this program to scan a singel person. Scanning means to use the face detector to extract a 96*96 img of the persons face.
-The images are saved in one folder as png and in an other folder as numpy array. The png's are only for visual inspection.
-For default values in "recognize_face.py" you need to get at least 20 pictures per person.
+from __future__ import annotations
 
-Important: For each new person, increase the variable "str(person_number)" in main() by 1. This "str(person_number)" will define the foldername
-where the images of the scanned person will be saved.
-
-Adjust the variable "camera.rotation" to fit your configuration
-
-If you do not have an Edge TPU or you want to see the performance difference, change the
-variable ifEdgeTPU_1_else_0 in main() to 0.
-"""
-
-import io
-import re
-import time
-import os
+import argparse
 import shutil
-from tflite_runtime.interpreter import load_delegate
-
-from annotation import Annotator
+import sys
 
 import numpy as np
 
+from .common import (
+    FaceRecognitionError,
+    annotate_detections,
+    best_detection,
+    create_detection_interpreter,
+    crop_face_rgb,
+    detect_faces,
+    input_size,
+    load_labels,
+    require_cv2,
+    require_pil_image,
+    resolve_data_dir,
+)
+from .coral_runtime import reexec_module_with_coral_python, should_delegate_edge_tpu
 
-from PIL import Image
-from tflite_runtime.interpreter import Interpreter
-
-import cv2
-
-CAMERA_WIDTH = 1280
-CAMERA_HEIGHT = 960
-
-
-def main():
-    
-  ifEdgeTPU_1_else_0 = 1
-  
-  labels = load_labels('coco_labels.txt')
-  
-  #get interpreter for face detection model
-  if ifEdgeTPU_1_else_0 == 1:
-      interpreter = Interpreter(model_path = 'models/ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite',
-        experimental_delegates=[load_delegate('libedgetpu.so.1.0')])
-  else:
-      interpreter = Interpreter(model_path = 'models/ssd_mobilenet_v2_face_quant_postprocess.tflite')
-  
-  interpreter.allocate_tensors()
-  _, input_height, input_width, _ = interpreter.get_input_details()[0]['shape']
-  
-  
-  
-  person_number = 3 # Change the number of the person you scan. It will create a new number for that person
-  count_images_saved = 0
-  
-  if os.path.isdir('scanned_people') == False:
-    os.mkdir('scanned_people')
-      
-  if os.path.isdir('scanned_people/' + str(person_number)) == False:
-    os.mkdir('scanned_people/' + str(person_number))
-    os.mkdir('scanned_people/' + str(person_number) + '/png')
-    os.mkdir('scanned_people/' + str(person_number) + '/npy')
-  else:
-    shutil.rmtree('scanned_people/' + str(person_number))
-    os.mkdir('scanned_people/' + str(person_number))
-    os.mkdir('scanned_people/' + str(person_number) + '/png')
-    os.mkdir('scanned_people/' + str(person_number) + '/npy')
-  
-  cap = cv2.VideoCapture(0)  # 0 = default camera, change if needed
-  cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-  cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-  cap.set(cv2.CAP_PROP_FPS, 30)
-  try:
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Failed to grab frame")
-            break
-
-        # Rotate 270 degrees (equivalent to camera.rotation=270)
-        #frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-        # Convert BGR (OpenCV) to RGB (PIL), then resize for inference
-        image_large = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        image = image_large.resize((input_width, input_height), Image.LANCZOS)
-
-        start_time = time.monotonic()
-        results = detect_objects(interpreter, image, 0.9)
-        elapsed_ms = (time.monotonic() - start_time) * 1000
-
-        # Draw annotations using OpenCV instead of Annotator
-        annotate_objects(frame, results, labels, CAMERA_WIDTH, CAMERA_HEIGHT)
-        cv2.putText(frame, '%.1fms' % elapsed_ms, (5, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        cv2.imshow('Object Detection', frame)
-
-        ymin, xmin, ymax, xmax, score = get_best_box_param(results, CAMERA_WIDTH, CAMERA_HEIGHT)
-
-        if score > 0.85:
-            img = np.array(image_large)
-            img_cut = img[ymin:ymax, xmin:xmax, :]
-            print(img_cut.shape)
-            img_cut = cv2.resize(img_cut, dsize=(96, 96),
-                                 interpolation=cv2.INTER_CUBIC).astype('uint8')
-            img_cut_pil = Image.fromarray(img_cut)
-            img_cut_pil.save('scanned_people/' + str(person_number) + '/png/img_' + str(count_images_saved) + '.png')
-            np.save('scanned_people/' + str(person_number) + '/npy/img_' + str(count_images_saved), img_cut)
-            count_images_saved += 1
-
-        # Press 'q' to quit
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-  finally:
-      cap.release()
-      cv2.destroyAllWindows()
+DEFAULT_CAMERA_WIDTH = 1280
+DEFAULT_CAMERA_HEIGHT = 960
+DEFAULT_CAMERA_FPS = 30
 
 
-def load_labels(path):
-  #Loads the labels file. Supports files with or without index numbers.
-  with open(path, 'r', encoding='utf-8') as f:
-    lines = f.readlines()
-    labels = {}
-    for row_number, content in enumerate(lines):
-      pair = re.split(r'[:\s]+', content.strip(), maxsplit=1)
-      if len(pair) == 2 and pair[0].strip().isdigit():
-        labels[int(pair[0])] = pair[1].strip()
-      else:
-        labels[row_number] = pair[0].strip()
-  return labels
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Enroll one person by saving detected 96x96 face crops."
+    )
+    parser.add_argument(
+        "--person", type=int, required=True, help="Person folder number to create."
+    )
+    parser.add_argument(
+        "--camera-index", type=int, default=0, help="OpenCV camera index."
+    )
+    parser.add_argument(
+        "--edge-tpu",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the Edge TPU model and libedgetpu delegate.",
+    )
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="Directory for scanned_people data. Defaults to vision/face_recognition/scanned_people.",
+    )
+    parser.add_argument("--camera-width", type=int, default=DEFAULT_CAMERA_WIDTH)
+    parser.add_argument("--camera-height", type=int, default=DEFAULT_CAMERA_HEIGHT)
+    parser.add_argument("--fps", type=int, default=DEFAULT_CAMERA_FPS)
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.9,
+        help="Minimum face detection score to save a crop.",
+    )
+    parser.add_argument(
+        "--max-images",
+        type=int,
+        default=0,
+        help="Stop after this many saved crops. 0 means unlimited.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Delete and recreate the selected person's existing scan folder.",
+    )
+    return parser
 
 
-def set_input_tensor(interpreter, image):
-  #Sets the input tensor.
-  tensor_index = interpreter.get_input_details()[0]['index']
-  input_tensor = interpreter.tensor(tensor_index)()[0]
-  input_tensor[:, :] = image
+def run(args: argparse.Namespace) -> None:
+    cv2 = require_cv2()
+    Image = require_pil_image()
+
+    data_dir = resolve_data_dir(args.data_dir)
+    person_dir = data_dir / str(args.person)
+    png_dir = person_dir / "png"
+    npy_dir = person_dir / "npy"
+
+    if person_dir.exists():
+        if not args.overwrite:
+            raise FaceRecognitionError(
+                f"{person_dir} already exists. Pass --overwrite to replace that person's scan data."
+            )
+        shutil.rmtree(person_dir)
+
+    png_dir.mkdir(parents=True)
+    npy_dir.mkdir(parents=True)
+
+    labels = load_labels()
+    interpreter = create_detection_interpreter(args.edge_tpu)
+    input_width, input_height = input_size(interpreter)
+
+    cap = cv2.VideoCapture(args.camera_index)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.camera_width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.camera_height)
+    cap.set(cv2.CAP_PROP_FPS, args.fps)
+
+    if not cap.isOpened():
+        raise FaceRecognitionError(f"Could not open camera index {args.camera_index}.")
+
+    saved = 0
+    print(f"Saving scans to {person_dir}")
+    print("Press q to stop.")
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                raise FaceRecognitionError("Failed to grab frame from camera.")
+
+            frame_height, frame_width = frame.shape[:2]
+            image_rgb = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            detection_image = image_rgb.convert("RGB").resize(
+                (input_width, input_height), Image.LANCZOS
+            )
+
+            detections = detect_faces(
+                interpreter,
+                detection_image,
+                args.threshold,
+                frame_width,
+                frame_height,
+            )
+            annotate_detections(frame, detections, labels, cv2)
+
+            detection = best_detection(detections)
+            if detection is not None:
+                crop = crop_face_rgb(np.asarray(image_rgb), detection)
+                if crop is not None:
+                    Image.fromarray(crop).save(png_dir / f"img_{saved}.png")
+                    np.save(npy_dir / f"img_{saved}.npy", crop)
+                    saved += 1
+                    print(f"saved crop {saved}: score={detection.score:.2f}")
+
+            cv2.imshow("Face Enrollment", frame)
+
+            if args.max_images and saved >= args.max_images:
+                break
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
 
 
-def get_output_tensor(interpreter, index):
-  #Returns the output tensor at the given index.
-  output_details = interpreter.get_output_details()[index]
-  tensor = np.squeeze(interpreter.get_tensor(output_details['index']))
-  return tensor
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if should_delegate_edge_tpu(args.edge_tpu):
+        return reexec_module_with_coral_python(
+            "vision.face_recognition.scan_people", argv or sys.argv[1:]
+        )
+    try:
+        run(args)
+    except FaceRecognitionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
-def detect_objects(interpreter, image, threshold):
-  #Returns a list of detection results, each a dictionary of object info.
-  set_input_tensor(interpreter, image)
-  interpreter.invoke()
-
-  # Get all output details
-  boxes = get_output_tensor(interpreter, 0)
-  classes = get_output_tensor(interpreter, 1)
-  scores = get_output_tensor(interpreter, 2)
-  count = int(get_output_tensor(interpreter, 3))
-
-  results = []
-  for i in range(count):
-    if scores[i] >= threshold:
-      result = {
-          'bounding_box': boxes[i],
-          'class_id': classes[i],
-          'score': scores[i]
-      }
-      results.append(result)
-  return results
-
-def get_best_box_param(results,CAMERA_WIDTH, CAMERA_HEIGHT):
-    #Returns the box parameters for the box with the highest score
-    best_boxvalue = 0
-    xmin = 0
-    xmax = 1
-    ymin = 0
-    ymax = 1
-    for obj in results:
-        if obj['score'] > best_boxvalue:
-            best_boxvalue = obj['score']
-            ymin, xmin, ymax, xmax = obj['bounding_box']
-            if xmin < 0:
-                xmin = 0
-            if xmax > 1:
-                xmax = 1
-            if ymin < 0:
-                ymin = 0
-            if ymax > 1:
-                ymax = 1
-            xmin = int(xmin * CAMERA_WIDTH)
-            xmax = int(xmax * CAMERA_WIDTH)
-            ymin = int(ymin * CAMERA_HEIGHT)
-            ymax = int(ymax * CAMERA_HEIGHT)
-    #print("score: ", best_boxvalue)
-    return ymin, xmin, ymax, xmax, best_boxvalue
-
-
-def annotate_objects(frame, results, labels, CAMERA_WIDTH, CAMERA_HEIGHT):
-    for obj in results:
-        ymin, xmin, ymax, xmax = obj['bounding_box']
-        xmin = int(xmin * CAMERA_WIDTH)
-        xmax = int(xmax * CAMERA_WIDTH)
-        ymin = int(ymin * CAMERA_HEIGHT)
-        ymax = int(ymax * CAMERA_HEIGHT)
-
-        cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
-        cv2.putText(frame, '%s %.2f' % (labels[obj['class_id']], obj['score']),
-                    (xmin, ymin - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-
-
-if __name__ == '__main__':
-  main()
-
+if __name__ == "__main__":
+    raise SystemExit(main())

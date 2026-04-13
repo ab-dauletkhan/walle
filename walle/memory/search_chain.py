@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Optional, List, Dict
+from typing import Dict, List, Optional
 
 _log = logging.getLogger("walle.search")
 
@@ -19,6 +19,7 @@ _log = logging.getLogger("walle.search")
 def _connect_db(db_path: str):
     """Import-free re-use of the project's WAL-mode SQLite opener."""
     import sqlite3
+
     conn = sqlite3.connect(db_path, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
@@ -34,9 +35,14 @@ class SearchHandler(ABC):
         self._next = next_handler
 
     @abstractmethod
-    def search(self, query: Optional[str], limit: int, db_path: str,
-               table: str = "recall_memory", **ctx) -> Optional[List[Dict]]:
-        ...
+    def search(
+        self,
+        query: Optional[str],
+        limit: int,
+        db_path: str,
+        table: str = "recall_memory",
+        **ctx,
+    ) -> Optional[List[Dict]]: ...
 
     def _try_next(self, query, limit, db_path, table, **ctx):
         if self._next is not None:
@@ -50,15 +56,22 @@ class SearchHandler(ABC):
 class FAISSSearchHandler(SearchHandler):
     """Semantic search via FAISS index. Falls through if FAISS unavailable or no results."""
 
-    def __init__(self, faiss_manager, get_embedding_fn, use_semantic: bool = False,
-                 next_handler: Optional[SearchHandler] = None):
+    def __init__(
+        self,
+        faiss_manager,
+        get_embedding_fn,
+        use_semantic: bool = False,
+        next_handler: Optional[SearchHandler] = None,
+    ):
         super().__init__(next_handler)
         self._faiss = faiss_manager
         self._get_embedding = get_embedding_fn
         self._use_semantic = use_semantic
 
     def search(self, query, limit, db_path, table="recall_memory", **ctx):
-        if not (self._use_semantic and query and self._faiss and self._faiss.is_available):
+        if not (
+            self._use_semantic and query and self._faiss and self._faiss.is_available
+        ):
             return self._try_next(query, limit, db_path, table, **ctx)
 
         q_emb = self._get_embedding(query)
@@ -88,7 +101,14 @@ class FAISSSearchHandler(SearchHandler):
             for row_id, score in faiss_results:
                 if row_id in row_map:
                     r = row_map[row_id]
-                    results.append({"role": r[2], "content": r[3], "timestamp": r[1], "score": round(score, 4)})
+                    results.append(
+                        {
+                            "role": r[2],
+                            "content": r[3],
+                            "timestamp": r[1],
+                            "score": round(score, 4),
+                        }
+                    )
             return results
         else:
             # Archival — return raw tuples for importance decay processing
@@ -112,7 +132,7 @@ class FTS5SearchHandler(SearchHandler):
                 # Check FTS table exists
                 exists = conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                    (fts_table,)
+                    (fts_table,),
                 ).fetchone()
                 if not exists:
                     return self._try_next(query, limit, db_path, table, **ctx)
@@ -131,10 +151,13 @@ class FTS5SearchHandler(SearchHandler):
                             WHERE {fts_table} MATCH ?
                             ORDER BY fts.rank
                             LIMIT ?""",
-                        (safe_query, limit)
+                        (safe_query, limit),
                     ).fetchall()
                     if rows:
-                        return [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in rows]
+                        return [
+                            {"role": r[0], "content": r[1], "timestamp": r[2]}
+                            for r in rows
+                        ]
                 else:
                     rows = conn.execute(
                         f"""SELECT am.id, am.category, am.content, am.importance, am.timestamp
@@ -143,7 +166,7 @@ class FTS5SearchHandler(SearchHandler):
                             WHERE {fts_table} MATCH ?
                             ORDER BY fts.rank
                             LIMIT ?""",
-                        (safe_query, limit)
+                        (safe_query, limit),
                     ).fetchall()
                     if rows:
                         return ctx.get("format_archival", lambda r: r)(rows)
@@ -179,25 +202,27 @@ class RecentSearchHandler(SearchHandler):
                 if query:
                     rows = conn.execute(
                         f"SELECT role, content, timestamp FROM {table} WHERE content LIKE ? ORDER BY timestamp DESC LIMIT ?",
-                        (f"%{query}%", limit)
+                        (f"%{query}%", limit),
                     ).fetchall()
                 else:
                     rows = conn.execute(
                         f"SELECT role, content, timestamp FROM {table} ORDER BY timestamp DESC LIMIT ?",
-                        (limit,)
+                        (limit,),
                     ).fetchall()
-                return [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in rows]
+                return [
+                    {"role": r[0], "content": r[1], "timestamp": r[2]} for r in rows
+                ]
             else:
                 fetch_limit = limit * 3
                 if query:
                     rows = conn.execute(
                         f"SELECT id, category, content, importance, timestamp FROM {table} WHERE content LIKE ? ORDER BY importance DESC LIMIT ?",
-                        (f"%{query}%", fetch_limit)
+                        (f"%{query}%", fetch_limit),
                     ).fetchall()
                 else:
                     rows = conn.execute(
                         f"SELECT id, category, content, importance, timestamp FROM {table} ORDER BY importance DESC LIMIT ?",
-                        (fetch_limit,)
+                        (fetch_limit,),
                     ).fetchall()
                 if not rows:
                     return []
@@ -230,7 +255,7 @@ def insert_fts5(db_path: str, table: str, row_id: int, content: str) -> None:
         with _connect_db(db_path) as conn:
             conn.execute(
                 f"INSERT OR REPLACE INTO {fts_table}(rowid, content) VALUES (?, ?)",
-                (row_id, content)
+                (row_id, content),
             )
     except Exception:
         pass  # FTS table may not exist yet; gracefully skip
