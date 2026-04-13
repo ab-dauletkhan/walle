@@ -14,6 +14,12 @@ The `vision-coral` extra installs Python dependencies where wheels are
 available. Real Edge TPU runs also need the native Coral runtime that provides
 `libedgetpu.so.1.0` on the Jetson/Linux host.
 
+Jetson users should also install a Jetson-compatible `tflite-runtime`
+separately instead of relying on `uv` to choose one automatically. On this
+project's earlier working Jetson setup, the Coral stack used
+`tflite-runtime==2.5.0.post1`, while `2.14.0` caused the Edge TPU face detector
+to segfault during interpreter creation.
+
 Use `--no-edge-tpu` to run the non-TPU TFLite models.
 
 ## Enroll a Person

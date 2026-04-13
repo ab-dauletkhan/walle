@@ -45,7 +45,8 @@ vision-cpu = [
 vision-coral = [
     "opencv-python>=4.8",
     "pillow>=10.0",
-    "tflite-runtime==2.14.0; sys_platform == 'linux' and python_version >= '3.10' and python_version < '3.12'",
+    # tflite-runtime must match the target's Coral/Jetson stack.
+    # Install a known-good version on-device instead of forcing one here.
 ]
 
 # Voice — STT + TTS
