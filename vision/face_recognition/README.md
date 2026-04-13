@@ -8,17 +8,19 @@ virtual environment inside this folder.
 
 ```bash
 uv sync --extra vision-coral
+scripts/setup_jetson_coral39.sh
+export WALLE_CORAL_PYTHON39="$PWD/.venv-coral39/bin/python"
 ```
 
-The `vision-coral` extra installs Python dependencies where wheels are
-available. Real Edge TPU runs also need the native Coral runtime that provides
-`libedgetpu.so.1.0` on the Jetson/Linux host.
+The main WALL-E app stays on the project Python runtime. Edge TPU commands are
+re-executed through a dedicated Python 3.9 Coral environment configured via
+`WALLE_CORAL_PYTHON39`. Real Edge TPU runs also need the native Coral runtime
+that provides `libedgetpu.so.1.0` on the Jetson/Linux host.
 
-Jetson users should also install a Jetson-compatible `tflite-runtime`
-separately instead of relying on `uv` to choose one automatically. On this
-project's earlier working Jetson setup, the Coral stack used
-`tflite-runtime==2.5.0.post1`, while `2.14.0` caused the Edge TPU face detector
-to segfault during interpreter creation.
+Jetson users must install a Jetson-compatible `tflite-runtime` into that Python
+3.9 Coral environment. The helper script installs the Python packages it can,
+then verifies `tflite_runtime`; if the runtime is still missing, provide a
+known-good wheel with `WALLE_CORAL_TFLITE_WHEEL=/path/to/wheel.whl`.
 
 Use `--no-edge-tpu` to run the non-TPU TFLite models.
 

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+VENV_PATH="${WALLE_CORAL_VENV:-$PROJECT_ROOT/.venv-coral39}"
+PYTHON_BIN="${WALLE_CORAL_PYTHON39:-python3.9}"
+REQ_FILE="$PROJECT_ROOT/vision/face_recognition/requirements-coral39.txt"
+
+echo "=== Coral Python 3.9 setup ==="
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    echo "ERROR: Python 3.9 interpreter not found: $PYTHON_BIN"
+    exit 1
+fi
+
+echo "Using Python: $(command -v "$PYTHON_BIN")"
+"$PYTHON_BIN" -m venv "$VENV_PATH"
+
+source "$VENV_PATH/bin/activate"
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r "$REQ_FILE"
+
+if [[ -n "${WALLE_CORAL_TFLITE_WHEEL:-}" ]]; then
+    python -m pip install "$WALLE_CORAL_TFLITE_WHEEL"
+fi
+
+python - <<'PY'
+import sys
+
+print("Python:", sys.version)
+try:
+    import tflite_runtime  # noqa: F401
+    print("tflite_runtime: OK")
+except Exception as exc:  # pragma: no cover - setup script only
+    raise SystemExit(
+        "ERROR: tflite_runtime is not available in the Coral Python 3.9 environment. "
+        "Install a known-good Jetson wheel or set WALLE_CORAL_TFLITE_WHEEL.\n"
+        f"Original error: {exc}"
+    )
+PY
+
+echo ""
+echo "Coral runtime ready."
+echo "Set:"
+echo "  export WALLE_CORAL_PYTHON39=\"$VENV_PATH/bin/python\""

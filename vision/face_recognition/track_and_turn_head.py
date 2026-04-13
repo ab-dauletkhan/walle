@@ -24,6 +24,7 @@ from .common import (
     require_pil_image,
     resolve_data_dir,
 )
+from .coral_runtime import reexec_module_with_coral_python, should_delegate_edge_tpu
 
 DEFAULT_CAMERA_WIDTH = 640
 DEFAULT_CAMERA_HEIGHT = 480
@@ -469,6 +470,10 @@ def run(args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if should_delegate_edge_tpu(args.edge_tpu):
+        return reexec_module_with_coral_python(
+            "vision.face_recognition.track_and_turn_head", argv or sys.argv[1:]
+        )
     try:
         run(args)
     except FaceRecognitionError as exc:

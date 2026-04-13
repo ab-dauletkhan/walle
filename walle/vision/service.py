@@ -26,6 +26,10 @@ from vision.face_recognition.common import (
     recognize_detection,
     require_pil_image,
 )
+from vision.face_recognition.coral_runtime import (
+    CoralWorkerClient,
+    running_on_python39_or_lower,
+)
 
 from walle.memory.config import conf
 from walle.memory.context_manager import ContextManager, VisualContext
@@ -135,6 +139,45 @@ class CoralVisionBackend(VisionBackend):
 
     def close(self):
         pass
+
+
+class SubprocessCoralVisionBackend(VisionBackend):
+    """Face detection + recognition using a Python 3.9 Coral worker."""
+
+    def __init__(self):
+        self._worker = CoralWorkerClient(timeout_ms=conf.VISION_CORAL_WORKER_TIMEOUT_MS)
+        self._restarts = 0
+        _log.info("Coral subprocess backend initialized")
+
+    def _restart_worker(self):
+        self._worker.close()
+        self._worker = CoralWorkerClient(timeout_ms=conf.VISION_CORAL_WORKER_TIMEOUT_MS)
+        self._restarts += 1
+
+    def process_frame(self, frame: np.ndarray) -> List[Dict]:
+        import cv2
+
+        success, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if not success:
+            raise RuntimeError("Failed to encode frame for Coral worker.")
+
+        payload = {
+            "op": "detect_recognize",
+            "frame_jpeg_base64": base64.b64encode(buf.tobytes()).decode("ascii"),
+        }
+
+        try:
+            response = self._worker.request(payload)
+        except Exception:
+            if self._restarts >= conf.VISION_CORAL_WORKER_MAX_RESTARTS:
+                raise
+            self._restart_worker()
+            response = self._worker.request(payload)
+
+        return response.get("faces", [])
+
+    def close(self) -> None:
+        self._worker.close()
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +319,10 @@ class VisionBackendRegistry:
 def build_default_vision_registry() -> VisionBackendRegistry:
     """Default priority: Coral TPU → CPU (YOLO + InsightFace)."""
     registry = VisionBackendRegistry()
-    registry.register("coral", CoralVisionBackend)
+    if conf.VISION_CORAL_ENABLED:
+        registry.register("coral-subprocess", SubprocessCoralVisionBackend)
+    if running_on_python39_or_lower():
+        registry.register("coral-local", CoralVisionBackend)
     registry.register("cpu", CPUVisionBackend)
     return registry
 

@@ -65,6 +65,9 @@ class Config:
     VISION_CPU_FACE_MATCH_THRESHOLD: float = 0.6  # Cosine similarity for CPU backend
     VISION_DETECTOR_EDGE_TPU: bool = True
     VISION_EMBEDDER_EDGE_TPU: bool = _default_vision_embedder_edge_tpu()
+    VISION_CORAL_ENABLED: bool = True
+    VISION_CORAL_WORKER_TIMEOUT_MS: int = 5000
+    VISION_CORAL_WORKER_MAX_RESTARTS: int = 3
 
     # --- STT / Voice Thresholds ---
     INTENT_MATCH_THRESHOLD: float = 0.65  # Semantic intent recognition

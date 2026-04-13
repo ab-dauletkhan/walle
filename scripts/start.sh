@@ -13,6 +13,7 @@ OLLAMA_MODEL="${OLLAMA_MODEL:-qwen2.5:3b}"
 MIMIC3_URL="${MIMIC3_URL:-http://localhost:59125}"
 UV_EXTRAS="${UV_EXTRAS:---extra jetson}"
 WALLE_ARGS="${WALLE_ARGS:-}"
+CORAL39_PY="${WALLE_CORAL_PYTHON39:-$PROJECT_ROOT/.venv-coral39/bin/python}"
 
 # Collect PIDs of services we start so we can clean up
 CHILD_PIDS=()
@@ -83,6 +84,10 @@ fi
 echo "  Sync args: $UV_EXTRAS"
 uv sync $UV_EXTRAS
 echo "  Python: $(uv run $UV_EXTRAS python --version 2>&1)"
+if [[ -x "$CORAL39_PY" ]]; then
+    export WALLE_CORAL_PYTHON39="$CORAL39_PY"
+    echo "  Coral worker: $WALLE_CORAL_PYTHON39"
+fi
 
 # ---------- 4. Launch WALL-E ----------
 echo ""

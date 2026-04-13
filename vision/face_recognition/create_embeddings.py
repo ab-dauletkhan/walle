@@ -12,6 +12,7 @@ from .common import (
     image_to_embedding,
     resolve_data_dir,
 )
+from .coral_runtime import reexec_module_with_coral_python, should_delegate_edge_tpu
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,6 +69,10 @@ def run(args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if should_delegate_edge_tpu(args.edge_tpu):
+        return reexec_module_with_coral_python(
+            "vision.face_recognition.create_embeddings", argv or sys.argv[1:]
+        )
     try:
         run(args)
     except FaceRecognitionError as exc:

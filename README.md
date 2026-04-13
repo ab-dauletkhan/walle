@@ -350,10 +350,10 @@ Use `--no-edge-tpu` to run the non-TPU TFLite models with the same data layout.
 On Linux ARM boards such as Jetson, live recognition defaults to
 `detector=Edge TPU` and `embedder=CPU`; use
 `--detector-edge-tpu` / `--embedder-edge-tpu` to override that split.
-Jetson users should install a known-good `tflite-runtime` manually for their
-device instead of relying on the Python extra to pin one. A previous working
-Jetson environment for this project used `tflite-runtime==2.5.0.post1`;
-forcing `2.14.0` caused the Edge TPU face detector to segfault.
+Jetson Coral now runs through a separate Python 3.9 worker environment. Set it
+up with `scripts/setup_jetson_coral39.sh`, then export
+`WALLE_CORAL_PYTHON39="$PWD/.venv-coral39/bin/python"` before using `--edge-tpu`
+commands or starting the main app with vision enabled.
 
 **Storage:**
 ```
