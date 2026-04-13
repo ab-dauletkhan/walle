@@ -18,6 +18,7 @@ from .common import (
     input_size,
     load_labels,
     load_people_embeddings,
+    recommended_live_edge_tpu_modes,
     recognize_detection,
     require_cv2,
     require_pil_image,
@@ -248,7 +249,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--edge-tpu",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use the Edge TPU models and libedgetpu delegate.",
+        help="Use Edge TPU acceleration for live tracking. On Linux ARM, defaults to TPU detector + CPU embedder.",
+    )
+    parser.add_argument(
+        "--detector-edge-tpu",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override Edge TPU usage for the face detector.",
+    )
+    parser.add_argument(
+        "--embedder-edge-tpu",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override Edge TPU usage for the face embedding model.",
     )
     parser.add_argument(
         "--data-dir",
@@ -290,8 +303,22 @@ def run(args: argparse.Namespace) -> None:
             f"WARNING: no embeddings found under {data_dir}; tracking will run without person names."
         )
 
-    detection_interpreter = create_detection_interpreter(args.edge_tpu)
-    embedding_interpreter = create_embedding_interpreter(args.edge_tpu)
+    default_detector_edge_tpu, default_embedder_edge_tpu = (
+        recommended_live_edge_tpu_modes(args.edge_tpu)
+    )
+    detector_edge_tpu = (
+        default_detector_edge_tpu
+        if args.detector_edge_tpu is None
+        else args.detector_edge_tpu
+    )
+    embedder_edge_tpu = (
+        default_embedder_edge_tpu
+        if args.embedder_edge_tpu is None
+        else args.embedder_edge_tpu
+    )
+
+    detection_interpreter = create_detection_interpreter(detector_edge_tpu)
+    embedding_interpreter = create_embedding_interpreter(embedder_edge_tpu)
     input_width, input_height = input_size(detection_interpreter)
 
     cap = open_camera(cv2, args.camera_index)
@@ -305,6 +332,11 @@ def run(args: argparse.Namespace) -> None:
         raise FaceRecognitionError(f"Could not open camera index {args.camera_index}.")
 
     head = HeadController(args.serial_port, args.serial_baud)
+    print(
+        "Runtime: "
+        f"detector={'Edge TPU' if detector_edge_tpu else 'CPU'}, "
+        f"embedder={'Edge TPU' if embedder_edge_tpu else 'CPU'}"
+    )
     print("Press q to stop.")
 
     try:

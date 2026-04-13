@@ -47,6 +47,12 @@ uv run walle-face-recognize --edge-tpu
 uv run walle-face-track-head --edge-tpu --serial-port /dev/ttyCH341USB0
 ```
 
+On Linux ARM boards such as Jetson, the live commands above default to `detector=Edge TPU`
+and `embedder=CPU` to avoid instability when loading both live models through the
+Edge TPU delegate in one process. You can override either side explicitly with
+`--detector-edge-tpu` / `--no-detector-edge-tpu` and
+`--embedder-edge-tpu` / `--no-embedder-edge-tpu`.
+
 All commands support `--help` without requiring a camera, TFLite runtime, or
 Coral hardware to be present.
 

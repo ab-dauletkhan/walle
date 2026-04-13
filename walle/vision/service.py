@@ -60,10 +60,14 @@ class CoralVisionBackend(VisionBackend):
     def __init__(self):
         self._Image = require_pil_image()
 
-        self._det_interpreter = create_detection_interpreter(edge_tpu=True)
+        self._det_interpreter = create_detection_interpreter(
+            edge_tpu=conf.VISION_DETECTOR_EDGE_TPU
+        )
         self._input_w, self._input_h = input_size(self._det_interpreter)
 
-        self._emb_interpreter = create_embedding_interpreter(edge_tpu=True)
+        self._emb_interpreter = create_embedding_interpreter(
+            edge_tpu=conf.VISION_EMBEDDER_EDGE_TPU
+        )
         self._people_labels = load_labels(PEOPLE_LABELS_PATH)
         self._people_embeddings = load_people_embeddings(
             DEFAULT_DATA_DIR, required=False
@@ -74,7 +78,11 @@ class CoralVisionBackend(VisionBackend):
                 DEFAULT_DATA_DIR,
             )
 
-        _log.info("Coral TPU backend initialized")
+        _log.info(
+            "Coral TPU backend initialized (detector=%s, embedder=%s)",
+            "Edge TPU" if conf.VISION_DETECTOR_EDGE_TPU else "CPU",
+            "Edge TPU" if conf.VISION_EMBEDDER_EDGE_TPU else "CPU",
+        )
 
     def _detect_faces(self, image_pil):
         """Run face detection, return list of (ymin, xmin, ymax, xmax, score) in pixel coords."""

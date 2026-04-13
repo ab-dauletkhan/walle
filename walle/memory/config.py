@@ -1,5 +1,6 @@
 import logging
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,11 @@ _PROJECT_ROOT: str = os.path.dirname(
 )
 # Data directory for runtime files (databases, indices, personality)
 MEMORY_DIR: str = os.path.join(_PROJECT_ROOT, "data")
+
+
+def _default_vision_embedder_edge_tpu() -> bool:
+    machine = platform.machine().lower()
+    return not (platform.system() == "Linux" and machine in {"aarch64", "arm64"})
 
 
 @dataclass
@@ -57,6 +63,8 @@ class Config:
     )
     VISION_FACE_MATCH_THRESHOLD: float = 0.5  # Cosine similarity for Coral backend
     VISION_CPU_FACE_MATCH_THRESHOLD: float = 0.6  # Cosine similarity for CPU backend
+    VISION_DETECTOR_EDGE_TPU: bool = True
+    VISION_EMBEDDER_EDGE_TPU: bool = _default_vision_embedder_edge_tpu()
 
     # --- STT / Voice Thresholds ---
     INTENT_MATCH_THRESHOLD: float = 0.65  # Semantic intent recognition

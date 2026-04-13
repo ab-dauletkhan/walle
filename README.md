@@ -347,6 +347,9 @@ uv run walle-face-recognize --edge-tpu
 ```
 
 Use `--no-edge-tpu` to run the non-TPU TFLite models with the same data layout.
+On Linux ARM boards such as Jetson, live recognition defaults to
+`detector=Edge TPU` and `embedder=CPU`; use
+`--detector-edge-tpu` / `--embedder-edge-tpu` to override that split.
 
 **Storage:**
 ```

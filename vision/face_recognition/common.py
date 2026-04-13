@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import platform
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -126,6 +127,19 @@ def create_embedding_interpreter(edge_tpu: bool):
     interpreter = create_interpreter(embedding_model_path(edge_tpu), edge_tpu)
     interpreter.allocate_tensors()
     return interpreter
+
+
+def running_on_linux_arm() -> bool:
+    machine = platform.machine().lower()
+    return machine in {"aarch64", "arm64"} and platform.system() == "Linux"
+
+
+def recommended_live_edge_tpu_modes(edge_tpu: bool) -> tuple[bool, bool]:
+    if not edge_tpu:
+        return False, False
+    if running_on_linux_arm():
+        return True, False
+    return True, True
 
 
 def input_size(interpreter) -> tuple[int, int]:
