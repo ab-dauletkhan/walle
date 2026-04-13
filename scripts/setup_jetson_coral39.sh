@@ -6,6 +6,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_PATH="${WALLE_CORAL_VENV:-$PROJECT_ROOT/.venv-coral39}"
 PYTHON_BIN="${WALLE_CORAL_PYTHON39:-python3.9}"
 REQ_FILE="$PROJECT_ROOT/vision/face_recognition/requirements-coral39.txt"
+TFLITE_DEB="${WALLE_CORAL_TFLITE_DEB:-}"
 
 echo "=== Coral Python 3.9 setup ==="
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
@@ -22,6 +23,21 @@ python -m pip install -r "$REQ_FILE"
 
 if [[ -n "${WALLE_CORAL_TFLITE_WHEEL:-}" ]]; then
     python -m pip install "$WALLE_CORAL_TFLITE_WHEEL"
+fi
+
+if [[ -n "$TFLITE_DEB" ]]; then
+    if [[ ! -f "$TFLITE_DEB" ]]; then
+        echo "ERROR: WALLE_CORAL_TFLITE_DEB does not exist: $TFLITE_DEB"
+        exit 1
+    fi
+
+    TMP_DIR="$(mktemp -d)"
+    dpkg-deb -x "$TFLITE_DEB" "$TMP_DIR"
+    SITE_PACKAGES="$VENV_PATH/lib/python3.9/site-packages"
+    mkdir -p "$SITE_PACKAGES"
+    cp -R "$TMP_DIR/usr/lib/python3/dist-packages/tflite_runtime" "$SITE_PACKAGES/"
+    cp -R "$TMP_DIR/usr/lib/python3/dist-packages"/tflite_runtime-*.egg-info "$SITE_PACKAGES/"
+    rm -rf "$TMP_DIR"
 fi
 
 python - <<'PY'
