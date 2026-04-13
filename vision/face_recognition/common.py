@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import platform
 import re
 from dataclasses import dataclass
@@ -62,7 +63,7 @@ def ensure_file(path: Path, description: str) -> Path:
 
 def require_cv2():
     try:
-        import cv2
+        cv2 = importlib.import_module("cv2")
     except ImportError as exc:
         raise FaceRecognitionError(
             "OpenCV is not installed. Run `uv sync --extra vision-coral` "
@@ -73,7 +74,7 @@ def require_cv2():
 
 def require_pil_image():
     try:
-        from PIL import Image
+        Image = importlib.import_module("PIL.Image")
     except ImportError as exc:
         raise FaceRecognitionError(
             "Pillow is not installed. Run `uv sync --extra vision-coral` "

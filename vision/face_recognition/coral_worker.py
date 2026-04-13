@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import importlib
 import json
 import sys
 
-import cv2
 import numpy as np
-from PIL import Image
 
 from .common import (
     DEFAULT_DATA_DIR,
@@ -24,6 +23,8 @@ from .common import (
 
 class CoralRecognizer:
     def __init__(self):
+        self._cv2 = importlib.import_module("cv2")
+        self._Image = importlib.import_module("PIL.Image")
         self._detector = create_detection_interpreter(edge_tpu=True)
         self._embedder = create_embedding_interpreter(edge_tpu=True)
         self._input_width, self._input_height = input_size(self._detector)
@@ -33,10 +34,12 @@ class CoralRecognizer:
         )
 
     def detect_and_recognize(self, frame_bgr: np.ndarray) -> list[dict]:
-        image_rgb = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+        image_rgb = self._Image.fromarray(
+            self._cv2.cvtColor(frame_bgr, self._cv2.COLOR_BGR2RGB)
+        )
         frame_height, frame_width = frame_bgr.shape[:2]
         detection_image = image_rgb.convert("RGB").resize(
-            (self._input_width, self._input_height), Image.LANCZOS
+            (self._input_width, self._input_height), self._Image.LANCZOS
         )
 
         detections = detect_faces(
@@ -81,6 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def decode_frame(payload: dict) -> np.ndarray:
+    cv2 = importlib.import_module("cv2")
     encoded = payload["frame_jpeg_base64"]
     data = base64.b64decode(encoded)
     array = np.frombuffer(data, dtype=np.uint8)
