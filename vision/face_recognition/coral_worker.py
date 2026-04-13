@@ -5,6 +5,7 @@ import base64
 import importlib
 import json
 import sys
+from typing import Any
 
 import numpy as np
 
@@ -23,8 +24,8 @@ from .common import (
 
 class CoralRecognizer:
     def __init__(self):
-        self._cv2 = importlib.import_module("cv2")
-        self._Image = importlib.import_module("PIL.Image")
+        self._cv2: Any = importlib.import_module("cv2")
+        self._Image: Any = importlib.import_module("PIL.Image")
         self._detector = create_detection_interpreter(edge_tpu=True)
         self._embedder = create_embedding_interpreter(edge_tpu=True)
         self._input_width, self._input_height = input_size(self._detector)
