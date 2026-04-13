@@ -28,7 +28,9 @@ class CoralRecognizer:
         self._embedder = create_embedding_interpreter(edge_tpu=True)
         self._input_width, self._input_height = input_size(self._detector)
         self._people_labels = load_labels(PEOPLE_LABELS_PATH)
-        self._people_embeddings = load_people_embeddings(DEFAULT_DATA_DIR, required=False)
+        self._people_embeddings = load_people_embeddings(
+            DEFAULT_DATA_DIR, required=False
+        )
 
     def detect_and_recognize(self, frame_bgr: np.ndarray) -> list[dict]:
         image_rgb = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))

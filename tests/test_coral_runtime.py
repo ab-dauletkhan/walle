@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from vision.face_recognition import coral_runtime
 from walle.vision import service
 
@@ -15,9 +13,7 @@ def test_resolve_coral_python_prefers_explicit_env(monkeypatch, tmp_path):
 
 
 def test_should_delegate_edge_tpu_respects_local_flag(monkeypatch):
-    monkeypatch.setattr(
-        coral_runtime, "running_on_python39_or_lower", lambda: False
-    )
+    monkeypatch.setattr(coral_runtime, "running_on_python39_or_lower", lambda: False)
     monkeypatch.setenv(coral_runtime.LOCAL_ENV_FLAG, "1")
 
     assert coral_runtime.should_delegate_edge_tpu(True) is False
