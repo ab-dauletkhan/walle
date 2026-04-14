@@ -93,15 +93,9 @@ class Block:
         return False, f"New content too large ({len(new_value)} > {self.limit})"
 
     def compile(self) -> str:
-        readonly_tag = " [READ-ONLY]" if self.read_only else ""
-        return (
-            f"<{self.label}{readonly_tag}>\n"
-            f"<description>{self.description}</description>\n"
-            f"<metadata>chars={self.chars_current}/{self.limit}, "
-            f"modified={self.metadata.get('last_modified')}</metadata>\n"
-            f"<value>\n{self.value}\n</value>\n"
-            f"</{self.label}>"
-        )
+        # Omit description and metadata — they add tokens and the
+        # `modified` timestamp invalidates prefix cache on every write.
+        return f"<{self.label}>\n{self.value}\n</{self.label}>"
 
 
 @dataclass

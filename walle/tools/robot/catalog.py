@@ -244,87 +244,20 @@ class RobotToolRegistry:
         return action.execute(runtime, args)
 
 
+_DRIVE_PARAMS = {
+    "speed": {"type": "integer", "minimum": 10, "maximum": 100},
+    "duration_ms": {"type": "integer", "minimum": 100, "maximum": 5000},
+}
+
+
 def build_default_robot_registry() -> RobotToolRegistry:
     return RobotToolRegistry(
         [
-            # --- Servo position tools ---
-            SetPositionAction(
-                RobotToolSpec(
-                    "set_head_rotation",
-                    "Call when the user asks to look left/right or face a direction. "
-                    "Sets head rotation angle. Returns confirmation with final position.",
-                    {
-                        "position": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": 100,
-                            "description": "Head angle: 0=full left, 50=center, 100=full right. Example: 25=slightly left.",
-                        }
-                    },
-                    ("position",),
-                ),
-                command_prefix="G",
-                label="Head",
-            ),
-            CoordinatedNeckAction(
-                RobotToolSpec(
-                    "set_neck_position",
-                    "Call when the user asks to look up/down or nod. "
-                    "Sets neck tilt angle. Returns confirmation with final position.",
-                    {
-                        "position": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": 100,
-                            "description": "Neck tilt: 0=looking down, 50=level, 100=looking up. Example: 80=looking up.",
-                        }
-                    },
-                    ("position",),
-                )
-            ),
-            SetBothArmsAction(
-                RobotToolSpec(
-                    "set_both_arms",
-                    "Call when the user asks to raise/lower arms or make a gesture. "
-                    "Sets both arm positions independently. Returns confirmation.",
-                    {
-                        "left": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": 100,
-                            "description": "Left arm: 0=fully lowered, 50=horizontal, 100=fully raised.",
-                        },
-                        "right": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": 100,
-                            "description": "Right arm: 0=fully lowered, 50=horizontal, 100=fully raised.",
-                        },
-                    },
-                    ("left", "right"),
-                )
-            ),
-            # --- Timed movement tools ---
             TimedAxisAction(
                 RobotToolSpec(
                     "drive_forward",
-                    "Call when the user asks to move forward or approach something. "
-                    "Drives forward for the specified duration then stops automatically. "
-                    "Returns distance estimate. Reference: speed=50 for 1000ms covers ~30cm.",
-                    {
-                        "speed": {
-                            "type": "integer",
-                            "minimum": 10,
-                            "maximum": 100,
-                            "description": "Motor power in percent. 30=slow, 50=normal, 80=fast.",
-                        },
-                        "duration_ms": {
-                            "type": "integer",
-                            "minimum": 100,
-                            "maximum": 5000,
-                            "description": "Duration in ms, max 5000 per call. For longer moves, call multiple times. Example: 1000=1s.",
-                        },
-                    },
+                    "Drive forward. speed 10-100, duration_ms max 5000.",
+                    _DRIVE_PARAMS,
                     ("speed", "duration_ms"),
                 ),
                 axis="Y",
@@ -334,23 +267,8 @@ def build_default_robot_registry() -> RobotToolRegistry:
             TimedAxisAction(
                 RobotToolSpec(
                     "drive_backward",
-                    "Call when the user asks to move backward or retreat. "
-                    "Drives backward for the specified duration then stops automatically. "
-                    "Returns distance estimate. Reference: speed=50 for 1000ms covers ~30cm.",
-                    {
-                        "speed": {
-                            "type": "integer",
-                            "minimum": 10,
-                            "maximum": 100,
-                            "description": "Motor power in percent. 30=slow, 50=normal, 80=fast.",
-                        },
-                        "duration_ms": {
-                            "type": "integer",
-                            "minimum": 100,
-                            "maximum": 5000,
-                            "description": "Duration in ms, max 5000 per call. For longer moves, call multiple times. Example: 1000=1s.",
-                        },
-                    },
+                    "Drive backward. speed 10-100, duration_ms max 5000.",
+                    _DRIVE_PARAMS,
                     ("speed", "duration_ms"),
                 ),
                 axis="Y",
@@ -360,23 +278,8 @@ def build_default_robot_registry() -> RobotToolRegistry:
             TimedAxisAction(
                 RobotToolSpec(
                     "turn_left",
-                    "Call when the user asks to turn/rotate left. "
-                    "Rotates left in place for the specified duration then stops. "
-                    "Returns angle estimate. Reference at speed=50: 500ms=~90°, 1000ms=~180°, 2000ms=~360°.",
-                    {
-                        "speed": {
-                            "type": "integer",
-                            "minimum": 10,
-                            "maximum": 100,
-                            "description": "Motor power in percent. 50=normal turning speed.",
-                        },
-                        "duration_ms": {
-                            "type": "integer",
-                            "minimum": 100,
-                            "maximum": 5000,
-                            "description": "Duration in ms, max 5000 per call. For longer turns, call multiple times. 500=~90°, 1000=~180°, 2000=~360°.",
-                        },
-                    },
+                    "Turn left in place. speed 10-100, duration_ms max 5000 (500ms~=90deg).",
+                    _DRIVE_PARAMS,
                     ("speed", "duration_ms"),
                 ),
                 axis="X",
@@ -386,48 +289,29 @@ def build_default_robot_registry() -> RobotToolRegistry:
             TimedAxisAction(
                 RobotToolSpec(
                     "turn_right",
-                    "Call when the user asks to turn/rotate right. "
-                    "Rotates right in place for the specified duration then stops. "
-                    "Returns angle estimate. Reference at speed=50: 500ms=~90°, 1000ms=~180°, 2000ms=~360°.",
-                    {
-                        "speed": {
-                            "type": "integer",
-                            "minimum": 10,
-                            "maximum": 100,
-                            "description": "Motor power in percent. 50=normal turning speed.",
-                        },
-                        "duration_ms": {
-                            "type": "integer",
-                            "minimum": 100,
-                            "maximum": 5000,
-                            "description": "Duration in ms, max 5000 per call. For longer turns, call multiple times. 500=~90°, 1000=~180°, 2000=~360°.",
-                        },
-                    },
+                    "Turn right in place. speed 10-100, duration_ms max 5000 (500ms~=90deg).",
+                    _DRIVE_PARAMS,
                     ("speed", "duration_ms"),
                 ),
                 axis="X",
                 direction=1,
                 action_label="Turning right",
             ),
-            # --- Instant actions ---
             StopMovementAction(
                 RobotToolSpec(
                     "stop_movement",
-                    "Call to immediately halt all drive motors. Use in emergencies or when the user says stop.",
+                    "Emergency stop all motors.",
                     {},
                 )
             ),
             ExpressEmotionAction(
                 RobotToolSpec(
                     "express_emotion",
-                    "Call when the user asks to show a feeling or when contextually appropriate "
-                    "(e.g. greet with happy, apologize with sad). "
-                    "Sets head, neck, and arm positions to match the emotion.",
+                    "Show emotion via pose. Only call on explicit request.",
                     {
                         "emotion": {
                             "type": "string",
                             "enum": ["happy", "sad", "neutral"],
-                            "description": "happy=head up, arms raised. sad=head down, arms lowered. neutral=relaxed centered pose.",
                         }
                     },
                     ("emotion",),
@@ -436,13 +320,11 @@ def build_default_robot_registry() -> RobotToolRegistry:
             ScanSurroundingsAction(
                 RobotToolSpec(
                     "scan_surroundings",
-                    "Call when the user asks to look around or check the environment. "
-                    "Sweeps head left→center→right→center. Returns completion status.",
+                    "Sweep head left-center-right-center.",
                     {
                         "speed": {
                             "type": "string",
                             "enum": ["slow", "normal", "fast"],
-                            "description": "Pause between positions: slow=1.5s, normal=0.8s, fast=0.4s.",
                         }
                     },
                     ("speed",),
@@ -451,26 +333,21 @@ def build_default_robot_registry() -> RobotToolRegistry:
             WaveHelloAction(
                 RobotToolSpec(
                     "wave_hello",
-                    "Call when the user says hello/hi/greetings or asks the robot to wave. "
-                    "Raises one arm and waves back and forth twice.",
+                    "Wave one arm. Only when user explicitly asks to wave.",
                     {},
                 )
             ),
             ResetToNeutralAction(
                 RobotToolSpec(
                     "reset_to_neutral",
-                    "Call to return all servos (head, neck, arms) to centered resting position. "
-                    "Use after finishing a sequence of movements.",
+                    "Return all servos to neutral rest pose.",
                     {},
                 )
             ),
-            # --- Feedback ---
             GetStatusAction(
                 RobotToolSpec(
                     "get_robot_status",
-                    "Call after movement commands to verify execution completed. "
-                    "Returns current servo positions and motor state (moving/stopped). "
-                    "Use this to confirm the robot finished a maneuver before issuing the next one.",
+                    "Report servo positions and motor state.",
                     {},
                 )
             ),
