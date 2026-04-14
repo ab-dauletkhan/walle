@@ -201,7 +201,10 @@ class RelevantMemoryProvider:
     """
 
     _SCORE_THRESHOLD = 0.35  # cosine distance — lower = more relevant
-    _FETCH_LIMIT = 50  # max candidates to fetch from FAISS, then filter by score
+    _FETCH_LIMIT = 20  # max candidates to fetch from FAISS
+    _MAX_RECALL = 3  # hard cap on recall hits injected into the prompt
+    _MAX_ARCHIVAL = 2  # hard cap on archival facts injected into the prompt
+    _MAX_CHARS_PER_HIT = 240  # truncate long memories to keep prompt tight
 
     def __init__(self, recall_memory, archival_memory):
         self._recall_memory = recall_memory
@@ -218,28 +221,34 @@ class RelevantMemoryProvider:
             recall_hits = recall_future.result()
             archival_hits = archival_future.result()
 
-        # Filter by relevance score (only FAISS results have score)
+        # Filter by score, then hard-cap regardless of how many pass.
+        # Without the cap, a query like "hi" matches every past greeting
+        # and dumps hundreds of tokens of memories into every prompt.
         recall_relevant = [
             h for h in recall_hits if h.get("score", 0) <= self._SCORE_THRESHOLD
-        ]
+        ][: self._MAX_RECALL]
         archival_relevant = [
             h for h in archival_hits if h.get("score", 0) <= self._SCORE_THRESHOLD
-        ]
+        ][: self._MAX_ARCHIVAL]
 
-        # Fallback: if no scored results, take top 2 from each (FTS5/recent don't have scores)
+        # Fallback for non-scored backends (FTS5, recent).
         if not recall_relevant and recall_hits:
-            recall_relevant = recall_hits[:2]
+            recall_relevant = recall_hits[: self._MAX_RECALL]
         if not archival_relevant and archival_hits:
-            archival_relevant = archival_hits[:1]
+            archival_relevant = archival_hits[: self._MAX_ARCHIVAL]
 
         if not recall_relevant and not archival_relevant:
             return ""
 
+        def _trim(text: str) -> str:
+            text = text or ""
+            return text if len(text) <= self._MAX_CHARS_PER_HIT else text[: self._MAX_CHARS_PER_HIT - 1] + "…"
+
         lines = ["", "[RELEVANT MEMORIES]"]
         for hit in recall_relevant:
-            lines.append(f"- {hit['role']}: {hit['content']}")
+            lines.append(f"- {hit['role']}: {_trim(hit['content'])}")
         for hit in archival_relevant:
-            lines.append(f"- Fact: {hit['content']}")
+            lines.append(f"- Fact: {_trim(hit['content'])}")
         return "\n".join(lines) + "\n\n"
 
 
