@@ -80,34 +80,93 @@ class LLMStreamer:
         self._model = model
 
     def stream(self, messages, tools, max_retries=2):
-        """Call LLM and return (content, tool_calls_list)."""
+        """Call LLM and return (content, tool_calls_list).
+
+        Streams the response in real time, prints content as it arrives,
+        and logs TTFT + tokens/sec in debug mode.
+        """
+        debug = _log.isEnabledFor(logging.DEBUG)
+
         for attempt in range(max_retries):
             try:
-                response = self._client.chat.completions.create(
+                t_start = time.perf_counter()
+                t_first: Optional[float] = None
+
+                stream = self._client.chat.completions.create(
                     model=self._model,
                     messages=messages,
                     tools=tools,
                     tool_choice="auto",
+                    stream=True,
+                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
                 )
 
-                choice = response.choices[0]
-                content = choice.message.content or ""
+                acc_content: list[str] = []
+                acc_tools: dict[int, dict] = {}
 
-                if content and _log.isEnabledFor(logging.DEBUG):
-                    print(f"   \U0001f4ad {content}")
+                for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
 
-                tool_calls_list = []
-                if choice.message.tool_calls:
-                    for tc in choice.message.tool_calls:
-                        tool_calls_list.append(
-                            ToolCallEnvelope(
-                                id=tc.id,
-                                function=ToolFunctionCall(
-                                    name=tc.function.name,
-                                    arguments=tc.function.arguments or "{}",
-                                ),
+                    if delta.content:
+                        if t_first is None:
+                            t_first = time.perf_counter()
+                        acc_content.append(delta.content)
+                        if debug:
+                            print(delta.content, end="", flush=True)
+
+                    if delta.tool_calls:
+                        if t_first is None:
+                            t_first = time.perf_counter()
+                        for tc_delta in delta.tool_calls:
+                            slot = acc_tools.setdefault(
+                                tc_delta.index,
+                                {"id": "", "name": "", "arguments": ""},
                             )
+                            if tc_delta.id:
+                                slot["id"] = tc_delta.id
+                            fn = tc_delta.function
+                            if fn is not None:
+                                if fn.name:
+                                    slot["name"] += fn.name
+                                if fn.arguments:
+                                    slot["arguments"] += fn.arguments
+
+                t_end = time.perf_counter()
+                content = "".join(acc_content)
+
+                tool_calls_list = [
+                    ToolCallEnvelope(
+                        id=slot["id"],
+                        function=ToolFunctionCall(
+                            name=slot["name"],
+                            arguments=slot["arguments"] or "{}",
+                        ),
+                    )
+                    for _, slot in sorted(acc_tools.items())
+                ]
+
+                if debug:
+                    if acc_content:
+                        print()
+                    total = t_end - t_start
+                    n_out = len(content.split()) + sum(
+                        len(s["arguments"].split()) for s in acc_tools.values()
+                    )
+                    if t_first is not None:
+                        ttft = t_first - t_start
+                        gen = max(t_end - t_first, 1e-6)
+                        rate = n_out / gen
+                        _log.debug(
+                            "[TTFT %.2fs] [%d tok @ %.1f tok/s] [total %.2fs]",
+                            ttft,
+                            n_out,
+                            rate,
+                            total,
                         )
+                    else:
+                        _log.debug("[no tokens] [total %.2fs]", total)
 
                 return content, tool_calls_list
 
@@ -132,6 +191,7 @@ class LLMStreamer:
                     {"role": "user", "content": f"Summarize this concisely:\n{text}"}
                 ],
                 max_tokens=200,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
             return resp.choices[0].message.content
         except Exception:
