@@ -60,10 +60,7 @@ def _dump_messages_debug(messages, tools) -> None:
 
 _MOTOR_TOOLS = frozenset(
     {
-        "drive_forward",
-        "drive_backward",
-        "turn_left",
-        "turn_right",
+        "drive",
         "stop_movement",
         "get_robot_status",
     }
