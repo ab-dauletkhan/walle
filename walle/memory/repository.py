@@ -18,6 +18,9 @@ _log = logging.getLogger("walle.repository")
 
 
 def _connect_db(db_path: str) -> sqlite3.Connection:
+    parent = os.path.dirname(db_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
