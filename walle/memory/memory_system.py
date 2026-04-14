@@ -314,9 +314,10 @@ class RecallMemory:
         summarizer_func: Callable[[str], str],
         archival_memory: "ArchivalMemory",
         keep_recent: int = 50,
+        batch_size: int = 10,
     ):
         count = self.get_count()
-        if count <= keep_recent:
+        if count <= keep_recent + batch_size:
             return 0
 
         rows = self._repo.get_old_memories(keep_recent)

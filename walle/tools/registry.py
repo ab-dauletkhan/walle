@@ -206,11 +206,35 @@ class RelevantMemoryProvider:
     _MAX_ARCHIVAL = 2  # hard cap on archival facts injected into the prompt
     _MAX_CHARS_PER_HIT = 240  # truncate long memories to keep prompt tight
 
+    # Turns where memory retrieval adds nothing: small talk + motion commands.
+    # Skipping these avoids a pointless FAISS round-trip and keeps the prompt lean.
+    _TRIVIAL_TOKENS = frozenset({
+        "hi", "hello", "hey", "bye", "goodbye", "thanks", "thank",
+        "ok", "okay", "yes", "no", "sure", "nope", "yep",
+        "move", "forward", "backward", "back", "left", "right",
+        "stop", "wave", "scan", "come", "go", "turn", "dance",
+        "neutral", "rest", "up", "down",
+    })
+
     def __init__(self, recall_memory, archival_memory):
         self._recall_memory = recall_memory
         self._archival_memory = archival_memory
 
+    @classmethod
+    def _is_trivial_query(cls, query: str) -> bool:
+        if not query:
+            return True
+        words = [w.strip(".,!?;:'\"") for w in query.lower().split()]
+        words = [w for w in words if w]
+        if not words:
+            return True
+        if len(words) < 3 and all(w in cls._TRIVIAL_TOKENS for w in words):
+            return True
+        return False
+
     def build_context(self, query: str) -> str:
+        if self._is_trivial_query(query):
+            return ""
         with ThreadPoolExecutor(max_workers=2) as executor:
             recall_future = executor.submit(
                 self._recall_memory.search, query, self._FETCH_LIMIT
@@ -221,27 +245,40 @@ class RelevantMemoryProvider:
             recall_hits = recall_future.result()
             archival_hits = archival_future.result()
 
-        # Filter by score, then hard-cap regardless of how many pass.
-        # Without the cap, a query like "hi" matches every past greeting
-        # and dumps hundreds of tokens of memories into every prompt.
-        recall_relevant = [
+        # Filter by score — hard cap applied later after dedup/empty filtering.
+        recall_candidates = [
             h for h in recall_hits if h.get("score", 0) <= self._SCORE_THRESHOLD
-        ][: self._MAX_RECALL]
-        archival_relevant = [
+        ]
+        archival_candidates = [
             h for h in archival_hits if h.get("score", 0) <= self._SCORE_THRESHOLD
-        ][: self._MAX_ARCHIVAL]
+        ]
 
         # Fallback for non-scored backends (FTS5, recent).
-        if not recall_relevant and recall_hits:
-            recall_relevant = recall_hits[: self._MAX_RECALL]
-        if not archival_relevant and archival_hits:
-            archival_relevant = archival_hits[: self._MAX_ARCHIVAL]
+        if not recall_candidates and recall_hits:
+            recall_candidates = list(recall_hits)
+        if not archival_candidates and archival_hits:
+            archival_candidates = list(archival_hits)
+
+        seen: set = set()
+
+        def _accept(hit) -> bool:
+            content = (hit.get("content") or "").strip()
+            if not content:
+                return False
+            key = content.lower()
+            if key in seen:
+                return False
+            seen.add(key)
+            return True
+
+        recall_relevant = [h for h in recall_candidates if _accept(h)][: self._MAX_RECALL]
+        archival_relevant = [h for h in archival_candidates if _accept(h)][: self._MAX_ARCHIVAL]
 
         if not recall_relevant and not archival_relevant:
             return ""
 
         def _trim(text: str) -> str:
-            text = text or ""
+            text = (text or "").strip()
             return text if len(text) <= self._MAX_CHARS_PER_HIT else text[: self._MAX_CHARS_PER_HIT - 1] + "…"
 
         lines = ["", "[RELEVANT MEMORIES]"]
