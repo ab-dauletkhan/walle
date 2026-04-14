@@ -166,6 +166,8 @@ class SystemPromptBuilder:
             f"{relevant_memories}\n" if relevant_memories else ""
         )
         return (
+            # Qwen3 soft switch: suppress <think> block for low latency
+            "/no_think\n\n"
             # Identity
             "You are WALL-E, a physical robot companion. "
             "You have a body with motors, arms, a head, and a neck. "
@@ -184,9 +186,10 @@ class SystemPromptBuilder:
             # Behavior
             "BEHAVIOR:\n"
             f"{self._personality_engine.get_system_prompt_addition()}\n"
-            "- Act, don't narrate. Call tools directly instead of describing what you plan to do.\n"
-            "- Be honest about your limitations. If you can't see (no vision), say so.\n"
-            "- Express yourself physically — wave when greeting, show emotion through posture.\n\n"
+            "- For greetings, small talk, and questions, reply with send_message ONLY. Do NOT call motion tools.\n"
+            "- Only use movement tools (drive_*, turn_*, wave_hello, scan_surroundings, express_emotion, etc.) when the user explicitly asks for physical action.\n"
+            "- Act, don't narrate. When you do call a tool, call it directly instead of describing what you plan to do.\n"
+            "- Be honest about your limitations. If you can't see (no vision), say so.\n\n"
             # Dynamic context
             f"{context_str}\n"
             f"{relevant_memories_section}"

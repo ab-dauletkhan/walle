@@ -98,7 +98,6 @@ class LLMStreamer:
                     tools=tools,
                     tool_choice="auto",
                     stream=True,
-                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
                 )
 
                 acc_content: list[str] = []
@@ -188,10 +187,12 @@ class LLMStreamer:
             resp = self._client.chat.completions.create(
                 model=self._model,
                 messages=[
-                    {"role": "user", "content": f"Summarize this concisely:\n{text}"}
+                    {
+                        "role": "user",
+                        "content": f"/no_think\n\nSummarize this concisely:\n{text}",
+                    }
                 ],
                 max_tokens=200,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
             return resp.choices[0].message.content
         except Exception:
