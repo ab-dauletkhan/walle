@@ -7,6 +7,7 @@ from object construction and lifecycle management.
 
 import json
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -14,10 +15,48 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Optional
 
+_DUMP_PROMPT = os.environ.get("WALLE_DUMP_PROMPT", "").lower() in ("1", "true", "yes")
+
 from walle.memory.config import conf
 from walle.memory.context_manager import InteractionContext, SensorSimulator
 
 _log = logging.getLogger("walle.chat")
+
+def _dump_messages_debug(messages, tools) -> None:
+    """Print the exact compiled prompt with per-section char/rough-token counts.
+
+    Enabled by WALLE_DUMP_PROMPT=1. Rough-token = chars // 4 (indicative only;
+    real counts come from Ollama's usage.prompt_tokens in the response).
+    """
+    print("=" * 72, flush=True)
+    print("WALLE_DUMP_PROMPT: compiled request", flush=True)
+    print("=" * 72, flush=True)
+    total_chars = 0
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "?")
+        content = msg.get("content") or ""
+        ch = len(content)
+        total_chars += ch
+        header = f"[{i}] role={role} chars={ch} (~{ch // 4} tok)"
+        if msg.get("tool_calls"):
+            header += f" tool_calls={len(msg['tool_calls'])}"
+        if msg.get("tool_call_id"):
+            header += f" tool_call_id={msg['tool_call_id']}"
+        print(header, flush=True)
+        if content:
+            preview = content if len(content) < 2000 else content[:2000] + "\n...[truncated]"
+            print(preview, flush=True)
+        print("-" * 72, flush=True)
+
+    tool_chars = len(json.dumps(tools)) if tools else 0
+    total_chars += tool_chars
+    print(
+        f"[tools] count={len(tools or [])} json_chars={tool_chars} (~{tool_chars // 4} tok)",
+        flush=True,
+    )
+    print(f"TOTAL: ~{total_chars} chars (~{total_chars // 4} tok rough)", flush=True)
+    print("=" * 72, flush=True)
+
 
 _MOTOR_TOOLS = frozenset(
     {
@@ -87,10 +126,14 @@ class LLMStreamer:
         """
         debug = _log.isEnabledFor(logging.DEBUG)
 
+        if _DUMP_PROMPT:
+            _dump_messages_debug(messages, tools)
+
         for attempt in range(max_retries):
             try:
                 t_start = time.perf_counter()
                 t_first: Optional[float] = None
+                usage = None
 
                 stream = self._client.chat.completions.create(
                     model=self._model,
@@ -98,12 +141,15 @@ class LLMStreamer:
                     tools=tools,
                     tool_choice="auto",
                     stream=True,
+                    stream_options={"include_usage": True},
                 )
 
                 acc_content: list[str] = []
                 acc_tools: dict[int, dict] = {}
 
                 for chunk in stream:
+                    if getattr(chunk, "usage", None):
+                        usage = chunk.usage
                     if not chunk.choices:
                         continue
                     delta = chunk.choices[0].delta
@@ -150,20 +196,39 @@ class LLMStreamer:
                     if acc_content:
                         print()
                     total = t_end - t_start
-                    n_out = len(content.split()) + sum(
-                        len(s["arguments"].split()) for s in acc_tools.values()
+                    # Prefer real token counts from Ollama's usage payload.
+                    if usage is not None:
+                        prompt_tokens = getattr(usage, "prompt_tokens", None)
+                        completion_tokens = getattr(usage, "completion_tokens", None)
+                    else:
+                        prompt_tokens = None
+                        completion_tokens = None
+                    n_out = completion_tokens if completion_tokens is not None else (
+                        len(content.split())
+                        + sum(len(s["arguments"].split()) for s in acc_tools.values())
                     )
                     if t_first is not None:
                         ttft = t_first - t_start
                         gen = max(t_end - t_first, 1e-6)
                         rate = n_out / gen
-                        _log.debug(
-                            "[TTFT %.2fs] [%d tok @ %.1f tok/s] [total %.2fs]",
-                            ttft,
-                            n_out,
-                            rate,
-                            total,
-                        )
+                        if prompt_tokens is not None:
+                            _log.debug(
+                                "[prompt %d tok | TTFT %.2fs => prefill %.1f tok/s] [%d out tok @ %.1f tok/s] [total %.2fs]",
+                                prompt_tokens,
+                                ttft,
+                                prompt_tokens / max(ttft, 1e-6),
+                                n_out,
+                                rate,
+                                total,
+                            )
+                        else:
+                            _log.debug(
+                                "[TTFT %.2fs] [%d tok @ %.1f tok/s] [total %.2fs]",
+                                ttft,
+                                n_out,
+                                rate,
+                                total,
+                            )
                     else:
                         _log.debug("[no tokens] [total %.2fs]", total)
 
