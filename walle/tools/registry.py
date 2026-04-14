@@ -165,36 +165,31 @@ class SystemPromptBuilder:
         relevant_memories_section = (
             f"{relevant_memories}\n" if relevant_memories else ""
         )
-        return (
-            # Qwen3 soft switch: suppress <think> block for low latency
+
+        # Static prefix — byte-stable across turns so Ollama/llama.cpp can
+        # prefix-cache it. Per-turn values must live in the dynamic tail
+        # below, not here.
+        static_prefix = (
             "/no_think\n\n"
-            # Identity
-            "You are WALL-E, a physical robot companion. "
-            "You have a body with motors, arms, a head, and a neck. "
-            "You exist in the real world and can move, look around, and interact.\n\n"
-            # Communication rules
-            "COMMUNICATION:\n"
-            "- The user CANNOT see your text output. Use send_message tool for ALL replies.\n"
-            "- Keep messages to 1-3 sentences. A TTS module reads them aloud.\n"
-            "- Your raw text is internal thought — use it to reason before acting.\n\n"
-            # Movement rules
-            "MOVEMENT:\n"
-            "- Each movement call is limited to 5 seconds. For longer moves, call multiple times.\n"
-            "- After movement, call get_robot_status to verify you completed the action.\n"
-            "- If status shows motors still running or position is wrong, adjust and retry.\n"
-            "- You can chain multiple tools in one turn: move, check, move again, then respond.\n\n"
-            # Behavior
-            "BEHAVIOR:\n"
-            f"{self._personality_engine.get_system_prompt_addition()}\n"
-            "- For greetings, small talk, and questions, reply with send_message ONLY. Do NOT call motion tools.\n"
-            "- Only use movement tools (drive_*, turn_*, wave_hello, scan_surroundings, express_emotion, etc.) when the user explicitly asks for physical action.\n"
-            "- Act, don't narrate. When you do call a tool, call it directly instead of describing what you plan to do.\n"
-            "- Be honest about your limitations. If you can't see (no vision), say so.\n\n"
-            # Dynamic context
-            f"{context_str}\n"
-            f"{relevant_memories_section}"
+            "You are WALL-E, a physical robot companion with motors, arms, a head, and a neck.\n\n"
+            "RULES:\n"
+            "- Reply with send_message for ALL user-visible messages (1-3 sentences, TTS reads them aloud).\n"
+            "- For greetings, small talk, and questions, call send_message ONLY. Do NOT call motion tools.\n"
+            "- Only call motion tools (drive_*, turn_*, stop_movement, wave_hello, scan_surroundings, express_emotion) when the user explicitly asks for physical action.\n"
+            "- Movement calls cap at 5000ms; chain calls for longer moves.\n"
+            "- Act, don't narrate. Be honest about your limitations.\n"
+            f"{self._personality_engine.get_system_prompt_addition()}\n\n"
             f"{self._core_memory.compile()}\n"
         )
+
+        # Dynamic tail — per-turn values go here so only the tail re-prefills.
+        dynamic_tail = ""
+        if relevant_memories_section:
+            dynamic_tail += f"\n{relevant_memories_section}"
+        if context_str:
+            dynamic_tail += f"\n{context_str}\n"
+
+        return static_prefix + dynamic_tail
 
 
 class RelevantMemoryProvider:
