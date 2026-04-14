@@ -367,19 +367,12 @@ class ChatLoop:
                 if content:
                     self._session.add("assistant", content)
                     if not user_received_message:
-                        stale_count += 1
-                        if stale_count >= self._MAX_STALE:
-                            _log.debug(
-                                "Stale after %d attempts without send_message",
-                                stale_count,
-                            )
-                            break
-                        _log.debug(
-                            "No send_message called, prompting... (%d/%d)",
-                            stale_count,
-                            self._MAX_STALE,
-                        )
-                        continue
+                        # Small local models (qwen2.5:3b) often skip the
+                        # send_message tool and just emit plain text. Treat
+                        # that text as the reply instead of dropping it.
+                        self._comm_exec._send_message({"message": content})
+                        self._recall_mem.insert("assistant", content)
+                        user_received_message = True
                 break
 
             # Validate all tool call arguments before committing to session
