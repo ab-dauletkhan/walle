@@ -442,8 +442,6 @@ class ChatLoop:
     # -- Memory compression (background) --
 
     def _start_compression_if_needed(self) -> None:
-        if self._recall_mem.get_count() <= conf.RECALL_MEMORY_LIMIT:
-            return
         if not self._compression_lock.acquire(blocking=False):
             return
 
@@ -452,6 +450,7 @@ class ChatLoop:
                 self._recall_mem.compress_old_memories(
                     self._llm.summarize,
                     self._archival_mem,
+                    batch_size=conf.RECALL_COMPRESSION_BATCH,
                 )
             finally:
                 self._compression_lock.release()

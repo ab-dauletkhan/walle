@@ -40,7 +40,7 @@ class Config:
     # --- Memory Settings ---
     MAX_CONTEXT_MESSAGES: int = 10  # Rolling context window
     USE_SEMANTIC_SEARCH: bool = True  # Enable with lightweight embeddings
-    RECALL_MEMORY_LIMIT: int = 40  # Compress to archival after this limit
+    RECALL_COMPRESSION_BATCH: int = 10  # Compress only when ≥N old messages accumulate past keep_recent
 
     # --- FAISS Settings (Fast Vector Search) ---
     USE_FAISS: bool = True  # Enable FAISS for O(log n) search
