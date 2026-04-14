@@ -101,7 +101,7 @@ def build_app(args) -> tuple:
 
     # -- LLM client --
     client = OpenAI(
-        base_url=f"{conf.OLLAMA_BASE_URL}/v1", api_key="ollama", timeout=30.0
+        base_url=f"{conf.OLLAMA_BASE_URL}/v1", api_key="ollama", timeout=120.0
     )
     llm_streamer = LLMStreamer(client, conf.OLLAMA_MODEL)
 
