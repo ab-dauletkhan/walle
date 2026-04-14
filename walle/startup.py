@@ -402,7 +402,7 @@ def main():
     if args.text_mode:
         print('  Type your message. "exit" to quit.\n')
         try:
-            _text_mode_repl(orchestrator)
+            _text_mode_repl(orchestrator, args)
         finally:
             lifecycle.shutdown()
         return
@@ -421,7 +421,15 @@ def main():
 # ---------------------------------------------------------------------------
 # Mode runners
 # ---------------------------------------------------------------------------
-def _text_mode_repl(orchestrator):
+def _text_mode_repl(orchestrator, args):
+    from walle.voice.assistant import ConsoleTTSEngine, Mimic3TTSEngine
+
+    tts = (
+        ConsoleTTSEngine()
+        if args.no_tts
+        else Mimic3TTSEngine(url=args.tts_url, voice=args.tts_voice)
+    )
+
     print(f"\n{'=' * 50}")
     print(f"  WALL-E Text Mode | {conf.OLLAMA_MODEL} via Ollama")
     print("  Type 'exit' or 'quit' to stop.")
@@ -441,6 +449,10 @@ def _text_mode_repl(orchestrator):
             response = orchestrator.chat(user_input)
             if response:
                 print(f"WALL-E: {response}\n")
+                try:
+                    tts.speak(response)
+                except Exception as exc:
+                    _log.warning("TTS failed: %s", exc)
             else:
                 print("WALL-E: (no response)\n")
     except KeyboardInterrupt:
