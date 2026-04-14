@@ -57,6 +57,22 @@ LOST_TARGET_TIMEOUT_SEC = 1.8
 RETURN_TO_CENTER_STEP = 1
 EDGE_MARGIN_RATIO = 0.18
 
+BODY_ASSIST_HEAD_RATIO = 0.80
+BODY_ASSIST_STRONG_HEAD_RATIO = 0.92
+BODY_ASSIST_EDGE_DWELL_SEC = 0.45
+BODY_ASSIST_STRONG_EDGE_DWELL_SEC = 0.25
+BODY_ASSIST_COOLDOWN_SEC = 0.80
+BODY_ASSIST_SETTLE_SEC = 0.35
+BODY_ASSIST_CENTER_BAND_TICKS = 24
+BODY_ASSIST_RETURN_STEP = 8
+BODY_TURN_PWM = 120
+BODY_TURN_45_SEC = 0.28
+BODY_TURN_90_SEC = 0.56
+BODY_TURN_LEFT_MOTOR_A_SIGN = -1
+BODY_TURN_LEFT_MOTOR_B_SIGN = +1
+BODY_TURN_RIGHT_MOTOR_A_SIGN = +1
+BODY_TURN_RIGHT_MOTOR_B_SIGN = -1
+
 
 class HeadController:
     def __init__(self, port: str, baud: int):
@@ -71,6 +87,14 @@ class HeadController:
         self.smoothed_x = None
         self.last_target_time = 0.0
         self.last_command_dir = 0
+        self.body_turn_active = False
+        self.body_turn_dir = 0
+        self.body_turn_started_at = 0.0
+        self.body_turn_end_at = 0.0
+        self.body_turn_cooldown_until = 0.0
+        self.body_settle_until = 0.0
+        self.edge_hold_started_at = 0.0
+        self.edge_hold_dir = 0
 
         try:
             import serial
@@ -124,10 +148,131 @@ class HeadController:
         self.recent_face_x.clear()
         self.smoothed_x = None
         self.last_command_dir = 0
+        self.edge_hold_started_at = 0.0
+        self.edge_hold_dir = 0
+
+    def send_raw_command(self, command: str):
+        if self.enabled and self.ser is not None:
+            self.ser.write(f"{command}\n".encode("utf-8"))
+            self.ser.flush()
+
+    def send_motor_speeds(self, motor_a: int, motor_b: int):
+        self.send_raw_command(f"ma {int(motor_a)}")
+        self.send_raw_command(f"mb {int(motor_b)}")
+
+    def stop_body_turn(self):
+        if self.body_turn_active:
+            self.send_raw_command("stopm")
+        self.body_turn_active = False
+        self.body_turn_dir = 0
+        self.body_turn_started_at = 0.0
+        self.body_turn_end_at = 0.0
+        self.body_turn_cooldown_until = time.monotonic() + BODY_ASSIST_COOLDOWN_SEC
+        self.body_settle_until = time.monotonic() + BODY_ASSIST_SETTLE_SEC
+
+    def start_body_turn(self, turn_dir: int, duration_sec: float):
+        if turn_dir == 0:
+            return False
+
+        if turn_dir > 0:
+            motor_a = BODY_TURN_LEFT_MOTOR_A_SIGN * BODY_TURN_PWM
+            motor_b = BODY_TURN_LEFT_MOTOR_B_SIGN * BODY_TURN_PWM
+        else:
+            motor_a = BODY_TURN_RIGHT_MOTOR_A_SIGN * BODY_TURN_PWM
+            motor_b = BODY_TURN_RIGHT_MOTOR_B_SIGN * BODY_TURN_PWM
+
+        self.send_motor_speeds(motor_a, motor_b)
+        now = time.monotonic()
+        self.body_turn_active = True
+        self.body_turn_dir = turn_dir
+        self.body_turn_started_at = now
+        self.body_turn_end_at = now + duration_sec
+        self.edge_hold_started_at = 0.0
+        self.edge_hold_dir = 0
+        return True
+
+    def update_body_turn_state(self):
+        if not self.body_turn_active:
+            return {"turning": False, "just_finished": False, "dir": 0}
+
+        now = time.monotonic()
+        if now < self.body_turn_end_at:
+            return {"turning": True, "just_finished": False, "dir": self.body_turn_dir}
+
+        turn_dir = self.body_turn_dir
+        self.stop_body_turn()
+        return {"turning": False, "just_finished": True, "dir": turn_dir}
+
+    def body_assist_debug(self, phase: str, face_center_x=None, frame_width=None):
+        head_half_range = max(1.0, (HEAD_MAX_TICK - HEAD_MIN_TICK) / 2.0)
+        head_error_ticks = self.current_tick - HEAD_OPTICAL_CENTER_TICK
+        head_ratio = abs(head_error_ticks) / head_half_range
+        raw_error_px = None
+        effective_error_px = None
+        desired_dir = 0
+
+        if face_center_x is not None and frame_width is not None:
+            frame_center_x = frame_width / 2.0
+            raw_error_px = face_center_x - frame_center_x
+            effective_error_px = raw_error_px
+            if raw_error_px < -DEADBAND_PX:
+                desired_dir = +1
+            elif raw_error_px > DEADBAND_PX:
+                desired_dir = -1
+            else:
+                effective_error_px = 0.0
+
+        return {
+            "phase": phase,
+            "filtered_x": face_center_x if face_center_x is not None else 0.0,
+            "smoothed_x": face_center_x if face_center_x is not None else 0.0,
+            "raw_error_px": raw_error_px,
+            "effective_error_px": effective_error_px,
+            "target_tick": self.current_tick,
+            "new_tick": self.current_tick,
+            "dynamic_max_step": 0,
+            "desired_dir": desired_dir,
+            "head_ratio": head_ratio,
+            "body_turn_active": self.body_turn_active,
+            "body_turn_dir": self.body_turn_dir,
+        }
 
     def update_from_face_x(self, face_center_x, frame_width):
         now = time.monotonic()
         frame_center_x = frame_width / 2.0
+
+        turn_state = self.update_body_turn_state()
+        if turn_state["turning"]:
+            return self.body_assist_debug(
+                phase="body_turn", face_center_x=face_center_x, frame_width=frame_width
+            )
+
+        if turn_state["just_finished"]:
+            self.reset_tracking_state()
+
+        if now < self.body_settle_until:
+            target_tick = HEAD_OPTICAL_CENTER_TICK
+            tick_error = target_tick - self.current_tick
+            if tick_error > BODY_ASSIST_RETURN_STEP:
+                tick_error = BODY_ASSIST_RETURN_STEP
+            elif tick_error < -BODY_ASSIST_RETURN_STEP:
+                tick_error = -BODY_ASSIST_RETURN_STEP
+            self.send_tick(self.current_tick + tick_error)
+            return {
+                "filtered_x": face_center_x,
+                "smoothed_x": face_center_x,
+                "raw_error_px": face_center_x - frame_center_x,
+                "effective_error_px": 0.0,
+                "target_tick": target_tick,
+                "new_tick": self.current_tick,
+                "dynamic_max_step": BODY_ASSIST_RETURN_STEP,
+                "desired_dir": 0,
+                "head_ratio": abs(self.current_tick - HEAD_OPTICAL_CENTER_TICK)
+                / max(1.0, (HEAD_MAX_TICK - HEAD_MIN_TICK) / 2.0),
+                "body_turn_active": False,
+                "body_turn_dir": 0,
+                "phase": "settle",
+            }
 
         self.recent_face_x.append(face_center_x)
         filtered_x = float(np.median(self.recent_face_x))
@@ -194,6 +339,38 @@ class HeadController:
 
         self.send_tick(self.current_tick + tick_error)
 
+        head_half_range = max(1.0, (HEAD_MAX_TICK - HEAD_MIN_TICK) / 2.0)
+        head_error_ticks = self.current_tick - HEAD_OPTICAL_CENTER_TICK
+        head_ratio = abs(head_error_ticks) / head_half_range
+
+        head_dir = 0
+        if head_error_ticks > BODY_ASSIST_CENTER_BAND_TICKS:
+            head_dir = +1
+        elif head_error_ticks < -BODY_ASSIST_CENTER_BAND_TICKS:
+            head_dir = -1
+
+        body_turn_dir = 0
+        if head_dir == desired_dir and head_ratio >= BODY_ASSIST_HEAD_RATIO:
+            if self.edge_hold_dir != desired_dir:
+                self.edge_hold_dir = desired_dir
+                self.edge_hold_started_at = now
+            dwell_sec = now - self.edge_hold_started_at
+            strong_hold = (
+                head_ratio >= BODY_ASSIST_STRONG_HEAD_RATIO
+                and dwell_sec >= BODY_ASSIST_STRONG_EDGE_DWELL_SEC
+            )
+            normal_hold = dwell_sec >= BODY_ASSIST_EDGE_DWELL_SEC
+            if (
+                now >= self.body_turn_cooldown_until
+                and (strong_hold or normal_hold)
+            ):
+                body_turn_dir = desired_dir
+                turn_duration = BODY_TURN_90_SEC if strong_hold else BODY_TURN_45_SEC
+                self.start_body_turn(body_turn_dir, turn_duration)
+        else:
+            self.edge_hold_dir = 0
+            self.edge_hold_started_at = 0.0
+
         return {
             "filtered_x": filtered_x,
             "smoothed_x": self.smoothed_x,
@@ -203,13 +380,33 @@ class HeadController:
             "new_tick": self.current_tick,
             "dynamic_max_step": dynamic_max_step,
             "desired_dir": desired_dir,
+            "head_ratio": head_ratio,
+            "body_turn_active": self.body_turn_active,
+            "body_turn_dir": body_turn_dir if body_turn_dir else self.body_turn_dir,
+            "phase": "body_turn_start" if body_turn_dir else "head_track",
         }
 
     def on_target_lost(self):
         now = time.monotonic()
 
+        turn_state = self.update_body_turn_state()
+        if turn_state["turning"]:
+            return {
+                "returning": False,
+                "new_tick": self.current_tick,
+                "body_turn_active": True,
+                "phase": "body_turn",
+            }
+        if turn_state["just_finished"]:
+            self.reset_tracking_state()
+
         if now - self.last_target_time < LOST_TARGET_TIMEOUT_SEC:
-            return {"returning": False, "new_tick": self.current_tick}
+            return {
+                "returning": False,
+                "new_tick": self.current_tick,
+                "body_turn_active": False,
+                "phase": "hold",
+            }
 
         self.reset_tracking_state()
 
@@ -225,9 +422,18 @@ class HeadController:
             new_tick = self.current_tick
 
         self.send_tick(new_tick)
-        return {"returning": True, "new_tick": self.current_tick}
+        return {
+            "returning": True,
+            "new_tick": self.current_tick,
+            "body_turn_active": False,
+            "phase": "return_center",
+        }
 
     def close(self):
+        try:
+            self.send_raw_command("stopm")
+        except Exception:
+            pass
         try:
             self.send_tick(HEAD_OPTICAL_CENTER_TICK, force=True)
         except Exception:
@@ -415,8 +621,19 @@ def run(args: argparse.Namespace) -> None:
                 )
                 cv2.putText(
                     frame,
-                    f"target={debug['target_tick']} head={debug['new_tick']} dir={debug['desired_dir']}",
+                    "target="
+                    f"{debug['target_tick']} head={debug['new_tick']} "
+                    f"dir={debug['desired_dir']} phase={debug.get('phase', 'head_track')}",
                     (5, 75),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 255),
+                    2,
+                )
+                cv2.putText(
+                    frame,
+                    f"head_ratio={debug.get('head_ratio', 0.0):.2f} body_turn={int(debug.get('body_turn_active', False))}",
+                    (5, 100),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55,
                     (255, 255, 255),
@@ -441,6 +658,16 @@ def run(args: argparse.Namespace) -> None:
                     cv2.putText(
                         frame,
                         f"returning to center, head={debug['new_tick']}",
+                        (5, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (0, 165, 255),
+                        2,
+                    )
+                elif debug.get("body_turn_active"):
+                    cv2.putText(
+                        frame,
+                        "body turning to recenter head",
                         (5, 50),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.55,
