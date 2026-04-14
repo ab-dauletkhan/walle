@@ -89,24 +89,29 @@ class RobotAction(ABC):
             self._send_checked(runtime, cmd)
 
 
-class TimedAxisAction(RobotAction):
-    def __init__(
-        self, spec: RobotToolSpec, axis: str, direction: int, action_label: str
-    ):
-        super().__init__(spec)
-        self._axis = axis
-        self._direction = direction
-        self._action_label = action_label
+class DriveAction(RobotAction):
+    """Single tool that dispatches on `direction` to axis + sign."""
+
+    _DIRECTIONS = {
+        "forward": ("Y", 1, "Driving forward"),
+        "backward": ("Y", -1, "Driving backward"),
+        "left": ("X", -1, "Turning left"),
+        "right": ("X", 1, "Turning right"),
+    }
 
     def execute(self, runtime: RobotRuntime, args: dict) -> str:
+        direction = str(args.get("direction", "forward")).lower()
+        axis, sign, label = self._DIRECTIONS.get(
+            direction, self._DIRECTIONS["forward"]
+        )
         speed = self._clamp_percent(args.get("speed", 50))
         duration_ms = max(0, int(args.get("duration_ms", 0)))
-        signed_speed = speed * self._direction
-        self._send_checked(runtime, f"{self._axis}{signed_speed}")
+        signed_speed = speed * sign
+        self._send_checked(runtime, f"{axis}{signed_speed}")
         if duration_ms > 0:
             self._send_checked(runtime, f"D{duration_ms}")
-            return f"{self._action_label} at {speed}% for {duration_ms}ms"
-        return f"{self._action_label} at {speed}% (continuous)"
+            return f"{label} at {speed}% for {duration_ms}ms"
+        return f"{label} at {speed}% (continuous)"
 
 
 class SetPositionAction(RobotAction):
@@ -244,58 +249,27 @@ class RobotToolRegistry:
         return action.execute(runtime, args)
 
 
-_DRIVE_PARAMS = {
-    "speed": {"type": "integer", "minimum": 10, "maximum": 100},
-    "duration_ms": {"type": "integer", "minimum": 100, "maximum": 5000},
-}
-
-
 def build_default_robot_registry() -> RobotToolRegistry:
     return RobotToolRegistry(
         [
-            TimedAxisAction(
+            DriveAction(
                 RobotToolSpec(
-                    "drive_forward",
-                    "Drive forward. speed 10-100, duration_ms max 5000.",
-                    _DRIVE_PARAMS,
-                    ("speed", "duration_ms"),
-                ),
-                axis="Y",
-                direction=1,
-                action_label="Driving forward",
-            ),
-            TimedAxisAction(
-                RobotToolSpec(
-                    "drive_backward",
-                    "Drive backward. speed 10-100, duration_ms max 5000.",
-                    _DRIVE_PARAMS,
-                    ("speed", "duration_ms"),
-                ),
-                axis="Y",
-                direction=-1,
-                action_label="Driving backward",
-            ),
-            TimedAxisAction(
-                RobotToolSpec(
-                    "turn_left",
-                    "Turn left in place. speed 10-100, duration_ms max 5000 (500ms~=90deg).",
-                    _DRIVE_PARAMS,
-                    ("speed", "duration_ms"),
-                ),
-                axis="X",
-                direction=-1,
-                action_label="Turning left",
-            ),
-            TimedAxisAction(
-                RobotToolSpec(
-                    "turn_right",
-                    "Turn right in place. speed 10-100, duration_ms max 5000 (500ms~=90deg).",
-                    _DRIVE_PARAMS,
-                    ("speed", "duration_ms"),
-                ),
-                axis="X",
-                direction=1,
-                action_label="Turning right",
+                    "drive",
+                    "Move the robot. direction=forward/backward/left/right. speed 10-100, duration_ms max 5000.",
+                    {
+                        "direction": {
+                            "type": "string",
+                            "enum": ["forward", "backward", "left", "right"],
+                        },
+                        "speed": {"type": "integer", "minimum": 10, "maximum": 100},
+                        "duration_ms": {
+                            "type": "integer",
+                            "minimum": 100,
+                            "maximum": 5000,
+                        },
+                    },
+                    ("direction", "speed", "duration_ms"),
+                )
             ),
             StopMovementAction(
                 RobotToolSpec(

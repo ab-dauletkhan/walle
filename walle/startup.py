@@ -85,18 +85,15 @@ def build_app(args) -> tuple:
     comm_exec = CommunicationExecutor()
 
     # -- Tool registry (Microkernel: each provider registers independently) --
+    # Memory / personality / knowledge tools are intentionally not registered
+    # with the LLM to keep the tool schema budget small on Jetson. The
+    # executors are kept alive — the memory loop still auto-injects relevant
+    # recall/archival hits via RelevantMemoryProvider without needing the
+    # LLM to self-edit blocks.
+    _ = mem_exec, personality_exec, knowledge_exec  # retained for future re-enable
     registry = ToolRegistry()
     registry.register(CommunicationToolProvider(comm_exec))
     registry.register(SchemaExecutorToolProvider(get_robot_control_tools, robot_exec))
-    registry.register(SchemaExecutorToolProvider(get_memory_tools, mem_exec))
-    registry.register(
-        SchemaExecutorToolProvider(get_personality_tools, personality_exec)
-    )
-    registry.register(
-        SchemaExecutorToolProvider(
-            get_knowledge_tools, knowledge_exec, request_heartbeat_after=True
-        )
-    )
     tool_suite = ToolSuiteFacade(registry)
 
     # -- LLM client --
@@ -292,7 +289,7 @@ def main():
 
     # --- Jetson overrides ---
     if args.jetson:
-        conf.OLLAMA_MODEL = "qwen3:4b"
+        conf.OLLAMA_MODEL = "qwen2.5:3b"
         conf.EMBEDDING_DEVICE = "cpu"
         conf.EMBEDDING_BATCH_SIZE = 4
         conf.USE_FAISS = True
