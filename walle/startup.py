@@ -283,9 +283,14 @@ def parse_args():
 # Main entry point
 # ---------------------------------------------------------------------------
 def main():
-    setup_logging()
-
     args = parse_args()
+
+    # Voice mode is the live Jetson deployment — suppress debug chatter
+    # (LLM token metrics, stale-turn retries) so only real output is spoken/shown.
+    # Text mode stays verbose for development.
+    run_mode = "debug" if args.text_mode else "test"
+    conf.RUN_MODE = run_mode
+    setup_logging(run_mode)
 
     # --- Jetson overrides ---
     if args.jetson:
