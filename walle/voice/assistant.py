@@ -1083,6 +1083,7 @@ def main():
         listen_timeout_long=args.listen_timeout_long,
         max_utterance=args.max_utterance,
         wake_sounds_dir=wake_sounds,
+        mic_device=args.mic_device,
     )
     assistant.run()
 
