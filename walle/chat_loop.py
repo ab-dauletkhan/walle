@@ -22,6 +22,32 @@ from walle.memory.context_manager import InteractionContext, SensorSimulator
 
 _log = logging.getLogger("walle.chat")
 
+_OOM_MARKERS = (
+    "out of memory",
+    "cuda",
+    "cudamalloc",
+    "failed to allocate",
+)
+
+
+def _is_oom_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _OOM_MARKERS)
+
+
+def _force_unload_ollama_model(model: str) -> None:
+    """Best-effort POST to unload a model from Ollama's GPU cache."""
+    try:
+        import requests
+
+        requests.post(
+            f"{conf.OLLAMA_BASE_URL}/api/generate",
+            json={"model": model, "keep_alive": 0},
+            timeout=5,
+        )
+    except Exception as unload_err:
+        _log.debug("Ollama unload failed: %s", unload_err)
+
 def _dump_messages_debug(messages, tools) -> None:
     """Print the exact compiled prompt with per-section char/rough-token counts.
 
@@ -232,10 +258,23 @@ class LLMStreamer:
                 return content, tool_calls_list
 
             except Exception as e:
-                _log.warning(
-                    "LLM error (attempt %d/%d): %s", attempt + 1, max_retries, e
-                )
-                time.sleep(1)
+                if _is_oom_error(e):
+                    _log.warning(
+                        "LLM OOM (attempt %d/%d): %s — unloading model",
+                        attempt + 1,
+                        max_retries,
+                        e,
+                    )
+                    _force_unload_ollama_model(self._model)
+                    time.sleep(2)
+                else:
+                    _log.warning(
+                        "LLM error (attempt %d/%d): %s",
+                        attempt + 1,
+                        max_retries,
+                        e,
+                    )
+                    time.sleep(1)
 
         _log.error("Failed to generate LLM response after %d retries", max_retries)
         return (

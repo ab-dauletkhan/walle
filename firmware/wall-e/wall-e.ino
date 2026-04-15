@@ -94,6 +94,10 @@
 #define MAX_SERIAL_LENGTH 6       // Maximum number of characters that can be received (letter + sign + 3 digits + null)
 #define SERVO_STUCK_TIMEOUT 3000  // Disable servo after 3 seconds with no position change (ms)
 
+// Uncomment to echo every parsed serial command back to the host (noisy;
+// useful for debugging the Jetson <-> Arduino protocol).
+//#define DEBUG_SERIAL
+
 
 
 /// Instantiate Objects
@@ -290,7 +294,9 @@ void evaluateSerial() {
 	// Evaluate integer number in the serial buffer
 	int number = atoi(serialBuffer);
 
+#ifdef DEBUG_SERIAL
 	Serial.print(firstChar); Serial.println(number);
+#endif
 
 
 	// Motor Inputs and Offsets
@@ -599,7 +605,13 @@ void manageServos(float dt) {
 			pwm.setPWM(i, 0, curpos[i]);
 
 		} else {
+			// Servo is at target — reset stuck detection so the next
+			// movement command doesn't inherit a stale timer and get
+			// falsely disabled on its first tick.
 			curvel[i] = 0;
+			prevpos[i] = curpos[i];
+			stuckTimer[i] = millis();
+			servoDisabled[i] = false;
 		}
 	}
 
@@ -637,11 +649,10 @@ void softStart(animation_t targetPos, int timeMs) {
 
 			while (millis() < endTime) {
 				pwm.setPWM(i, 0, curpos[i]);
-				delay(10);
-				pwm.setPin(i, 0);
-				delay(50);
+				delay(60);
 			}
 			pwm.setPWM(i, 0, curpos[i]);
+			pwm.setPin(i, 0);
 			setpos[i] = curpos[i];
 		}
 	}

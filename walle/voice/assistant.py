@@ -220,14 +220,29 @@ class SpeechRouter(TranscriptEventListener):
         self._max_conversation_length = (
             20  # Rolling window to prevent unbounded memory growth
         )
-        self._busy = False
+        self._processing = False
+        self._stop_requested = False
         self._speaking = False
         self._last_text_length = 0
 
         self._state = self.IDLE
         self._command_text = ""
-        self._pending_command: Optional[str] = None
         self._timeout_timer: Optional[threading.Timer] = None
+
+        # Literal stop-intent whitelist. Matched by normalized text only —
+        # never routed through the LLM, so it passes even while processing.
+        self._stop_phrases: frozenset[str] = frozenset(
+            {
+                "stop",
+                "cancel",
+                "quiet",
+                "shut up",
+                "wall-e stop",
+                "wall e stop",
+                "stop wall-e",
+                "stop wall e",
+            }
+        )
 
         # Echo filter: store words from last TTS output to reject mic echo
         self._echo_words: set[str] = set()
@@ -406,11 +421,10 @@ class SpeechRouter(TranscriptEventListener):
         command = self._command_text.strip()
         self._state = self.IDLE
         self._command_text = ""
+        if self._processing:
+            # Previous turn is still running; drop whatever accumulated.
+            return
         if command:
-            if self._busy:
-                print("  ... still processing previous request, queued.")
-                self._pending_command = command
-                return
             threading.Thread(
                 target=self._handle_llm_query,
                 args=(command,),
@@ -418,6 +432,19 @@ class SpeechRouter(TranscriptEventListener):
             ).start()
         else:
             print("  ... no command heard, going back to sleep.")
+
+    def _is_stop_intent(self, text: str) -> bool:
+        normalized = self._strip_punctuation(text).lower().strip()
+        return normalized in self._stop_phrases
+
+    def _request_stop(self) -> None:
+        """Signal the active LLM/TTS turn to bail out as soon as possible."""
+        print("  ✋ stop heard — interrupting.")
+        self._stop_requested = True
+        try:
+            sd.stop()
+        except Exception:
+            pass
 
     # -- TranscriptEventListener callbacks --
 
@@ -454,7 +481,12 @@ class SpeechRouter(TranscriptEventListener):
             self._handled_utterances.discard(text)
             return
 
-        if self._busy:
+        # While an LLM turn is in flight, only a literal stop intent is
+        # allowed through. Everything else is dropped — no accumulation,
+        # no queuing — so the running turn gets to finish cleanly.
+        if self._processing:
+            if self._is_stop_intent(text):
+                self._request_stop()
             return
 
         # --- State machine ---
@@ -479,7 +511,8 @@ class SpeechRouter(TranscriptEventListener):
     # -- LLM query on background thread --
 
     def _handle_llm_query(self, text: str) -> None:
-        self._busy = True
+        self._processing = True
+        self._stop_requested = False
         try:
             self._conversation.append({"role": "user", "content": text})
 
@@ -487,6 +520,8 @@ class SpeechRouter(TranscriptEventListener):
             print("  🤖 ", end="", flush=True)
             chunks: list[str] = []
             for chunk in self._llm.stream_chat(self._conversation):
+                if self._stop_requested:
+                    break
                 print(chunk, end="", flush=True)
                 chunks.append(chunk)
             print()
@@ -500,21 +535,17 @@ class SpeechRouter(TranscriptEventListener):
                     -self._max_conversation_length :
                 ]
 
-            self._speak(full_response)
+            if not self._stop_requested and full_response:
+                self._speak(full_response)
         except Exception as e:
             print(f"\n  ... LLM error: {e}", file=sys.stderr)
         finally:
-            self._busy = False
-            # Process queued command if one arrived while we were busy
-            queued = self._pending_command
-            self._pending_command = None
-            if queued:
-                self._handle_llm_query(queued)
-            else:
-                self._state = self.LISTENING
-                self._command_text = ""
-                self._start_timeout(self._post_speak_timeout)
-                print("  👂 Listening for follow-up... (or stay silent to end)")
+            self._processing = False
+            self._stop_requested = False
+            self._state = self.LISTENING
+            self._command_text = ""
+            self._start_timeout(self._post_speak_timeout)
+            print("  👂 Listening for follow-up... (or stay silent to end)")
 
 
 # ─────────────────────────────────────────────────────────────
