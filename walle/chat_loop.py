@@ -137,9 +137,10 @@ class ChatSession:
 class LLMStreamer:
     """Wraps the OpenAI-compatible streaming API."""
 
-    def __init__(self, client, model: str):
+    def __init__(self, client, model: str, num_ctx: int | None = None):
         self._client = client
         self._model = model
+        self._num_ctx = num_ctx
 
     def stream(self, messages, tools, max_retries=2):
         """Call LLM and return (content, tool_calls_list).
@@ -158,6 +159,14 @@ class LLMStreamer:
                 t_first: Optional[float] = None
                 usage = None
 
+                # Pass num_ctx via extra_body so Ollama keeps the same KV
+                # buffer as the preload — otherwise it reloads the model
+                # mid-request and fragments Jetson UMA.
+                extra_body = (
+                    {"options": {"num_ctx": self._num_ctx}}
+                    if self._num_ctx
+                    else None
+                )
                 stream = self._client.chat.completions.create(
                     model=self._model,
                     messages=messages,
@@ -165,6 +174,7 @@ class LLMStreamer:
                     tool_choice="auto",
                     stream=True,
                     stream_options={"include_usage": True},
+                    extra_body=extra_body,
                 )
 
                 acc_content: list[str] = []
