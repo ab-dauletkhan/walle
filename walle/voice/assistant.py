@@ -189,6 +189,46 @@ class StubRobotController(BaseRobotController):
         pass
 
 
+class SerialRobotController(BaseRobotController):
+    """Maps wake-word ROBOT_INTENTS to RobotControlExecutor tool calls.
+
+    Mirrors walle.startup._RobotBridge but stays in voice.assistant so
+    `python -m walle.voice.assistant --serial-port ...` can drive real
+    hardware without importing the full startup composition root
+    (which pulls in memory, personality, vision, OpenAI, etc.).
+    """
+
+    _ACTION_MAP = {
+        "forward": ("drive", {"direction": "forward", "speed": 50, "duration_ms": 1000}),
+        "backward": ("drive", {"direction": "backward", "speed": 50, "duration_ms": 1000}),
+        "left": ("drive", {"direction": "left", "speed": 50, "duration_ms": 500}),
+        "right": ("drive", {"direction": "right", "speed": 50, "duration_ms": 500}),
+        "stop": ("stop_movement", {}),
+    }
+
+    def __init__(self, serial_manager, robot_exec):
+        self._serial = serial_manager
+        self._robot = robot_exec
+
+    def execute(self, action: str, utterance: str, confidence: float) -> None:
+        mapping = self._ACTION_MAP.get(action)
+        if mapping is None:
+            print(f"  [ROBOT] unknown action '{action}'", file=sys.stderr)
+            return
+        tool_name, tool_args = mapping
+        result = self._robot.execute(tool_name, tool_args)
+        print(
+            f"  [ROBOT] {action} → {tool_name}{tool_args} "
+            f"(heard: '{utterance}', conf {confidence:.0%}) → {result}"
+        )
+
+    def close(self) -> None:
+        try:
+            self._serial.close()
+        except Exception:
+            pass
+
+
 # ─────────────────────────────────────────────────────────────
 # Layer 2: TTS Engine
 # ─────────────────────────────────────────────────────────────
@@ -1180,6 +1220,20 @@ def parse_args():
         help="TTS voice (default: en_US/vctk_low#p236)",
     )
 
+    robot_group = p.add_argument_group("Robot")
+    robot_group.add_argument(
+        "--serial-port",
+        default=None,
+        help="Arduino serial port (e.g. /dev/ttyACM0). "
+             "Omit to run robot actions in simulation (stub) mode.",
+    )
+    robot_group.add_argument(
+        "--baud-rate",
+        type=int,
+        default=115200,
+        help="Arduino serial baud rate (default: 115200, must match firmware).",
+    )
+
     llm_group = p.add_argument_group("LLM")
     llm_group.add_argument(
         "--use-ollama", action="store_true", help="Use real Ollama instead of mock LLM"
@@ -1223,7 +1277,21 @@ def main():
         llm = MockLLMClient(token_delay=0.05)
         print("LLM: Mock (use --use-ollama for real)", file=sys.stderr)
 
-    robot = StubRobotController()
+    if args.serial_port:
+        from walle.serial_manager import SerialManager
+        from walle.tools.robot.executor import RobotControlExecutor
+
+        serial_mgr = SerialManager(port=args.serial_port, baud_rate=args.baud_rate)
+        robot_exec = RobotControlExecutor(serial_manager=serial_mgr)
+        robot = SerialRobotController(serial_mgr, robot_exec)
+        mode = "simulation" if serial_mgr.simulation else "connected"
+        print(
+            f"Robot: Arduino {args.serial_port} @ {args.baud_rate} ({mode})",
+            file=sys.stderr,
+        )
+    else:
+        robot = StubRobotController()
+        print("Robot: stub (no --serial-port)", file=sys.stderr)
 
     if args.no_tts:
         tts = ConsoleTTSEngine()
