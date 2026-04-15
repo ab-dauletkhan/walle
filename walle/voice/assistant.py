@@ -316,10 +316,17 @@ class SpeechRouter(TranscriptEventListener):
     )
     _WAKE_DEBOUNCE_SECONDS = 1.5
 
+    _INITIAL_LISTEN_WINDOW = 7.0  # seconds to start speaking after wake / after TTS
+
     @property
     def _post_speak_timeout(self) -> float:
-        """Timeout after speaking — must exceed echo window to avoid suppressing user's first words."""
-        return max(self._listen_timeout * 3, self._ECHO_WINDOW + 1)
+        """Initial window for the user to BEGIN speaking after wake word or
+        after WALL-E finishes. Once speech starts, the per-sentence silence
+        timer ( _current_silence_timeout ) takes over, so making this roomy
+        is free — it just means we wait longer for the first word.
+        Must also exceed the echo window so self-echo can't trigger commit.
+        """
+        return max(self._INITIAL_LISTEN_WINDOW, self._ECHO_WINDOW + 1)
 
     def _pause_mic(self) -> None:
         """Hard-gate the mic: stop audio capture so TTS can't self-echo."""
