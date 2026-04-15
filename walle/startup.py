@@ -246,7 +246,7 @@ def parse_args():
     parser.add_argument("--tts-voice", default="en_UK/apope_low", help="Mimic3 voice")
 
     # Voice / STT
-    parser.add_argument("--wake-word", default="hey robot", help="Wake word phrase")
+    parser.add_argument("--wake-word", default="hey", help="Wake word phrase")
     parser.add_argument(
         "--listen-timeout", type=float, default=0.5, help="Silence timeout (seconds)"
     )

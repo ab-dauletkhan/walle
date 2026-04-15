@@ -306,7 +306,7 @@ class SpeechRouter(TranscriptEventListener):
         llm: LLMClient,
         tts: BaseTTSEngine,
         system_prompt: str,
-        wake_word: str = "hey robot",
+        wake_word: str = "hey",
         listen_timeout: float = 0.5,
         listen_timeout_long: float = 1.0,
         max_utterance: float = 15.0,
@@ -822,7 +822,7 @@ class VoiceAssistant:
         embedding_quantization: str = "q4",
         intent_threshold: float = 0.65,
         intents: Optional[dict[str, str]] = None,
-        wake_word: str = "hey robot",
+        wake_word: str = "hey",
         listen_timeout: float = 0.5,
         listen_timeout_long: float = 1.0,
         max_utterance: float = 15.0,
@@ -944,8 +944,8 @@ def parse_args():
     )
     p.add_argument(
         "--wake-word",
-        default="hey robot",
-        help="Wake phrase to activate LLM queries (default: 'hey robot')",
+        default="hey",
+        help="Wake phrase to activate LLM queries (default: 'hey')",
     )
     p.add_argument(
         "--listen-timeout",
