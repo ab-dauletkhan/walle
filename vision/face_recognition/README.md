@@ -19,10 +19,20 @@ that provides `libedgetpu.so.1.0` on the Jetson/Linux host.
 
 Jetson users must install a Jetson-compatible `tflite-runtime` into that Python
 3.9 Coral environment. The helper script installs the Python packages it can,
-then verifies `tflite_runtime`; if the runtime is still missing, provide a
+then verifies `tflite_runtime`. If the Coral APT repository is configured on
+the Jetson, the script will auto-download `python3-tflite-runtime` and repair a
+broken `.venv-coral39` in place. If the runtime is still missing, provide a
 known-good wheel with `WALLE_CORAL_TFLITE_WHEEL=/path/to/wheel.whl`, or point it
 at the Coral Debian package with
 `WALLE_CORAL_TFLITE_DEB=/tmp/coral-deb/python3-tflite-runtime_2.5.0.post1_arm64.deb`.
+
+If the Coral environment gets into a bad state again, the recovery flow is:
+
+```bash
+uv sync --extra vision-coral
+scripts/setup_jetson_coral39.sh
+export WALLE_CORAL_PYTHON39="$PWD/.venv-coral39/bin/python"
+```
 
 Use `--no-edge-tpu` to run the non-TPU TFLite models.
 
