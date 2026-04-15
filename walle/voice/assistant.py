@@ -518,6 +518,10 @@ class SpeechRouter(TranscriptEventListener):
             return
         text = event.line.text
         if self._state == self.LISTENING:
+            # Keep the silence timer fresh while the user is still speaking,
+            # so slow-finalising Moonshine lines don't commit mid-sentence.
+            if text.strip():
+                self._start_timeout()
             display = f"  👂 {text}"
         else:
             display = f"  🎙  {text}"
