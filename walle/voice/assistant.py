@@ -30,7 +30,19 @@ import numpy as np
 import requests
 from scipy.io import wavfile
 
+# SpeechRouter subclasses TranscriptEventListener for the type; if
+# moonshine_voice isn't installed (e.g. text-mode-only hosts), fall
+# back to a plain object so module import still succeeds.
+try:
+    from moonshine_voice import TranscriptEventListener  # type: ignore
+except ImportError:  # pragma: no cover - exercised on voice-less hosts
+
+    class TranscriptEventListener:  # type: ignore[no-redef]
+        """Stub base used when moonshine_voice is unavailable."""
+
+
 from walle.voice.llm_client import LLMClient, MockLLMClient
+
 
 # sounddevice and moonshine_voice are voice-only deps. Importing them
 # eagerly makes `walle --text-mode` crash on hosts where they aren't
@@ -45,16 +57,6 @@ def _moonshine():
     import moonshine_voice  # noqa: PLC0415
 
     return moonshine_voice
-
-
-# SpeechRouter subclasses TranscriptEventListener for the type; if
-# moonshine_voice isn't installed (e.g. text-mode-only hosts), fall
-# back to a plain object so module import still succeeds.
-try:
-    from moonshine_voice import TranscriptEventListener  # type: ignore
-except ImportError:  # pragma: no cover - exercised on voice-less hosts
-    class TranscriptEventListener:  # type: ignore[no-redef]
-        """Stub base used when moonshine_voice is unavailable."""
 
 
 # STT model choice map — resolved lazily because it references
