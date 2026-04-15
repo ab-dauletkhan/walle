@@ -18,6 +18,7 @@ python3 -m stt_tts.main --wake-word "hey, rocket" --listen-timeout 3.0
 import argparse
 import io
 import os
+import queue
 import random
 import re
 import sys
@@ -149,16 +150,80 @@ class StubRobotController(BaseRobotController):
 
 
 class BaseTTSEngine(ABC):
-    """Interface for text-to-speech output."""
+    """Interface for text-to-speech output.
+
+    Subclasses implement `_synthesize_and_play(text)` as a blocking call.
+    The base class wraps it in a daemon worker thread so callers can
+    `enqueue(text)` from the LLM streaming loop and let synthesis +
+    playback overlap with further token generation. This is the core
+    trick that makes sentence-level pipelining possible: the first
+    sentence starts speaking while the LLM is still producing the rest.
+    """
+
+    def __init__(self) -> None:
+        self._tts_queue: queue.Queue[Optional[str]] = queue.Queue(maxsize=50)
+        self._tts_busy = threading.Event()  # set while synthesising or playing
+        self._tts_worker = threading.Thread(
+            target=self._tts_worker_loop, daemon=True
+        )
+        self._tts_worker.start()
 
     @abstractmethod
-    def speak(self, text: str) -> None: ...
+    def _synthesize_and_play(self, text: str) -> None:
+        """Blocking synth + playback for one sentence / utterance."""
+
+    def _tts_worker_loop(self) -> None:
+        while True:
+            item = self._tts_queue.get()
+            if item is None:
+                self._tts_queue.task_done()
+                break
+            try:
+                self._tts_busy.set()
+                self._synthesize_and_play(item)
+            except Exception as e:  # pragma: no cover - engine-specific
+                print(f"  TTS worker error: {e}", file=sys.stderr)
+            finally:
+                self._tts_busy.clear()
+                self._tts_queue.task_done()
+
+    def enqueue(self, text: str) -> None:
+        """Async: push a sentence to the worker and return immediately."""
+        text = text.strip()
+        if not text:
+            return
+        self._tts_queue.put(text)
+
+    def wait_until_idle(self) -> None:
+        """Block until the queue is drained AND the last sentence finished playing."""
+        self._tts_queue.join()
+        # Guard against a tiny window where join() returns before busy clears.
+        while self._tts_busy.is_set():
+            time.sleep(0.01)
+
+    def drain(self) -> None:
+        """Drop any pending sentences (used on stop-intent)."""
+        try:
+            while True:
+                self._tts_queue.get_nowait()
+                self._tts_queue.task_done()
+        except queue.Empty:
+            pass
+        try:
+            _sd().stop()
+        except Exception:
+            pass
+
+    def speak(self, text: str) -> None:
+        """Synchronous convenience wrapper — enqueue + wait."""
+        self.enqueue(text)
+        self.wait_until_idle()
 
 
 class ConsoleTTSEngine(BaseTTSEngine):
     """Prints to console instead of speaking."""
 
-    def speak(self, text: str) -> None:
+    def _synthesize_and_play(self, text: str) -> None:
         print(f"  [TTS] {text}")
 
 
@@ -168,12 +233,13 @@ class Mimic3TTSEngine(BaseTTSEngine):
     def __init__(
         self,
         url: str = "http://localhost:59125",
-        voice: str = "en_UK/apope_low",
+        voice: str = "en_US/vctk_low#p236",
     ):
+        super().__init__()
         self._url = url
         self._voice = voice
 
-    def speak(self, text: str) -> None:
+    def _synthesize_and_play(self, text: str) -> None:
         try:
             resp = requests.get(
                 f"{self._url}/api/tts",
@@ -241,8 +307,8 @@ class SpeechRouter(TranscriptEventListener):
         tts: BaseTTSEngine,
         system_prompt: str,
         wake_word: str = "hey robot",
-        listen_timeout: float = 1.0,
-        listen_timeout_long: float = 2.0,
+        listen_timeout: float = 0.5,
+        listen_timeout_long: float = 1.0,
         max_utterance: float = 15.0,
         wake_sounds_dir: Optional[str] = None,
         mic_pause: Optional[Callable[[], None]] = None,
@@ -310,13 +376,13 @@ class SpeechRouter(TranscriptEventListener):
     #    2) _is_echo() checks word overlap against last spoken text (content-based)
     #    Together they reliably filter self-heard audio on slow STT pipelines.
 
-    _ECHO_COOLDOWN = 0.3  # hard mic-mute after TTS; keep tight so follow-up feels instant
+    _ECHO_COOLDOWN = 0.05  # hard mic-mute after TTS; keep tight so follow-up feels instant
     _ECHO_WINDOW = (
-        2.5  # seconds after TTS to keep content-based echo filtering
+        0.8  # seconds after TTS to keep content-based echo filtering
     )
     _WAKE_DEBOUNCE_SECONDS = 1.5
 
-    _INITIAL_LISTEN_WINDOW = 7.0  # seconds to start speaking after wake / after TTS
+    _INITIAL_LISTEN_WINDOW = 0.5  # seconds to start speaking after wake / after TTS
 
     @property
     def _post_speak_timeout(self) -> float:
@@ -345,18 +411,33 @@ class SpeechRouter(TranscriptEventListener):
         except Exception as e:
             print(f"  ... mic resume error: {e}", file=sys.stderr)
 
-    def _speak(self, text: str) -> None:
-        """Speak and block. Hard-gates mic + sets echo suppression as defence-in-depth."""
+    _SENTENCE_ENDS = ".?!\n"
+
+    def _begin_speaking(self) -> None:
+        """Enter speaking state: gate mic so TTS can't self-echo."""
         self._speaking = True
-        self._echo_words = set(self._strip_punctuation(text).lower().split())
         self._pause_mic()
+
+    def _end_speaking(self, full_text: str) -> None:
+        """Leave speaking state after the TTS queue has drained."""
         try:
-            self._tts.speak(text)
+            self._echo_words = set(
+                self._strip_punctuation(full_text).lower().split()
+            )
             time.sleep(self._ECHO_COOLDOWN)
             self._echo_suppress_until = time.time() + self._ECHO_WINDOW
         finally:
             self._resume_mic()
             self._speaking = False
+
+    def _speak(self, text: str) -> None:
+        """Synchronous speak (used by callers outside the LLM stream loop)."""
+        self._begin_speaking()
+        try:
+            self._tts.enqueue(text)
+            self._tts.wait_until_idle()
+        finally:
+            self._end_speaking(text)
 
     _WAKE_ECHO_WORDS = {
         "yes",
@@ -561,7 +642,7 @@ class SpeechRouter(TranscriptEventListener):
         print("  ✋ stop heard — interrupting.")
         self._stop_requested = True
         try:
-            _sd().stop()
+            self._tts.drain()
         except Exception:
             pass
 
@@ -644,20 +725,48 @@ class SpeechRouter(TranscriptEventListener):
     def _handle_llm_query(self, text: str) -> None:
         self._processing = True
         self._stop_requested = False
+        speaking_started = False
+        full_response = ""
         try:
             self._conversation.append({"role": "user", "content": text})
 
             print(f"  🗣  You: {text}")
             print("  🤖 ", end="", flush=True)
-            chunks: list[str] = []
+
+            buf = ""
+            full_chunks: list[str] = []
             for chunk in self._llm.stream_chat(self._conversation):
                 if self._stop_requested:
                     break
                 print(chunk, end="", flush=True)
-                chunks.append(chunk)
+                full_chunks.append(chunk)
+                buf += chunk
+                # Flush every completed sentence to the TTS worker so
+                # playback of sentence N overlaps with generation of N+1.
+                while True:
+                    idx = -1
+                    for ender in self._SENTENCE_ENDS:
+                        pos = buf.find(ender)
+                        if pos != -1 and (idx == -1 or pos < idx):
+                            idx = pos
+                    if idx < 0:
+                        break
+                    sentence, buf = buf[: idx + 1].strip(), buf[idx + 1 :]
+                    if sentence:
+                        if not speaking_started:
+                            self._begin_speaking()
+                            speaking_started = True
+                        self._tts.enqueue(sentence)
             print()
-            full_response = "".join(chunks)
+            # Flush the tail (any trailing text without a final punctuation).
+            tail = buf.strip()
+            if tail and not self._stop_requested:
+                if not speaking_started:
+                    self._begin_speaking()
+                    speaking_started = True
+                self._tts.enqueue(tail)
 
+            full_response = "".join(full_chunks)
             self._conversation.append({"role": "assistant", "content": full_response})
 
             # Trim conversation to rolling window to prevent unbounded memory growth
@@ -666,11 +775,15 @@ class SpeechRouter(TranscriptEventListener):
                     -self._max_conversation_length :
                 ]
 
-            if not self._stop_requested and full_response:
-                self._speak(full_response)
+            if self._stop_requested:
+                self._tts.drain()
+            elif speaking_started:
+                self._tts.wait_until_idle()
         except Exception as e:
             print(f"\n  ... LLM error: {e}", file=sys.stderr)
         finally:
+            if speaking_started:
+                self._end_speaking(full_response)
             self._processing = False
             self._stop_requested = False
             self._state = self.LISTENING
@@ -712,8 +825,8 @@ class VoiceAssistant:
         intent_threshold: float = 0.65,
         intents: Optional[dict[str, str]] = None,
         wake_word: str = "hey robot",
-        listen_timeout: float = 1.0,
-        listen_timeout_long: float = 2.0,
+        listen_timeout: float = 0.5,
+        listen_timeout_long: float = 1.0,
         max_utterance: float = 15.0,
         wake_sounds_dir: Optional[str] = None,
         system_prompt: str = (
@@ -839,14 +952,14 @@ def parse_args():
     p.add_argument(
         "--listen-timeout",
         type=float,
-        default=1.0,
-        help="Short-command silence window in seconds (default: 1.0)",
+        default=0.5,
+        help="Short-command silence window in seconds (default: 0.5)",
     )
     p.add_argument(
         "--listen-timeout-long",
         type=float,
-        default=2.0,
-        help="Conversational silence window once the user is mid-sentence (default: 2.0)",
+        default=1.0,
+        help="Conversational silence window once the user is mid-sentence (default: 1.0)",
     )
     p.add_argument(
         "--max-utterance",
