@@ -94,15 +94,20 @@ class OllamaLLMClient(LLMClient):
         base_url: str = "http://localhost:11434",
         model: str = "qwen2.5:3b",
         system_prompt: str = (
-            "You are a helpful voice assistant on a Jetson robot. "
-            "Keep responses to 1-3 sentences since they will be spoken aloud."
+            "You are WALL-E, a voice assistant on a physical robot. Your replies "
+            "are spoken aloud, so they MUST be extremely short. Hard rules: "
+            "respond in ONE sentence by default, two at most. Never use lists, "
+            "bullets, markdown, emojis, or multiple paragraphs. No preamble, "
+            "no 'sure!', no repeating the question. Under 30 words."
         ),
+        max_tokens: int = 80,
     ):
         from openai import OpenAI
 
         self.client = OpenAI(base_url=f"{base_url}/v1", api_key="ollama")
         self.model = model
         self.system_prompt = system_prompt
+        self.max_tokens = max_tokens
 
     def stream_chat(self, messages: list[dict]) -> Iterator[str]:
         full_messages = [{"role": "system", "content": self.system_prompt}] + messages
@@ -111,6 +116,7 @@ class OllamaLLMClient(LLMClient):
             model=self.model,
             messages=full_messages,
             stream=True,
+            max_tokens=self.max_tokens,
         )
         for chunk in stream:
             delta = chunk.choices[0].delta
