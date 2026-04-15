@@ -382,7 +382,7 @@ class SpeechRouter(TranscriptEventListener):
     )
     _WAKE_DEBOUNCE_SECONDS = 1.5
 
-    _INITIAL_LISTEN_WINDOW = 0.5  # seconds to start speaking after wake / after TTS
+    _INITIAL_LISTEN_WINDOW = 10.0  # seconds to start speaking after wake / after TTS
 
     @property
     def _post_speak_timeout(self) -> float:
@@ -828,6 +828,8 @@ class VoiceAssistant:
         max_utterance: float = 15.0,
         wake_sounds_dir: Optional[str] = None,
         mic_device: Optional[int] = None,
+        mic_channels: int = 1,
+        mic_blocksize: int = 2048,
         system_prompt: str = (
             "You are a helpful voice assistant running on a Jetson-powered robot. "
             "Keep responses to 1-3 sentences — they will be spoken aloud via TTS."
@@ -862,7 +864,15 @@ class VoiceAssistant:
         # -- STT model --
         print("Loading STT model...", file=sys.stderr)
         model_path, model_arch = mv.get_model_for_language(language, stt_model_arch)
-        mic_kwargs: dict = {"model_path": model_path, "model_arch": model_arch}
+        # Larger blocksize reduces callback pressure → fewer input-overflows
+        # when LLM + TTS + STT all hit CPU at once. Explicit channels=1 keeps
+        # PortAudio from delivering 6 raw channels from the ReSpeaker array.
+        mic_kwargs: dict = {
+            "model_path": model_path,
+            "model_arch": model_arch,
+            "channels": mic_channels,
+            "blocksize": mic_blocksize,
+        }
         if mic_device is not None:
             mic_kwargs["device"] = mic_device
         self._mic = mv.MicTranscriber(**mic_kwargs)
@@ -1002,6 +1012,21 @@ def parse_args():
              "Use this to bypass pulse/ALSA default routing when walle can't hear you.",
     )
     p.add_argument(
+        "--mic-channels",
+        type=int,
+        default=1,
+        help="Mic input channels (default: 1). The ReSpeaker array is 6-ch "
+             "but Moonshine only needs mono — leaving this at 1 avoids pulling "
+             "5 channels of audio we'd throw away.",
+    )
+    p.add_argument(
+        "--mic-blocksize",
+        type=int,
+        default=2048,
+        help="PortAudio blocksize in samples (default: 2048 = 128 ms @ 16 kHz). "
+             "Raise to 4096 if you still see 'MicTranscriber: input overflow'.",
+    )
+    p.add_argument(
         "--intent-threshold",
         type=float,
         default=0.65,
@@ -1087,6 +1112,8 @@ def main():
         max_utterance=args.max_utterance,
         wake_sounds_dir=wake_sounds,
         mic_device=args.mic_device,
+        mic_channels=args.mic_channels,
+        mic_blocksize=args.mic_blocksize,
     )
     assistant.run()
 
