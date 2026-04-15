@@ -855,7 +855,9 @@ class VoiceAssistant:
 
         mv = _moonshine()
         if stt_model_arch is None:
-            stt_model_arch = mv.ModelArch.MEDIUM_STREAMING
+            # Tiny is the realtime-safe default on Jetson CPU; medium causes
+            # input-overflow because ONNX inference lags the audio stream.
+            stt_model_arch = mv.ModelArch.TINY_STREAMING
 
         # -- STT model --
         print("Loading STT model...", file=sys.stderr)
@@ -959,9 +961,10 @@ def parse_args():
     p.add_argument("--language", default="en", help="STT language (default: en)")
     p.add_argument(
         "--stt-model",
-        default="medium-streaming",
+        default="tiny-streaming",
         choices=STT_MODEL_NAMES,
-        help="Moonshine STT model (default: medium-streaming)",
+        help="Moonshine STT model (default: tiny-streaming — medium-streaming "
+             "causes input-overflow on Jetson CPU).",
     )
     p.add_argument(
         "--wake-word",
