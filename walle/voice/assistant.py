@@ -261,6 +261,7 @@ class SpeechRouter(TranscriptEventListener):
         self._wake_sounds_dir = wake_sounds_dir
 
         self._last_stable_text: str = ""
+        self._last_partial_raw: str = ""
         self._listen_started_monotonic: float = 0.0
 
         self._handled_utterances: set[str] = set()
@@ -510,7 +511,12 @@ class SpeechRouter(TranscriptEventListener):
         """Silence timer fired — send whatever we collected to the LLM."""
         if self._state != self.LISTENING:
             return
+        # Prefer finalized text from on_line_completed; fall back to the
+        # last partial transcript seen on-screen if Moonshine hasn't
+        # finalized the line yet when silence fires.
         command = self._command_text.strip()
+        if not command and self._last_partial_raw:
+            command = self._last_partial_raw
         elapsed = (
             time.monotonic() - self._listen_started_monotonic
             if self._listen_started_monotonic > 0
@@ -519,6 +525,7 @@ class SpeechRouter(TranscriptEventListener):
         self._state = self.IDLE
         self._command_text = ""
         self._last_stable_text = ""
+        self._last_partial_raw = ""
         self._listen_started_monotonic = 0.0
         if self._processing:
             # Previous turn is still running; drop whatever accumulated.
@@ -566,6 +573,7 @@ class SpeechRouter(TranscriptEventListener):
             normalized = self._strip_punctuation(text).lower().strip()
             if normalized and len(normalized) > len(self._last_stable_text):
                 self._last_stable_text = normalized
+                self._last_partial_raw = text.strip()
                 self._start_timeout()
             display = f"  👂 {text}"
         else:
@@ -608,6 +616,7 @@ class SpeechRouter(TranscriptEventListener):
             self._state = self.LISTENING
             self._command_text = initial_command
             self._last_stable_text = self._strip_punctuation(initial_command).lower().strip()
+            self._last_partial_raw = initial_command
             self._listen_started_monotonic = time.monotonic()
             self._play_wake_sound(initial_command)
 
@@ -658,6 +667,7 @@ class SpeechRouter(TranscriptEventListener):
             self._state = self.LISTENING
             self._command_text = ""
             self._last_stable_text = ""
+            self._last_partial_raw = ""
             self._listen_started_monotonic = time.monotonic()
             self._start_timeout(self._post_speak_timeout)
             print("  👂 Listening for follow-up... (or stay silent to end)")
