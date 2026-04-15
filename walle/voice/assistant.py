@@ -836,25 +836,22 @@ class VoiceAssistant:
         self._robot = robot
         self._tts = tts
 
-        # Pin the PortAudio default input before Moonshine opens the stream.
+        # Report which PortAudio device we're about to hand to Moonshine.
         # On Jetson the ALSA `default` is routed through pulse, which often
         # picks an empty source and makes walle feel "deaf". Accepting an
-        # explicit device index lets the user force the USB mic (see
-        # `python -m sounddevice` for the list).
-        sd_mod = _sd()
+        # explicit device index (see `python -m sounddevice` for the list)
+        # bypasses pulse entirely.
         if mic_device is not None:
             try:
-                existing = sd_mod.default.device
-                out_dev = existing[1] if isinstance(existing, (list, tuple)) else None
-                sd_mod.default.device = (mic_device, out_dev)
+                sd_mod = _sd()
                 info = sd_mod.query_devices(mic_device)
                 print(
-                    f"Mic: forced to device {mic_device} "
+                    f"Mic: device {mic_device} "
                     f"({info['name']}, {info['max_input_channels']} in)",
                     file=sys.stderr,
                 )
             except Exception as e:
-                print(f"  ... failed to pin mic device {mic_device}: {e}", file=sys.stderr)
+                print(f"  ... mic_device {mic_device} lookup failed: {e}", file=sys.stderr)
 
         mv = _moonshine()
         if stt_model_arch is None:
@@ -863,7 +860,10 @@ class VoiceAssistant:
         # -- STT model --
         print("Loading STT model...", file=sys.stderr)
         model_path, model_arch = mv.get_model_for_language(language, stt_model_arch)
-        self._mic = mv.MicTranscriber(model_path=model_path, model_arch=model_arch)
+        mic_kwargs: dict = {"model_path": model_path, "model_arch": model_arch}
+        if mic_device is not None:
+            mic_kwargs["device"] = mic_device
+        self._mic = mv.MicTranscriber(**mic_kwargs)
 
         # -- Intent recognizer --
         print("Loading embedding model for intent recognition...", file=sys.stderr)
