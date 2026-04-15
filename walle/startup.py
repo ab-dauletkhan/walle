@@ -253,7 +253,7 @@ def parse_args():
     parser.add_argument("--language", default="en", help="STT language")
     parser.add_argument(
         "--stt-model",
-        default="small-streaming",
+        default="medium-streaming",
         choices=[
             "tiny-streaming",
             "small-streaming",
@@ -516,7 +516,7 @@ def _run_voice_mode(orchestrator, robot_exec, args, lifecycle: LifecycleManager)
     # ModelArch is lazy-imported inside assistant.py to keep text-mode free
     # of the moonshine_voice dependency. Resolve the string choice here.
     stt_arch_map = _stt_model_choices()
-    stt_arch = stt_arch_map.get(args.stt_model, stt_arch_map["small-streaming"])
+    stt_arch = stt_arch_map.get(args.stt_model, stt_arch_map["medium-streaming"])
 
     wake_sounds_dir = os.path.join(_BASE, "voice", "wake_up_sounds")
     if not os.path.isdir(wake_sounds_dir):

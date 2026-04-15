@@ -387,7 +387,7 @@ vision/face_recognition/scanned_people/{person_number}/
 | Parameter        | Value                              |
 |------------------|------------------------------------|
 | Library          | `moonshine-voice`                  |
-| Model            | `SMALL_STREAMING` (~80 MB)         |
+| Model            | `MEDIUM_STREAMING`                 |
 | Embedding model  | `embeddinggemma-300m` (q4)         |
 | Input            | Microphone (default audio device)  |
 | Output           | Streaming text via callbacks       |
