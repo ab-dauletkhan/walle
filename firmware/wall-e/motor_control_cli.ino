@@ -9,15 +9,20 @@
 const uint8_t OE = 11;  // PCA9685 Output Enable, LOW = enabled
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 
-// Keep the motor_test sketch on the exact wiring that already worked on the robot.
-// On some boards pins 2 and 7 are not hardware PWM, but we preserve this mapping
-// because it matches the existing wiring and direction behavior in the old sketch.
-const uint8_t LEFT_ENA = 2;
+// ENA pins MUST be hardware-PWM-capable on the target board. On Arduino
+// Uno/Nano the PWM-capable pins are 3, 5, 6, 9, 10, 11 — plain digital
+// pins like 2 and 7 silently break analogWrite(), which then falls back
+// to digitalWrite(HIGH) only when value >= 128. With ENA on a non-PWM
+// pin every speed < 128 read as LOW and the motor stayed off, which is
+// why `drive 50 1000` looked like a no-op even though the firmware
+// acknowledged it. Pins 9 and 10 are free in this sketch and give real
+// 8-bit PWM speed control.
+const uint8_t LEFT_ENA = 9;    // was 2 — move the wire on the Uno header
 const uint8_t LEFT_IN1 = 3;
 const uint8_t LEFT_IN2 = 4;
 const uint8_t RIGHT_IN1 = 5;
 const uint8_t RIGHT_IN2 = 6;
-const uint8_t RIGHT_ENA = 7;
+const uint8_t RIGHT_ENA = 10;  // was 7 — move the wire on the Uno header
 
 // =========================
 // Safety / tuning
