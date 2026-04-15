@@ -241,7 +241,7 @@ class SpeechRouter(TranscriptEventListener):
         tts: BaseTTSEngine,
         system_prompt: str,
         wake_word: str = "hey robot",
-        listen_timeout: float = 3.0,
+        listen_timeout: float = 1.0,
         wake_sounds_dir: Optional[str] = None,
         mic_pause: Optional[Callable[[], None]] = None,
         mic_resume: Optional[Callable[[], None]] = None,
@@ -514,7 +514,7 @@ class SpeechRouter(TranscriptEventListener):
         self._last_text_length = 0
 
     def on_line_text_changed(self, event):
-        if self._speaking or self._is_echo(event.line.text):
+        if self._processing or self._speaking or self._is_echo(event.line.text):
             return
         text = event.line.text
         if self._state == self.LISTENING:
@@ -531,8 +531,13 @@ class SpeechRouter(TranscriptEventListener):
         if not text:
             return
 
-        # Suppress self-heard TTS — intents still fire via IntentRecognizer
-        if self._speaking or self._is_echo(text):
+        # Suppress self-heard TTS and any stray transcripts while a turn
+        # is in flight (LLM streaming + TTS + cooldown). Intents still fire
+        # via IntentRecognizer, which is registered separately.
+        if self._processing or self._speaking or self._is_echo(text):
+            # Allow a literal stop-intent to still interrupt
+            if self._processing and self._is_stop_intent(text):
+                self._request_stop()
             return
 
         print(f"\r  🎙  {text}" + " " * max(0, self._last_text_length - len(text) - 6))
@@ -541,14 +546,6 @@ class SpeechRouter(TranscriptEventListener):
         # Skip lines already handled by IntentRecognizer
         if text in self._handled_utterances:
             self._handled_utterances.discard(text)
-            return
-
-        # While an LLM turn is in flight, only a literal stop intent is
-        # allowed through. Everything else is dropped — no accumulation,
-        # no queuing — so the running turn gets to finish cleanly.
-        if self._processing:
-            if self._is_stop_intent(text):
-                self._request_stop()
             return
 
         # --- State machine ---
@@ -640,7 +637,7 @@ class VoiceAssistant:
         intent_threshold: float = 0.65,
         intents: Optional[dict[str, str]] = None,
         wake_word: str = "hey robot",
-        listen_timeout: float = 3.0,
+        listen_timeout: float = 1.0,
         wake_sounds_dir: Optional[str] = None,
         system_prompt: str = (
             "You are a helpful voice assistant running on a Jetson-powered robot. "
@@ -763,8 +760,8 @@ def parse_args():
     p.add_argument(
         "--listen-timeout",
         type=float,
-        default=3.0,
-        help="Seconds of silence before sending to LLM (default: 3.0)",
+        default=1.0,
+        help="Seconds of silence before sending to LLM (default: 1.0)",
     )
     p.add_argument(
         "--wake-sounds-dir",

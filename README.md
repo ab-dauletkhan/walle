@@ -626,7 +626,7 @@ IF |posError| > 1 (CONTROLLER_THRESHOLD):
 | Flag              | Default              | Description               |
 |-------------------|----------------------|---------------------------|
 | --wake-word       | "hey robot"          | Wake phrase                |
-| --listen-timeout  | 3.0                  | Silence timeout (seconds)  |
+| --listen-timeout  | 1.0                  | Silence timeout (seconds)  |
 | --tts-voice       | en_UK/apope_low      | Mimic3 voice ID            |
 | --stt-model       | small-streaming      | Moonshine model size       |
 
