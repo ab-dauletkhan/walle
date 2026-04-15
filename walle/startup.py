@@ -19,12 +19,11 @@ from walle.memory.heartbeat import HeartbeatManager
 from walle.memory.memory_system import ArchivalMemory, Memory, RecallMemory
 from walle.serial_manager import SerialManager
 from walle.tools.communication import CommunicationExecutor
-from walle.tools.knowledge import KnowledgeToolExecutor, get_knowledge_tools
-from walle.tools.memory_tools import MemoryToolExecutor, get_memory_tools
+from walle.tools.knowledge import KnowledgeToolExecutor
+from walle.tools.memory_tools import MemoryToolExecutor
 from walle.tools.personality import (
     PersonalityEngine,
     PersonalityToolExecutor,
-    get_personality_tools,
 )
 from walle.tools.registry import (
     CommunicationToolProvider,

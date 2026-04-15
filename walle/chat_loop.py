@@ -15,10 +15,10 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Optional
 
-_DUMP_PROMPT = os.environ.get("WALLE_DUMP_PROMPT", "").lower() in ("1", "true", "yes")
-
 from walle.memory.config import conf
 from walle.memory.context_manager import InteractionContext, SensorSimulator
+
+_DUMP_PROMPT = os.environ.get("WALLE_DUMP_PROMPT", "").lower() in ("1", "true", "yes")
 
 _log = logging.getLogger("walle.chat")
 
@@ -385,12 +385,10 @@ class ChatLoop:
         return result
 
     _MAX_ITERATIONS = 20
-    _MAX_STALE = 3
 
     def _tool_loop(self, memory_context: str) -> Optional[str]:
         """Inner loop: call LLM → execute tools → repeat until send_message."""
         iteration = 0
-        stale_count = 0
         user_received_message = False
 
         while iteration < self._MAX_ITERATIONS:
@@ -431,7 +429,6 @@ class ChatLoop:
                 continue
 
             self._session.add("assistant", content or "", tool_calls)
-            stale_count = 0
             hb_req = False
 
             for tc, args in parsed_calls:

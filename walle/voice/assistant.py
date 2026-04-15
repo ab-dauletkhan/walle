@@ -28,26 +28,56 @@ from typing import Optional
 
 import numpy as np
 import requests
-import sounddevice as sd
-from moonshine_voice import (
-    IntentRecognizer,
-    MicTranscriber,
-    ModelArch,
-    TranscriptEventListener,
-    get_embedding_model,
-    get_model_for_language,
-)
 from scipy.io import wavfile
 
 from walle.voice.llm_client import LLMClient, MockLLMClient
 
-STT_MODEL_CHOICES = {
-    "tiny-streaming": ModelArch.TINY_STREAMING,
-    "small-streaming": ModelArch.SMALL_STREAMING,
-    "medium-streaming": ModelArch.MEDIUM_STREAMING,
-    "tiny": ModelArch.TINY,
-    "base": ModelArch.BASE,
-}
+# sounddevice and moonshine_voice are voice-only deps. Importing them
+# eagerly makes `walle --text-mode` crash on hosts where they aren't
+# installed (e.g. Jetson with `uv sync --extra dev`). Resolve lazily.
+def _sd():
+    import sounddevice as sd  # noqa: PLC0415
+
+    return sd
+
+
+def _moonshine():
+    import moonshine_voice  # noqa: PLC0415
+
+    return moonshine_voice
+
+
+# SpeechRouter subclasses TranscriptEventListener for the type; if
+# moonshine_voice isn't installed (e.g. text-mode-only hosts), fall
+# back to a plain object so module import still succeeds.
+try:
+    from moonshine_voice import TranscriptEventListener  # type: ignore
+except ImportError:  # pragma: no cover - exercised on voice-less hosts
+    class TranscriptEventListener:  # type: ignore[no-redef]
+        """Stub base used when moonshine_voice is unavailable."""
+
+
+# STT model choice map — resolved lazily because it references
+# moonshine_voice.ModelArch which may not be installed in text mode.
+def _stt_model_choices() -> dict:
+    mv = _moonshine()
+    return {
+        "tiny-streaming": mv.ModelArch.TINY_STREAMING,
+        "small-streaming": mv.ModelArch.SMALL_STREAMING,
+        "medium-streaming": mv.ModelArch.MEDIUM_STREAMING,
+        "tiny": mv.ModelArch.TINY,
+        "base": mv.ModelArch.BASE,
+    }
+
+
+# String-keyed list for argparse `choices=` (no import of moonshine_voice).
+STT_MODEL_NAMES = [
+    "tiny-streaming",
+    "small-streaming",
+    "medium-streaming",
+    "tiny",
+    "base",
+]
 
 # Audio playback tuning for embedded Linux devices where default
 # low-latency settings can underrun under concurrent STT/LLM load.
@@ -69,8 +99,8 @@ def _play_audio_stable(
     audio: np.ndarray, sample_rate: int, blocking: bool = True
 ) -> None:
     audio = _to_float32_audio(audio)
-    sd.stop()
-    sd.play(
+    _sd().stop()
+    _sd().play(
         audio,
         sample_rate,
         blocking=blocking,
@@ -442,7 +472,7 @@ class SpeechRouter(TranscriptEventListener):
         print("  ✋ stop heard — interrupting.")
         self._stop_requested = True
         try:
-            sd.stop()
+            _sd().stop()
         except Exception:
             pass
 
@@ -572,7 +602,7 @@ class VoiceAssistant:
         robot: BaseRobotController,
         tts: BaseTTSEngine,
         language: str = "en",
-        stt_model_arch: Optional[ModelArch] = ModelArch.SMALL_STREAMING,
+        stt_model_arch=None,
         embedding_model: str = "embeddinggemma-300m",
         embedding_quantization: str = "q4",
         intent_threshold: float = 0.65,
@@ -588,17 +618,21 @@ class VoiceAssistant:
         self._robot = robot
         self._tts = tts
 
+        mv = _moonshine()
+        if stt_model_arch is None:
+            stt_model_arch = mv.ModelArch.SMALL_STREAMING
+
         # -- STT model --
         print("Loading STT model...", file=sys.stderr)
-        model_path, model_arch = get_model_for_language(language, stt_model_arch)
-        self._mic = MicTranscriber(model_path=model_path, model_arch=model_arch)
+        model_path, model_arch = mv.get_model_for_language(language, stt_model_arch)
+        self._mic = mv.MicTranscriber(model_path=model_path, model_arch=model_arch)
 
         # -- Intent recognizer --
         print("Loading embedding model for intent recognition...", file=sys.stderr)
-        emb_path, emb_arch = get_embedding_model(
+        emb_path, emb_arch = mv.get_embedding_model(
             embedding_model, embedding_quantization
         )
-        self._intent_recognizer = IntentRecognizer(
+        self._intent_recognizer = mv.IntentRecognizer(
             model_path=emb_path,
             model_arch=emb_arch,
             model_variant=embedding_quantization,
@@ -684,7 +718,7 @@ def parse_args():
     p.add_argument(
         "--stt-model",
         default="small-streaming",
-        choices=list(STT_MODEL_CHOICES.keys()),
+        choices=STT_MODEL_NAMES,
         help="Moonshine STT model (default: small-streaming)",
     )
     p.add_argument(
@@ -761,7 +795,7 @@ def main():
             f"TTS: Mimic3 at {args.tts_url} (voice: {args.tts_voice})", file=sys.stderr
         )
 
-    stt_arch = STT_MODEL_CHOICES[args.stt_model]
+    stt_arch = _stt_model_choices()[args.stt_model]
 
     wake_sounds = args.wake_sounds_dir
     if wake_sounds is None:
