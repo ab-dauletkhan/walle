@@ -309,15 +309,30 @@ class SpeechRouter(TranscriptEventListener):
         """Timeout after speaking — must exceed echo window to avoid suppressing user's first words."""
         return max(self._listen_timeout * 3, self._ECHO_WINDOW + 1)
 
+    def _pause_mic(self) -> None:
+        """Hard-gate the mic: stop audio capture so TTS can't self-echo."""
+        try:
+            self._mic.stop()
+        except Exception as e:
+            print(f"  ... mic pause error: {e}", file=sys.stderr)
+
+    def _resume_mic(self) -> None:
+        try:
+            self._mic.start()
+        except Exception as e:
+            print(f"  ... mic resume error: {e}", file=sys.stderr)
+
     def _speak(self, text: str) -> None:
-        """Speak and block. Sets echo suppression state."""
+        """Speak and block. Hard-gates mic + sets echo suppression as defence-in-depth."""
         self._speaking = True
         self._echo_words = set(self._strip_punctuation(text).lower().split())
+        self._pause_mic()
         try:
             self._tts.speak(text)
-            self._echo_suppress_until = time.time() + self._ECHO_WINDOW
             time.sleep(self._ECHO_COOLDOWN)
+            self._echo_suppress_until = time.time() + self._ECHO_WINDOW
         finally:
+            self._resume_mic()
             self._speaking = False
 
     _WAKE_ECHO_WORDS = {
@@ -369,6 +384,7 @@ class SpeechRouter(TranscriptEventListener):
         self._echo_words = self._WAKE_ECHO_WORDS.copy()
         self._echo_suppress_until = time.time() + self._ECHO_WINDOW
         self._last_wake_play_time = now
+        self._pause_mic()
 
         def _play():
             try:
@@ -379,6 +395,7 @@ class SpeechRouter(TranscriptEventListener):
             except Exception as e:
                 print(f"  Wake sound error: {e}", file=sys.stderr)
             finally:
+                self._resume_mic()
                 self._speaking = False
                 self._command_text = initial_command
                 self._start_timeout(
