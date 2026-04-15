@@ -30,7 +30,7 @@ class Config:
 
     # --- Ollama Settings (Recommended Backend) ---
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "gemma4:31b-cloud"  # Best tool calling among small models
+    OLLAMA_MODEL: str = "qwen2.5:3b"  # Small local model, fits Jetson VRAM
 
     # --- Embedding Model (Lightweight for Jetson) ---
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"  # 80MB model
@@ -149,10 +149,15 @@ def validate_ollama(config: "Config") -> tuple[bool, Optional[subprocess.Popen]]
             return False, None
 
         log.info("Starting ollama serve...")
+        env = os.environ.copy()
+        env.setdefault("OLLAMA_KEEP_ALIVE", "5m")
+        env.setdefault("OLLAMA_MAX_LOADED_MODELS", "1")
+        env.setdefault("OLLAMA_KV_CACHE_TYPE", "q8_0")
         process = subprocess.Popen(
             [binary, "serve"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=env,
         )
 
         for _ in range(10):

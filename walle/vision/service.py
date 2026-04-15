@@ -147,7 +147,31 @@ class SubprocessCoralVisionBackend(VisionBackend):
     def __init__(self):
         self._worker = CoralWorkerClient(timeout_ms=conf.VISION_CORAL_WORKER_TIMEOUT_MS)
         self._restarts = 0
+        try:
+            self._health_check()
+        except Exception as exc:
+            _log.warning("Coral subprocess health check failed: %s", exc)
+            try:
+                self._worker.close()
+            except Exception:
+                pass
+            raise
         _log.info("Coral subprocess backend initialized")
+
+    def _health_check(self) -> None:
+        """Round-trip a tiny frame through the worker to confirm it serves."""
+        import cv2
+
+        probe = np.zeros((8, 8, 3), dtype=np.uint8)
+        success, buf = cv2.imencode(".jpg", probe, [cv2.IMWRITE_JPEG_QUALITY, 50])
+        if not success:
+            raise RuntimeError("failed to encode health-check frame")
+        self._worker.request(
+            {
+                "op": "detect_recognize",
+                "frame_jpeg_base64": base64.b64encode(buf.tobytes()).decode("ascii"),
+            }
+        )
 
     def _restart_worker(self):
         self._worker.close()
@@ -197,7 +221,7 @@ class CPUVisionBackend(VisionBackend):
         self._yolo = YOLO(model_path)
 
         # ArcFace embedder (CPU only to save GPU for LLM)
-        onnx_path = os.path.join(cv_dir, "models", "w600k_r50.onnx")
+        onnx_path = os.path.join(cv_dir, "w600k_r50.onnx")
         if os.path.exists(onnx_path):
             self._emb_session = ort.InferenceSession(
                 onnx_path, providers=["CPUExecutionProvider"]
@@ -307,11 +331,19 @@ class VisionBackendRegistry:
         self._factories.append((name, factory))
 
     def create_first_available(self) -> Optional[VisionBackend]:
+        last_error: Optional[str] = None
         for name, factory in self._factories:
             try:
-                return factory()
+                backend = factory()
             except Exception as e:
+                last_error = f"{name}: {e}"
                 _log.warning("Backend '%s' unavailable: %s", name, e)
+                continue
+            if last_error:
+                _log.info("Vision backend: %s (previous failed — %s)", name, last_error)
+            else:
+                _log.info("Vision backend: %s (preferred)", name)
+            return backend
         _log.warning("No vision backend available — running without face recognition")
         return None
 
