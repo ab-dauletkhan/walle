@@ -827,6 +827,7 @@ class VoiceAssistant:
         listen_timeout_long: float = 1.0,
         max_utterance: float = 15.0,
         wake_sounds_dir: Optional[str] = None,
+        mic_device: Optional[int] = None,
         system_prompt: str = (
             "You are a helpful voice assistant running on a Jetson-powered robot. "
             "Keep responses to 1-3 sentences — they will be spoken aloud via TTS."
@@ -834,6 +835,26 @@ class VoiceAssistant:
     ):
         self._robot = robot
         self._tts = tts
+
+        # Pin the PortAudio default input before Moonshine opens the stream.
+        # On Jetson the ALSA `default` is routed through pulse, which often
+        # picks an empty source and makes walle feel "deaf". Accepting an
+        # explicit device index lets the user force the USB mic (see
+        # `python -m sounddevice` for the list).
+        sd_mod = _sd()
+        if mic_device is not None:
+            try:
+                existing = sd_mod.default.device
+                out_dev = existing[1] if isinstance(existing, (list, tuple)) else None
+                sd_mod.default.device = (mic_device, out_dev)
+                info = sd_mod.query_devices(mic_device)
+                print(
+                    f"Mic: forced to device {mic_device} "
+                    f"({info['name']}, {info['max_input_channels']} in)",
+                    file=sys.stderr,
+                )
+            except Exception as e:
+                print(f"  ... failed to pin mic device {mic_device}: {e}", file=sys.stderr)
 
         mv = _moonshine()
         if stt_model_arch is None:
@@ -969,6 +990,13 @@ def parse_args():
         "--wake-sounds-dir",
         default=None,
         help="Directory with .wav files to play on wake (default: wake_up_sounds/ next to script)",
+    )
+    p.add_argument(
+        "--mic-device",
+        type=int,
+        default=None,
+        help="PortAudio input device index (see `python -m sounddevice`). "
+             "Use this to bypass pulse/ALSA default routing when walle can't hear you.",
     )
     p.add_argument(
         "--intent-threshold",
