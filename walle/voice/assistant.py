@@ -1017,6 +1017,45 @@ class VoiceAssistant:
 # ─────────────────────────────────────────────────────────────
 
 
+def _parse_device(value: str):
+    """--mic-device / --speaker-device accept either a numeric PortAudio
+    index or a substring of a device name. Name matching is resolved at
+    startup against the live device list, so it survives USB re-enumeration
+    that would shift numeric indices between runs."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return value  # resolved against sd.query_devices() later
+
+
+def _resolve_device(value, kind: str) -> Optional[int]:
+    """Turn a --*-device value (int or name substring) into an index."""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    needle = value.lower()
+    try:
+        devs = _sd().query_devices()
+    except Exception as e:
+        print(f"  ... device query failed: {e}", file=sys.stderr)
+        return None
+    want_in = kind == "input"
+    for idx, d in enumerate(devs):
+        chans = d["max_input_channels"] if want_in else d["max_output_channels"]
+        if chans <= 0:
+            continue
+        if needle in d["name"].lower():
+            return idx
+    print(
+        f"  ... no {kind} device matching '{value}' — falling back to default",
+        file=sys.stderr,
+    )
+    return None
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="Voice Assistant: Moonshine STT + Intent + LLM"
@@ -1060,10 +1099,11 @@ def parse_args():
     )
     p.add_argument(
         "--mic-device",
-        type=int,
+        type=_parse_device,
         default=None,
-        help="PortAudio input device index (see `python -m sounddevice`). "
-             "Use this to bypass pulse/ALSA default routing when walle can't hear you.",
+        help="PortAudio input device — integer index OR substring of a device "
+             "name (see `python -m sounddevice`). Prefer the name: numeric "
+             "indices shift between runs when USB devices come and go.",
     )
     p.add_argument(
         "--mic-channels",
@@ -1075,7 +1115,7 @@ def parse_args():
     )
     p.add_argument(
         "--speaker-device",
-        type=int,
+        type=_parse_device,
         default=None,
         help="PortAudio output device index for TTS / wake sounds (see "
              "`python -m sounddevice`). Set this when the ALSA default routes "
@@ -1139,6 +1179,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    args.mic_device = _resolve_device(args.mic_device, "input")
+    args.speaker_device = _resolve_device(args.speaker_device, "output")
 
     set_output_device(
         args.speaker_device,
