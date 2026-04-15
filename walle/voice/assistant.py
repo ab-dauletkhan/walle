@@ -502,6 +502,14 @@ class SpeechRouter(TranscriptEventListener):
         "here",
     }
 
+    # Single-token transcripts Moonshine hallucinates on silence/noise.
+    # Used to drop ghost 1-word commands without killing legitimate
+    # short follow-ups like "what?", "okay", "stop", "yes", "no".
+    _FILLERS = {
+        "uh", "um", "hmm", "hm", "mm", "mhm", "huh",
+        "ah", "er", "eh", "yeah", "yep", "the", "a",
+    }
+
     def _play_wake_sound(self, initial_command: str = "") -> None:
         """Play a random WAV from wake_sounds_dir (non-blocking).
 
@@ -663,12 +671,17 @@ class SpeechRouter(TranscriptEventListener):
         if self._processing:
             # Previous turn is still running; drop whatever accumulated.
             return
-        # Min-growth guard: 1-word utterances are almost always mumble/noise
-        # ("uh-huh", "hmm", "yeah"). Real single-word commands go through
-        # the IntentRecognizer path, not the LLM path, so we can reject here.
-        if command and len(command.split()) < 2:
-            print("  ... heard too little, ignoring.")
-            return
+        # Filter out Moonshine's filler-word hallucinations on silence/noise
+        # without rejecting legitimate short follow-ups like "what?", "why?",
+        # "okay", "stop", "yes", "no".
+        if command:
+            normalized = self._strip_punctuation(command).lower().strip()
+            tokens = normalized.split()
+            if len(tokens) == 1 and (
+                tokens[0] in self._FILLERS or len(tokens[0]) < 2
+            ):
+                print(f"  ... ignoring filler '{command}'")
+                return
         if command:
             threading.Thread(
                 target=self._handle_llm_query,
