@@ -627,7 +627,7 @@ class VoiceAssistant:
 
         mv = _moonshine()
         if stt_model_arch is None:
-            stt_model_arch = mv.ModelArch.SMALL_STREAMING
+            stt_model_arch = mv.ModelArch.MEDIUM_STREAMING
 
         # -- STT model --
         print("Loading STT model...", file=sys.stderr)
@@ -724,9 +724,9 @@ def parse_args():
     p.add_argument("--language", default="en", help="STT language (default: en)")
     p.add_argument(
         "--stt-model",
-        default="small-streaming",
+        default="medium-streaming",
         choices=STT_MODEL_NAMES,
-        help="Moonshine STT model (default: small-streaming)",
+        help="Moonshine STT model (default: medium-streaming)",
     )
     p.add_argument(
         "--wake-word",
