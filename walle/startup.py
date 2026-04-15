@@ -99,7 +99,7 @@ def build_app(args) -> tuple:
     client = OpenAI(
         base_url=f"{conf.OLLAMA_BASE_URL}/v1", api_key="ollama", timeout=120.0
     )
-    llm_streamer = LLMStreamer(client, conf.OLLAMA_MODEL)
+    llm_streamer = LLMStreamer(client, conf.OLLAMA_MODEL, num_ctx=conf.OLLAMA_NUM_CTX)
 
     # -- Prompt & memory providers --
     prompt_builder = SystemPromptBuilder(
@@ -502,8 +502,8 @@ def _run_voice_mode(orchestrator, robot_exec, args, lifecycle: LifecycleManager)
         ROBOT_INTENTS,
         ConsoleTTSEngine,
         Mimic3TTSEngine,
-        ModelArch,
         VoiceAssistant,
+        _stt_model_choices,
     )
 
     robot_bridge = _RobotBridge(robot_exec)
@@ -513,14 +513,10 @@ def _run_voice_mode(orchestrator, robot_exec, args, lifecycle: LifecycleManager)
         else Mimic3TTSEngine(url=args.tts_url, voice=args.tts_voice)
     )
 
-    stt_arch_map = {
-        "tiny-streaming": ModelArch.TINY_STREAMING,
-        "small-streaming": ModelArch.SMALL_STREAMING,
-        "medium-streaming": ModelArch.MEDIUM_STREAMING,
-        "tiny": ModelArch.TINY,
-        "base": ModelArch.BASE,
-    }
-    stt_arch = stt_arch_map.get(args.stt_model, ModelArch.SMALL_STREAMING)
+    # ModelArch is lazy-imported inside assistant.py to keep text-mode free
+    # of the moonshine_voice dependency. Resolve the string choice here.
+    stt_arch_map = _stt_model_choices()
+    stt_arch = stt_arch_map.get(args.stt_model, stt_arch_map["small-streaming"])
 
     wake_sounds_dir = os.path.join(_BASE, "voice", "wake_up_sounds")
     if not os.path.isdir(wake_sounds_dir):

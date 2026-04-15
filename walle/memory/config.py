@@ -31,6 +31,10 @@ class Config:
     # --- Ollama Settings (Recommended Backend) ---
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "qwen2.5:3b"  # Small local model, fits Jetson VRAM
+    # KV cache scales linearly with num_ctx. On Jetson UMA (8GB shared),
+    # 4096 = 144 MiB KV, 2048 = 72 MiB. Must match the preload in start.sh
+    # or Ollama reloads the model on first request and fragments VRAM.
+    OLLAMA_NUM_CTX: int = 2048
 
     # --- Embedding Model (Lightweight for Jetson) ---
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"  # 80MB model
