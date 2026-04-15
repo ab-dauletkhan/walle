@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import requests
@@ -243,9 +243,13 @@ class SpeechRouter(TranscriptEventListener):
         wake_word: str = "hey robot",
         listen_timeout: float = 3.0,
         wake_sounds_dir: Optional[str] = None,
+        mic_pause: Optional[Callable[[], None]] = None,
+        mic_resume: Optional[Callable[[], None]] = None,
     ):
         self._llm = llm
         self._tts = tts
+        self._mic_pause_cb = mic_pause
+        self._mic_resume_cb = mic_resume
         self._system_prompt = system_prompt
         self._wake_word = wake_word.strip()
         self._wake_tokens = set(re.sub(r"[^\w\s]", "", wake_word).lower().split())
@@ -311,14 +315,18 @@ class SpeechRouter(TranscriptEventListener):
 
     def _pause_mic(self) -> None:
         """Hard-gate the mic: stop audio capture so TTS can't self-echo."""
+        if self._mic_pause_cb is None:
+            return
         try:
-            self._mic.stop()
+            self._mic_pause_cb()
         except Exception as e:
             print(f"  ... mic pause error: {e}", file=sys.stderr)
 
     def _resume_mic(self) -> None:
+        if self._mic_resume_cb is None:
+            return
         try:
-            self._mic.start()
+            self._mic_resume_cb()
         except Exception as e:
             print(f"  ... mic resume error: {e}", file=sys.stderr)
 
@@ -671,6 +679,8 @@ class VoiceAssistant:
             wake_word=wake_word,
             listen_timeout=listen_timeout,
             wake_sounds_dir=wake_sounds_dir,
+            mic_pause=self._mic.stop,
+            mic_resume=self._mic.start,
         )
 
         # -- Register robot intents --
