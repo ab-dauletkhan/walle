@@ -92,16 +92,27 @@ STT_MODEL_NAMES = [
 AUDIO_BLOCKSIZE = 4096
 AUDIO_LATENCY = "high"
 
-# Module-level override for PortAudio output device index. Set once at
-# startup from --speaker-device so every _play_audio_stable() call (TTS,
-# wake sound) targets the same physical speaker instead of relying on
-# the ALSA/pulse default, which on Jetson can silently route to HDMI.
+# Module-level overrides for PortAudio output. Set once at startup from
+# --speaker-device / --speaker-rate so every _play_audio_stable() call
+# (TTS, wake sound) targets the same physical speaker at a rate the DAC
+# actually accepts. Needed on Jetson because:
+#   1. The ALSA/pulse default can silently route to HDMI.
+#   2. Cheap USB DACs (e.g. UACDemoV1.0) only accept a single fixed rate
+#      like 48000 Hz stereo, and PortAudio's hw: path does not resample.
 OUTPUT_DEVICE: Optional[int] = None
+OUTPUT_RATE: Optional[int] = None
+OUTPUT_CHANNELS: Optional[int] = None
 
 
-def set_output_device(device: Optional[int]) -> None:
-    global OUTPUT_DEVICE
+def set_output_device(
+    device: Optional[int],
+    rate: Optional[int] = None,
+    channels: Optional[int] = None,
+) -> None:
+    global OUTPUT_DEVICE, OUTPUT_RATE, OUTPUT_CHANNELS
     OUTPUT_DEVICE = device
+    OUTPUT_RATE = rate
+    OUTPUT_CHANNELS = channels
 
 
 def _to_float32_audio(audio: np.ndarray) -> np.ndarray:
@@ -118,6 +129,27 @@ def _play_audio_stable(
     audio: np.ndarray, sample_rate: int, blocking: bool = True
 ) -> None:
     audio = _to_float32_audio(audio)
+
+    # Resample + channel-expand to whatever the selected output device
+    # actually accepts. PortAudio's ALSA hw: path does not resample, so
+    # a 22050 Hz TTS stream into a 48000-only USB DAC would raise
+    # paInvalidSampleRate. Doing it here keeps every caller unaware.
+    target_rate = OUTPUT_RATE if OUTPUT_RATE is not None else sample_rate
+    if target_rate != sample_rate:
+        from scipy.signal import resample_poly  # noqa: PLC0415
+        from math import gcd  # noqa: PLC0415
+
+        g = gcd(int(target_rate), int(sample_rate))
+        up = int(target_rate) // g
+        down = int(sample_rate) // g
+        audio = resample_poly(audio, up, down).astype(np.float32)
+        sample_rate = target_rate
+
+    if OUTPUT_CHANNELS is not None and audio.ndim == 1 and OUTPUT_CHANNELS >= 2:
+        audio = np.repeat(audio[:, None], OUTPUT_CHANNELS, axis=1)
+
+    audio = np.ascontiguousarray(audio)
+
     _sd().stop()
     kwargs = dict(
         samplerate=sample_rate,
@@ -1041,6 +1073,21 @@ def parse_args():
              "to HDMI instead of the USB speaker.",
     )
     p.add_argument(
+        "--speaker-rate",
+        type=int,
+        default=None,
+        help="Resample all playback audio to this Hz before sending to "
+             "--speaker-device. Needed for USB DACs that only accept a fixed "
+             "rate (e.g. UACDemoV1.0 = 48000).",
+    )
+    p.add_argument(
+        "--speaker-channels",
+        type=int,
+        default=None,
+        help="Expand mono audio to this many channels before playback. "
+             "Set to 2 for USB DACs that only accept stereo.",
+    )
+    p.add_argument(
         "--mic-blocksize",
         type=int,
         default=2048,
@@ -1084,9 +1131,22 @@ def parse_args():
 def main():
     args = parse_args()
 
-    set_output_device(args.speaker_device)
+    set_output_device(
+        args.speaker_device,
+        rate=args.speaker_rate,
+        channels=args.speaker_channels,
+    )
     if args.speaker_device is not None:
-        print(f"Speaker: PortAudio device {args.speaker_device}", file=sys.stderr)
+        extras = []
+        if args.speaker_rate is not None:
+            extras.append(f"{args.speaker_rate} Hz")
+        if args.speaker_channels is not None:
+            extras.append(f"{args.speaker_channels}ch")
+        suffix = f" ({', '.join(extras)})" if extras else ""
+        print(
+            f"Speaker: PortAudio device {args.speaker_device}{suffix}",
+            file=sys.stderr,
+        )
 
     # -- Select LLM backend --
     if args.use_ollama:
