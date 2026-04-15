@@ -25,7 +25,6 @@ DEFAULT_SERIAL_PORT = "/dev/ttyCH341USB0"
 DEFAULT_SERIAL_BAUD = 115200
 SERIAL_STARTUP_WAIT_SEC = 2.5
 
-HEAD_CHANNEL = 2
 HEAD_RIGHT_TICK = 150
 HEAD_CENTER_TICK = 350
 HEAD_LEFT_TICK = 550
@@ -59,11 +58,6 @@ BODY_ASSIST_RETURN_STEP = 8
 BODY_TURN_PWM = 150
 BODY_TURN_45_SEC = 0.28
 BODY_TURN_90_SEC = 0.56
-BODY_TURN_LEFT_MOTOR_A_SIGN = -1
-BODY_TURN_LEFT_MOTOR_B_SIGN = +1
-BODY_TURN_RIGHT_MOTOR_A_SIGN = +1
-BODY_TURN_RIGHT_MOTOR_B_SIGN = -1
-
 
 class HeadController:
     def __init__(self, port: str, baud: int):
@@ -122,7 +116,7 @@ class HeadController:
         self.current_tick = tick
 
         if self.enabled and self.ser is not None:
-            cmd = f"set {HEAD_CHANNEL} {tick}\n"
+            cmd = f"head tick {tick}\n"
             self.ser.write(cmd.encode("utf-8"))
             self.ser.flush()
 
@@ -147,9 +141,8 @@ class HeadController:
             self.ser.write(f"{command}\n".encode("utf-8"))
             self.ser.flush()
 
-    def send_motor_speeds(self, motor_a: int, motor_b: int):
-        self.send_raw_command(f"ma {int(motor_a)}")
-        self.send_raw_command(f"mb {int(motor_b)}")
+    def send_spin_command(self, speed: int):
+        self.send_raw_command(f"spin {int(speed)}")
 
     def stop_body_turn(self):
         if self.body_turn_active:
@@ -166,13 +159,11 @@ class HeadController:
             return False
 
         if turn_dir > 0:
-            motor_a = BODY_TURN_LEFT_MOTOR_A_SIGN * BODY_TURN_PWM
-            motor_b = BODY_TURN_LEFT_MOTOR_B_SIGN * BODY_TURN_PWM
+            spin_speed = BODY_TURN_PWM
         else:
-            motor_a = BODY_TURN_RIGHT_MOTOR_A_SIGN * BODY_TURN_PWM
-            motor_b = BODY_TURN_RIGHT_MOTOR_B_SIGN * BODY_TURN_PWM
+            spin_speed = -BODY_TURN_PWM
 
-        self.send_motor_speeds(motor_a, motor_b)
+        self.send_spin_command(spin_speed)
         now = time.monotonic()
         self.body_turn_active = True
         self.body_turn_dir = turn_dir

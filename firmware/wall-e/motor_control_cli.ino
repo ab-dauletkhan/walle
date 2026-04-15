@@ -1,4 +1,3 @@
-#include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 #include <ctype.h>
 #include <stdlib.h>
