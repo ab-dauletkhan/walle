@@ -242,6 +242,8 @@ class SpeechRouter(TranscriptEventListener):
         system_prompt: str,
         wake_word: str = "hey robot",
         listen_timeout: float = 1.0,
+        listen_timeout_long: float = 2.0,
+        max_utterance: float = 15.0,
         wake_sounds_dir: Optional[str] = None,
         mic_pause: Optional[Callable[[], None]] = None,
         mic_resume: Optional[Callable[[], None]] = None,
@@ -254,7 +256,12 @@ class SpeechRouter(TranscriptEventListener):
         self._wake_word = wake_word.strip()
         self._wake_tokens = set(re.sub(r"[^\w\s]", "", wake_word).lower().split())
         self._listen_timeout = listen_timeout
+        self._listen_timeout_long = listen_timeout_long
+        self._max_utterance = max_utterance
         self._wake_sounds_dir = wake_sounds_dir
+
+        self._last_stable_text: str = ""
+        self._listen_started_monotonic: float = 0.0
 
         self._handled_utterances: set[str] = set()
         self._conversation: list[dict] = []
@@ -464,9 +471,32 @@ class SpeechRouter(TranscriptEventListener):
 
     # -- Silence timeout management --
 
+    def _current_silence_timeout(self) -> float:
+        """Adaptive silence window: longer once the user is mid-sentence.
+
+        Short commands commit fast; conversational utterances get a longer
+        pause tolerance so mid-sentence thinking doesn't trigger early commit.
+        """
+        word_count = len(self._command_text.split())
+        if word_count > 3:
+            return self._listen_timeout_long
+        return self._listen_timeout
+
     def _start_timeout(self, duration: float | None = None) -> None:
         self._cancel_timeout()
-        timeout = duration if duration is not None else self._listen_timeout
+        # Hard cap: if we've been listening longer than max_utterance, commit now.
+        if (
+            self._state == self.LISTENING
+            and self._listen_started_monotonic > 0
+            and time.monotonic() - self._listen_started_monotonic
+            >= self._max_utterance
+        ):
+            self._on_timeout()
+            return
+        if duration is None:
+            timeout = self._current_silence_timeout()
+        else:
+            timeout = duration
         self._timeout_timer = threading.Timer(timeout, self._on_timeout)
         self._timeout_timer.daemon = True
         self._timeout_timer.start()
@@ -481,10 +511,21 @@ class SpeechRouter(TranscriptEventListener):
         if self._state != self.LISTENING:
             return
         command = self._command_text.strip()
+        elapsed = (
+            time.monotonic() - self._listen_started_monotonic
+            if self._listen_started_monotonic > 0
+            else 0.0
+        )
         self._state = self.IDLE
         self._command_text = ""
+        self._last_stable_text = ""
+        self._listen_started_monotonic = 0.0
         if self._processing:
             # Previous turn is still running; drop whatever accumulated.
+            return
+        # Min-growth guard: discard tiny fragments from early finalisation.
+        if command and len(command.split()) < 2 and elapsed < 0.8:
+            print("  ... heard too little, ignoring.")
             return
         if command:
             threading.Thread(
@@ -518,9 +559,13 @@ class SpeechRouter(TranscriptEventListener):
             return
         text = event.line.text
         if self._state == self.LISTENING:
-            # Keep the silence timer fresh while the user is still speaking,
-            # so slow-finalising Moonshine lines don't commit mid-sentence.
-            if text.strip():
+            # Only reset the silence timer when the transcript actually GREW
+            # with new content. Moonshine re-emits partial refinements even
+            # during silence/noise — resetting on every event keeps the mic
+            # open forever. Stability endpointing fixes that.
+            normalized = self._strip_punctuation(text).lower().strip()
+            if normalized and len(normalized) > len(self._last_stable_text):
+                self._last_stable_text = normalized
                 self._start_timeout()
             display = f"  👂 {text}"
         else:
@@ -562,6 +607,8 @@ class SpeechRouter(TranscriptEventListener):
             print("  👂 Yes, how can I help you?")
             self._state = self.LISTENING
             self._command_text = initial_command
+            self._last_stable_text = self._strip_punctuation(initial_command).lower().strip()
+            self._listen_started_monotonic = time.monotonic()
             self._play_wake_sound(initial_command)
 
         elif self._state == self.LISTENING:
@@ -569,6 +616,9 @@ class SpeechRouter(TranscriptEventListener):
                 self._command_text += " " + text
             else:
                 self._command_text = text
+            normalized = self._strip_punctuation(self._command_text).lower().strip()
+            if len(normalized) > len(self._last_stable_text):
+                self._last_stable_text = normalized
             self._start_timeout()
 
     # -- LLM query on background thread --
@@ -607,6 +657,8 @@ class SpeechRouter(TranscriptEventListener):
             self._stop_requested = False
             self._state = self.LISTENING
             self._command_text = ""
+            self._last_stable_text = ""
+            self._listen_started_monotonic = time.monotonic()
             self._start_timeout(self._post_speak_timeout)
             print("  👂 Listening for follow-up... (or stay silent to end)")
 
@@ -642,6 +694,8 @@ class VoiceAssistant:
         intents: Optional[dict[str, str]] = None,
         wake_word: str = "hey robot",
         listen_timeout: float = 1.0,
+        listen_timeout_long: float = 2.0,
+        max_utterance: float = 15.0,
         wake_sounds_dir: Optional[str] = None,
         system_prompt: str = (
             "You are a helpful voice assistant running on a Jetson-powered robot. "
@@ -679,6 +733,8 @@ class VoiceAssistant:
             system_prompt=system_prompt,
             wake_word=wake_word,
             listen_timeout=listen_timeout,
+            listen_timeout_long=listen_timeout_long,
+            max_utterance=max_utterance,
             wake_sounds_dir=wake_sounds_dir,
             mic_pause=self._mic.stop,
             mic_resume=self._mic.start,
@@ -765,7 +821,19 @@ def parse_args():
         "--listen-timeout",
         type=float,
         default=1.0,
-        help="Seconds of silence before sending to LLM (default: 1.0)",
+        help="Short-command silence window in seconds (default: 1.0)",
+    )
+    p.add_argument(
+        "--listen-timeout-long",
+        type=float,
+        default=2.0,
+        help="Conversational silence window once the user is mid-sentence (default: 2.0)",
+    )
+    p.add_argument(
+        "--max-utterance",
+        type=float,
+        default=15.0,
+        help="Hard upper bound on a single listen window in seconds (default: 15.0)",
     )
     p.add_argument(
         "--wake-sounds-dir",
@@ -854,6 +922,8 @@ def main():
         intent_threshold=args.intent_threshold,
         wake_word=args.wake_word,
         listen_timeout=args.listen_timeout,
+        listen_timeout_long=args.listen_timeout_long,
+        max_utterance=args.max_utterance,
         wake_sounds_dir=wake_sounds,
     )
     assistant.run()
