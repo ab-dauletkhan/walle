@@ -310,9 +310,9 @@ class SpeechRouter(TranscriptEventListener):
     #    2) _is_echo() checks word overlap against last spoken text (content-based)
     #    Together they reliably filter self-heard audio on slow STT pipelines.
 
-    _ECHO_COOLDOWN = 2.0
+    _ECHO_COOLDOWN = 0.3  # hard mic-mute after TTS; keep tight so follow-up feels instant
     _ECHO_WINDOW = (
-        4.0  # seconds after TTS to keep content-based filtering (reduced from 8s)
+        2.5  # seconds after TTS to keep content-based echo filtering
     )
     _WAKE_DEBOUNCE_SECONDS = 1.5
 
@@ -530,8 +530,10 @@ class SpeechRouter(TranscriptEventListener):
         if self._processing:
             # Previous turn is still running; drop whatever accumulated.
             return
-        # Min-growth guard: discard tiny fragments from early finalisation.
-        if command and len(command.split()) < 2 and elapsed < 0.8:
+        # Min-growth guard: 1-word utterances are almost always mumble/noise
+        # ("uh-huh", "hmm", "yeah"). Real single-word commands go through
+        # the IntentRecognizer path, not the LLM path, so we can reject here.
+        if command and len(command.split()) < 2:
             print("  ... heard too little, ignoring.")
             return
         if command:
