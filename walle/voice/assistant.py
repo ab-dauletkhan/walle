@@ -772,6 +772,11 @@ class SpeechRouter(TranscriptEventListener):
         self._stop_requested = False
         speaking_started = False
         full_response = ""
+        # Gate the mic for the entire LLM+TTS phase, not just once the
+        # first sentence is ready to speak. Ollama and onnxruntime both
+        # saturate the Jetson's CPU during generation; leaving Moonshine
+        # streaming in parallel causes PortAudio ring buffer overflows.
+        self._pause_mic()
         try:
             self._conversation.append({"role": "user", "content": text})
 
@@ -829,6 +834,10 @@ class SpeechRouter(TranscriptEventListener):
         finally:
             if speaking_started:
                 self._end_speaking(full_response)
+            else:
+                # No TTS happened (empty/error response) — still need to
+                # un-gate the mic we paused at the top of this method.
+                self._resume_mic()
             self._processing = False
             self._stop_requested = False
             self._state = self.LISTENING
