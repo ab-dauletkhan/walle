@@ -92,6 +92,17 @@ STT_MODEL_NAMES = [
 AUDIO_BLOCKSIZE = 4096
 AUDIO_LATENCY = "high"
 
+# Module-level override for PortAudio output device index. Set once at
+# startup from --speaker-device so every _play_audio_stable() call (TTS,
+# wake sound) targets the same physical speaker instead of relying on
+# the ALSA/pulse default, which on Jetson can silently route to HDMI.
+OUTPUT_DEVICE: Optional[int] = None
+
+
+def set_output_device(device: Optional[int]) -> None:
+    global OUTPUT_DEVICE
+    OUTPUT_DEVICE = device
+
 
 def _to_float32_audio(audio: np.ndarray) -> np.ndarray:
     if audio.dtype == np.int16:
@@ -108,13 +119,15 @@ def _play_audio_stable(
 ) -> None:
     audio = _to_float32_audio(audio)
     _sd().stop()
-    _sd().play(
-        audio,
-        sample_rate,
+    kwargs = dict(
+        samplerate=sample_rate,
         blocking=blocking,
         latency=AUDIO_LATENCY,
         blocksize=AUDIO_BLOCKSIZE,
     )
+    if OUTPUT_DEVICE is not None:
+        kwargs["device"] = OUTPUT_DEVICE
+    _sd().play(audio, **kwargs)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1020,6 +1033,14 @@ def parse_args():
              "5 channels of audio we'd throw away.",
     )
     p.add_argument(
+        "--speaker-device",
+        type=int,
+        default=None,
+        help="PortAudio output device index for TTS / wake sounds (see "
+             "`python -m sounddevice`). Set this when the ALSA default routes "
+             "to HDMI instead of the USB speaker.",
+    )
+    p.add_argument(
         "--mic-blocksize",
         type=int,
         default=2048,
@@ -1062,6 +1083,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    set_output_device(args.speaker_device)
+    if args.speaker_device is not None:
+        print(f"Speaker: PortAudio device {args.speaker_device}", file=sys.stderr)
 
     # -- Select LLM backend --
     if args.use_ollama:
