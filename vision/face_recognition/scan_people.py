@@ -3,23 +3,18 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+from pathlib import Path
 
-import numpy as np
-
-from .common import (
-    FaceRecognitionError,
-    annotate_detections,
-    best_detection,
-    create_detection_interpreter,
-    crop_face_rgb,
-    detect_faces,
-    input_size,
-    load_labels,
-    require_cv2,
-    require_pil_image,
-    resolve_data_dir,
-)
-from .coral_runtime import reexec_module_with_coral_python, should_delegate_edge_tpu
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from vision.face_recognition.coral_runtime import (
+        reexec_module_with_coral_python,
+        should_delegate_edge_tpu,
+    )
+    from vision.face_recognition.errors import FaceRecognitionError
+else:
+    from .coral_runtime import reexec_module_with_coral_python, should_delegate_edge_tpu
+    from .errors import FaceRecognitionError
 
 DEFAULT_CAMERA_WIDTH = 1280
 DEFAULT_CAMERA_HEIGHT = 960
@@ -70,11 +65,67 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run(args: argparse.Namespace) -> None:
-    cv2 = require_cv2()
-    Image = require_pil_image()
+def _load_runtime_dependencies():
+    try:
+        import numpy as np
+    except ModuleNotFoundError as exc:
+        if exc.name == "numpy":
+            raise FaceRecognitionError(
+                "NumPy is not installed. Run `uv sync --extra vision-coral` from "
+                "the repo root for the main runtime, and `scripts/setup_jetson_coral39.sh` "
+                "for the Coral Python 3.9 runtime."
+            ) from exc
+        raise
 
-    data_dir = resolve_data_dir(args.data_dir)
+    if __package__ in {None, ""}:
+        from vision.face_recognition.common import (
+            annotate_detections,
+            best_detection,
+            create_detection_interpreter,
+            crop_face_rgb,
+            detect_faces,
+            input_size,
+            load_labels,
+            require_cv2,
+            require_pil_image,
+            resolve_data_dir,
+        )
+    else:
+        from .common import (
+            annotate_detections,
+            best_detection,
+            create_detection_interpreter,
+            crop_face_rgb,
+            detect_faces,
+            input_size,
+            load_labels,
+            require_cv2,
+            require_pil_image,
+            resolve_data_dir,
+        )
+
+    return {
+        "np": np,
+        "annotate_detections": annotate_detections,
+        "best_detection": best_detection,
+        "create_detection_interpreter": create_detection_interpreter,
+        "crop_face_rgb": crop_face_rgb,
+        "detect_faces": detect_faces,
+        "input_size": input_size,
+        "load_labels": load_labels,
+        "require_cv2": require_cv2,
+        "require_pil_image": require_pil_image,
+        "resolve_data_dir": resolve_data_dir,
+    }
+
+
+def run(args: argparse.Namespace) -> None:
+    deps = _load_runtime_dependencies()
+    np = deps["np"]
+    cv2 = deps["require_cv2"]()
+    Image = deps["require_pil_image"]()
+
+    data_dir = deps["resolve_data_dir"](args.data_dir)
     person_dir = data_dir / str(args.person)
     png_dir = person_dir / "png"
     npy_dir = person_dir / "npy"
@@ -89,9 +140,9 @@ def run(args: argparse.Namespace) -> None:
     png_dir.mkdir(parents=True)
     npy_dir.mkdir(parents=True)
 
-    labels = load_labels()
-    interpreter = create_detection_interpreter(args.edge_tpu)
-    input_width, input_height = input_size(interpreter)
+    labels = deps["load_labels"]()
+    interpreter = deps["create_detection_interpreter"](args.edge_tpu)
+    input_width, input_height = deps["input_size"](interpreter)
 
     cap = cv2.VideoCapture(args.camera_index)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.camera_width)
@@ -117,18 +168,18 @@ def run(args: argparse.Namespace) -> None:
                 (input_width, input_height), Image.LANCZOS
             )
 
-            detections = detect_faces(
+            detections = deps["detect_faces"](
                 interpreter,
                 detection_image,
                 args.threshold,
                 frame_width,
                 frame_height,
             )
-            annotate_detections(frame, detections, labels, cv2)
+            deps["annotate_detections"](frame, detections, labels, cv2)
 
-            detection = best_detection(detections)
+            detection = deps["best_detection"](detections)
             if detection is not None:
-                crop = crop_face_rgb(np.asarray(image_rgb), detection)
+                crop = deps["crop_face_rgb"](np.asarray(image_rgb), detection)
                 if crop is not None:
                     Image.fromarray(crop).save(png_dir / f"img_{saved}.png")
                     np.save(npy_dir / f"img_{saved}.npy", crop)

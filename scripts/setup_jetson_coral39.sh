@@ -45,12 +45,15 @@ import sys
 
 print("Python:", sys.version)
 try:
-    import tflite_runtime  # noqa: F401
-    print("tflite_runtime: OK")
+    import tflite_runtime
+    from tflite_runtime.interpreter import Interpreter, load_delegate  # noqa: F401
+    print("tflite_runtime:", getattr(tflite_runtime, "__file__", None))
+    print("tflite_runtime.interpreter: OK")
 except Exception as exc:  # pragma: no cover - setup script only
     raise SystemExit(
-        "ERROR: tflite_runtime is not available in the Coral Python 3.9 environment. "
-        "Install a known-good Jetson wheel or set WALLE_CORAL_TFLITE_WHEEL.\n"
+        "ERROR: the Coral Python 3.9 environment does not have a working "
+        "tflite_runtime.interpreter module. Install a known-good Jetson wheel, "
+        "or set WALLE_CORAL_TFLITE_WHEEL / WALLE_CORAL_TFLITE_DEB.\n"
         f"Original error: {exc}"
     )
 PY
