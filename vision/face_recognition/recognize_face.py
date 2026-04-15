@@ -2,27 +2,18 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
-import numpy as np
-
-from .common import (
-    PEOPLE_LABELS_PATH,
-    FaceRecognitionError,
-    annotate_detections,
-    best_detection,
-    create_detection_interpreter,
-    create_embedding_interpreter,
-    detect_faces,
-    input_size,
-    load_labels,
-    load_people_embeddings,
-    recognize_detection,
-    recommended_live_edge_tpu_modes,
-    require_cv2,
-    require_pil_image,
-    resolve_data_dir,
-)
-from .coral_runtime import reexec_module_with_coral_python, should_delegate_edge_tpu
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from vision.face_recognition.coral_runtime import (
+        reexec_module_with_coral_python,
+        should_delegate_edge_tpu,
+    )
+    from vision.face_recognition.errors import FaceRecognitionError
+else:
+    from .coral_runtime import reexec_module_with_coral_python, should_delegate_edge_tpu
+    from .errors import FaceRecognitionError
 
 DEFAULT_CAMERA_WIDTH = 1280
 DEFAULT_CAMERA_HEIGHT = 960
@@ -68,17 +59,85 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run(args: argparse.Namespace) -> None:
-    cv2 = require_cv2()
-    Image = require_pil_image()
+def _load_runtime_dependencies():
+    try:
+        import numpy as np
+    except ModuleNotFoundError as exc:
+        if exc.name == "numpy":
+            raise FaceRecognitionError(
+                "NumPy is not installed. Run `uv sync --extra vision-coral` from "
+                "the repo root for the main runtime, and `scripts/setup_jetson_coral39.sh` "
+                "for the Coral Python 3.9 runtime."
+            ) from exc
+        raise
 
-    data_dir = resolve_data_dir(args.data_dir)
-    labels = load_labels()
-    people_labels = load_labels(PEOPLE_LABELS_PATH)
-    people_embeddings = load_people_embeddings(data_dir, required=True)
+    if __package__ in {None, ""}:
+        from vision.face_recognition.common import (
+            PEOPLE_LABELS_PATH,
+            annotate_detections,
+            best_detection,
+            create_detection_interpreter,
+            create_embedding_interpreter,
+            detect_faces,
+            input_size,
+            load_labels,
+            load_people_embeddings,
+            recognize_detection,
+            recommended_live_edge_tpu_modes,
+            require_cv2,
+            require_pil_image,
+            resolve_data_dir,
+        )
+    else:
+        from .common import (
+            PEOPLE_LABELS_PATH,
+            annotate_detections,
+            best_detection,
+            create_detection_interpreter,
+            create_embedding_interpreter,
+            detect_faces,
+            input_size,
+            load_labels,
+            load_people_embeddings,
+            recognize_detection,
+            recommended_live_edge_tpu_modes,
+            require_cv2,
+            require_pil_image,
+            resolve_data_dir,
+        )
+
+    return {
+        "np": np,
+        "PEOPLE_LABELS_PATH": PEOPLE_LABELS_PATH,
+        "annotate_detections": annotate_detections,
+        "best_detection": best_detection,
+        "create_detection_interpreter": create_detection_interpreter,
+        "create_embedding_interpreter": create_embedding_interpreter,
+        "detect_faces": detect_faces,
+        "input_size": input_size,
+        "load_labels": load_labels,
+        "load_people_embeddings": load_people_embeddings,
+        "recognize_detection": recognize_detection,
+        "recommended_live_edge_tpu_modes": recommended_live_edge_tpu_modes,
+        "require_cv2": require_cv2,
+        "require_pil_image": require_pil_image,
+        "resolve_data_dir": resolve_data_dir,
+    }
+
+
+def run(args: argparse.Namespace) -> None:
+    deps = _load_runtime_dependencies()
+    np = deps["np"]
+    cv2 = deps["require_cv2"]()
+    Image = deps["require_pil_image"]()
+
+    data_dir = deps["resolve_data_dir"](args.data_dir)
+    labels = deps["load_labels"]()
+    people_labels = deps["load_labels"](deps["PEOPLE_LABELS_PATH"])
+    people_embeddings = deps["load_people_embeddings"](data_dir, required=True)
 
     default_detector_edge_tpu, default_embedder_edge_tpu = (
-        recommended_live_edge_tpu_modes(args.edge_tpu)
+        deps["recommended_live_edge_tpu_modes"](args.edge_tpu)
     )
     detector_edge_tpu = (
         default_detector_edge_tpu
@@ -91,9 +150,9 @@ def run(args: argparse.Namespace) -> None:
         else args.embedder_edge_tpu
     )
 
-    detection_interpreter = create_detection_interpreter(detector_edge_tpu)
-    embedding_interpreter = create_embedding_interpreter(embedder_edge_tpu)
-    input_width, input_height = input_size(detection_interpreter)
+    detection_interpreter = deps["create_detection_interpreter"](detector_edge_tpu)
+    embedding_interpreter = deps["create_embedding_interpreter"](embedder_edge_tpu)
+    input_width, input_height = deps["input_size"](detection_interpreter)
 
     cap = cv2.VideoCapture(args.camera_index)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.camera_width)
@@ -123,16 +182,16 @@ def run(args: argparse.Namespace) -> None:
                 (input_width, input_height), Image.LANCZOS
             )
 
-            detections = detect_faces(
+            detections = deps["detect_faces"](
                 detection_interpreter,
                 detection_image,
                 args.detection_threshold,
                 frame_width,
                 frame_height,
             )
-            annotate_detections(frame, detections, labels, cv2)
+            deps["annotate_detections"](frame, detections, labels, cv2)
 
-            detection = best_detection(detections)
+            detection = deps["best_detection"](detections)
             if detection is None:
                 print("face: NOT DETECTED")
             else:
@@ -144,7 +203,7 @@ def run(args: argparse.Namespace) -> None:
                 )
 
             if detection is not None and detection.score >= args.recognition_threshold:
-                match = recognize_detection(
+                match = deps["recognize_detection"](
                     embedding_interpreter,
                     np.asarray(image_rgb),
                     detection,

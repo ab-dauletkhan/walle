@@ -3,16 +3,18 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+from pathlib import Path
 
-import numpy as np
-
-from .common import (
-    FaceRecognitionError,
-    create_embedding_interpreter,
-    image_to_embedding,
-    resolve_data_dir,
-)
-from .coral_runtime import reexec_module_with_coral_python, should_delegate_edge_tpu
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from vision.face_recognition.coral_runtime import (
+        reexec_module_with_coral_python,
+        should_delegate_edge_tpu,
+    )
+    from vision.face_recognition.errors import FaceRecognitionError
+else:
+    from .coral_runtime import reexec_module_with_coral_python, should_delegate_edge_tpu
+    from .errors import FaceRecognitionError
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,8 +38,44 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _load_runtime_dependencies():
+    try:
+        import numpy as np
+    except ModuleNotFoundError as exc:
+        if exc.name == "numpy":
+            raise FaceRecognitionError(
+                "NumPy is not installed. Run `uv sync --extra vision-coral` from "
+                "the repo root for the main runtime, and `scripts/setup_jetson_coral39.sh` "
+                "for the Coral Python 3.9 runtime."
+            ) from exc
+        raise
+
+    if __package__ in {None, ""}:
+        from vision.face_recognition.common import (
+            create_embedding_interpreter,
+            image_to_embedding,
+            resolve_data_dir,
+        )
+    else:
+        from .common import (
+            create_embedding_interpreter,
+            image_to_embedding,
+            resolve_data_dir,
+        )
+
+    return {
+        "np": np,
+        "create_embedding_interpreter": create_embedding_interpreter,
+        "image_to_embedding": image_to_embedding,
+        "resolve_data_dir": resolve_data_dir,
+    }
+
+
 def run(args: argparse.Namespace) -> None:
-    data_dir = resolve_data_dir(args.data_dir)
+    deps = _load_runtime_dependencies()
+    np = deps["np"]
+
+    data_dir = deps["resolve_data_dir"](args.data_dir)
     person_dir = data_dir / str(args.person)
     npy_dir = person_dir / "npy"
     embeddings_dir = person_dir / "embeddings"
@@ -55,11 +93,11 @@ def run(args: argparse.Namespace) -> None:
         shutil.rmtree(embeddings_dir)
     embeddings_dir.mkdir(parents=True)
 
-    interpreter = create_embedding_interpreter(args.edge_tpu)
+    interpreter = deps["create_embedding_interpreter"](args.edge_tpu)
 
     for path in files:
         face_crop = np.load(path).reshape(1, 96, 96, 3) / 255.0
-        embedding = image_to_embedding(interpreter, face_crop)
+        embedding = deps["image_to_embedding"](interpreter, face_crop)
         np.save(embeddings_dir / path.name, embedding)
         print(f"created embedding: {embeddings_dir / path.name}")
 

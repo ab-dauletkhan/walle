@@ -9,6 +9,8 @@ from typing import Optional
 
 import numpy as np
 
+from .errors import FaceRecognitionError
+
 FACE_DIR = Path(__file__).resolve().parent
 MODELS_DIR = FACE_DIR / "models"
 DEFAULT_DATA_DIR = FACE_DIR / "scanned_people"
@@ -19,11 +21,6 @@ DETECTION_MODEL = "ssd_mobilenet_v2_face_quant_postprocess.tflite"
 DETECTION_EDGE_TPU_MODEL = "ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite"
 EMBEDDING_MODEL = "Mobilenet1_triplet1589223569_triplet_quant.tflite"
 EMBEDDING_EDGE_TPU_MODEL = "Mobilenet1_triplet1589223569_triplet_quant_edgetpu.tflite"
-
-
-class FaceRecognitionError(RuntimeError):
-    """Raised when the face recognition utilities cannot run safely."""
-
 
 @dataclass(frozen=True)
 class Detection:
