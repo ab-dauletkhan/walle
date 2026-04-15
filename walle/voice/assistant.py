@@ -199,10 +199,10 @@ class SerialRobotController(BaseRobotController):
     """
 
     _ACTION_MAP = {
-        "forward": ("drive", {"direction": "forward", "speed": 50, "duration_ms": 1000}),
-        "backward": ("drive", {"direction": "backward", "speed": 50, "duration_ms": 1000}),
-        "left": ("drive", {"direction": "left", "speed": 50, "duration_ms": 500}),
-        "right": ("drive", {"direction": "right", "speed": 50, "duration_ms": 500}),
+        "forward": ("drive", {"direction": "forward", "speed": 85, "duration_ms": 2000}),
+        "backward": ("drive", {"direction": "backward", "speed": 85, "duration_ms": 2000}),
+        "left": ("drive", {"direction": "left", "speed": 75, "duration_ms": 900}),
+        "right": ("drive", {"direction": "right", "speed": 75, "duration_ms": 900}),
         "stop": ("stop_movement", {}),
     }
 
