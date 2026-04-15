@@ -60,9 +60,10 @@ BODY_TURN_45_SEC = 0.28
 BODY_TURN_90_SEC = 0.56
 
 class HeadController:
-    def __init__(self, port: str, baud: int):
+    def __init__(self, port: str, baud: int, np_module):
         self.enabled = False
         self.ser = None
+        self.np = np_module
 
         self.current_tick = HEAD_OPTICAL_CENTER_TICK
         self.last_sent_tick = None
@@ -257,7 +258,7 @@ class HeadController:
             }
 
         self.recent_face_x.append(face_center_x)
-        filtered_x = float(np.median(self.recent_face_x))
+        filtered_x = float(self.np.median(self.recent_face_x))
 
         if self.smoothed_x is None:
             self.smoothed_x = filtered_x
@@ -295,7 +296,7 @@ class HeadController:
         right_x = frame_width - edge_margin_px
         mapped_x = min(max(self.smoothed_x, left_x), right_x)
 
-        target_tick = np.interp(
+        target_tick = self.np.interp(
             mapped_x, [left_x, right_x], [HEAD_LEFT_TICK, HEAD_RIGHT_TICK]
         )
 
@@ -588,7 +589,7 @@ def run(args: argparse.Namespace) -> None:
     if not cap.isOpened():
         raise FaceRecognitionError(f"Could not open camera index {args.camera_index}.")
 
-    head = HeadController(args.serial_port, args.serial_baud)
+    head = HeadController(args.serial_port, args.serial_baud, np)
     print(
         "Runtime: "
         f"detector={'Edge TPU' if detector_edge_tpu else 'CPU'}, "
