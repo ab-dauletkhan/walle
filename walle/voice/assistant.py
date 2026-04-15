@@ -805,8 +805,6 @@ ROBOT_INTENTS = {
     "turn left": "left",
     "turn right": "right",
     "stop moving": "stop",
-    "wave hello": "wave",
-    "dance": "dance",
 }
 
 
@@ -992,8 +990,8 @@ def parse_args():
     )
     tts_group.add_argument(
         "--tts-voice",
-        default="en_UK/apope_low",
-        help="TTS voice (default: en_UK/apope_low)",
+        default="en_US/vctk_low#p236",
+        help="TTS voice (default: en_US/vctk_low#p236)",
     )
 
     llm_group = p.add_argument_group("LLM")

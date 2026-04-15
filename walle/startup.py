@@ -125,8 +125,8 @@ def build_app(args) -> tuple:
         archival_mem=archival_mem,
         heartbeat=heartbeat,
         context_manager=context_manager,
-        on_turn_start=lambda: robot_exec.set_idle_mode(False),
-        on_turn_end=lambda: robot_exec.set_idle_mode(True),
+        on_turn_start=None,
+        on_turn_end=None,
     )
 
     # -- Register shutdown hooks --
@@ -466,14 +466,15 @@ class _RobotBridge:
     instantiated in voice mode after those deps are lazy-loaded.
     """
 
+    # Voice intents map directly to the unified `drive` tool. The old
+    # wave/dance intents targeted arm/neck servos that no longer exist in
+    # the CLI firmware, so they're dropped rather than silently no-oped.
     ACTION_MAP = {
-        "forward": ("drive_forward", {"speed": 50, "duration_ms": 1000}),
-        "backward": ("drive_backward", {"speed": 50, "duration_ms": 1000}),
-        "left": ("turn_left", {"speed": 50, "duration_ms": 500}),
-        "right": ("turn_right", {"speed": 50, "duration_ms": 500}),
+        "forward": ("drive", {"direction": "forward", "speed": 50, "duration_ms": 1000}),
+        "backward": ("drive", {"direction": "backward", "speed": 50, "duration_ms": 1000}),
+        "left": ("drive", {"direction": "left", "speed": 50, "duration_ms": 500}),
+        "right": ("drive", {"direction": "right", "speed": 50, "duration_ms": 500}),
         "stop": ("stop_movement", {}),
-        "wave": ("wave_hello", {}),
-        "dance": ("express_emotion", {"emotion": "happy"}),
     }
 
     def __init__(self, robot_exec):
