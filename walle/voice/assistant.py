@@ -28,7 +28,6 @@ from typing import Optional
 
 import numpy as np
 import requests
-from scipy.io import wavfile
 
 # SpeechRouter subclasses TranscriptEventListener for the type; if
 # moonshine_voice isn't installed (e.g. text-mode-only hosts), fall
@@ -57,6 +56,12 @@ def _moonshine():
     import moonshine_voice  # noqa: PLC0415
 
     return moonshine_voice
+
+
+def _wavfile():
+    from scipy.io import wavfile  # noqa: PLC0415
+
+    return wavfile
 
 
 # STT model choice map — resolved lazily because it references
@@ -190,7 +195,7 @@ class Mimic3TTSEngine(BaseTTSEngine):
                 )
                 return
             try:
-                sr, audio = wavfile.read(io.BytesIO(resp.content))
+                sr, audio = _wavfile().read(io.BytesIO(resp.content))
             except Exception as e:
                 print(f"  TTS error: corrupt audio data: {e}", file=sys.stderr)
                 return
@@ -368,7 +373,7 @@ class SpeechRouter(TranscriptEventListener):
         def _play():
             try:
                 with self._wake_play_lock:
-                    sr, audio = wavfile.read(random.choice(wavs))
+                    sr, audio = _wavfile().read(random.choice(wavs))
                     _play_audio_stable(audio, sr)
                     time.sleep(self._ECHO_COOLDOWN)
             except Exception as e:
