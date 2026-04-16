@@ -560,7 +560,9 @@ class VoiceAssistant:
         # -- STT model --
         print("Loading STT model...", file=sys.stderr)
         model_path, model_arch = get_model_for_language(language, stt_model_arch)
-        self._mic = MicTranscriber(model_path=model_path, model_arch=model_arch)
+        self._mic = MicTranscriber(
+            model_path=model_path, model_arch=model_arch, blocksize=4096
+        )
 
         # -- Intent recognizer --
         print("Loading embedding model for intent recognition...", file=sys.stderr)
