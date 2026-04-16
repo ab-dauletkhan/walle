@@ -8,12 +8,14 @@ from pathlib import Path
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from vision.camera_source import default_headless_mode, open_camera_source
     from vision.face_recognition.coral_runtime import (
         reexec_module_with_coral_python,
         should_delegate_edge_tpu,
     )
     from vision.face_recognition.errors import FaceRecognitionError
 else:
+    from vision.camera_source import default_headless_mode, open_camera_source
     from .coral_runtime import reexec_module_with_coral_python, should_delegate_edge_tpu
     from .errors import FaceRecognitionError
 
@@ -58,6 +60,7 @@ BODY_ASSIST_RETURN_STEP = 8
 BODY_TURN_PWM = 150
 BODY_TURN_45_SEC = 0.28
 BODY_TURN_90_SEC = 0.56
+
 
 class HeadController:
     def __init__(self, port: str, baud: int, np_module):
@@ -343,10 +346,7 @@ class HeadController:
                 and dwell_sec >= BODY_ASSIST_STRONG_EDGE_DWELL_SEC
             )
             normal_hold = dwell_sec >= BODY_ASSIST_EDGE_DWELL_SEC
-            if (
-                now >= self.body_turn_cooldown_until
-                and (strong_hold or normal_hold)
-            ):
+            if now >= self.body_turn_cooldown_until and (strong_hold or normal_hold):
                 body_turn_dir = desired_dir
                 turn_duration = BODY_TURN_90_SEC if strong_hold else BODY_TURN_45_SEC
                 self.start_body_turn(body_turn_dir, turn_duration)
@@ -463,21 +463,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-width", type=int, default=DEFAULT_CAMERA_WIDTH)
     parser.add_argument("--camera-height", type=int, default=DEFAULT_CAMERA_HEIGHT)
     parser.add_argument("--fps", type=int, default=DEFAULT_CAMERA_FPS)
+    parser.add_argument(
+        "--headless",
+        "--no-window",
+        dest="headless",
+        action="store_true",
+        help="Run without the OpenCV preview window.",
+    )
+    parser.add_argument(
+        "--window",
+        dest="headless",
+        action="store_false",
+        help="Force the OpenCV preview window on.",
+    )
+    parser.set_defaults(headless=None)
     parser.add_argument("--detection-threshold", type=float, default=0.5)
     parser.add_argument(
         "--recognition-threshold", type=float, default=FACE_SCORE_THRESHOLD
     )
     parser.add_argument("--match-threshold", type=float, default=0.5)
     return parser
-
-
-def open_camera(cv2, camera_index: int):
-    if hasattr(cv2, "CAP_V4L2"):
-        cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
-        if cap.isOpened():
-            return cap
-        cap.release()
-    return cv2.VideoCapture(camera_index)
 
 
 def _load_runtime_dependencies():
@@ -551,6 +556,7 @@ def run(args: argparse.Namespace) -> None:
     np = deps["np"]
     cv2 = deps["require_cv2"]()
     Image = deps["require_pil_image"]()
+    headless = args.headless if args.headless is not None else default_headless_mode()
 
     data_dir = deps["resolve_data_dir"](args.data_dir)
     labels = deps["load_labels"]()
@@ -561,9 +567,9 @@ def run(args: argparse.Namespace) -> None:
             f"WARNING: no embeddings found under {data_dir}; tracking will run without person names."
         )
 
-    default_detector_edge_tpu, default_embedder_edge_tpu = (
-        deps["recommended_live_edge_tpu_modes"](args.edge_tpu)
-    )
+    default_detector_edge_tpu, default_embedder_edge_tpu = deps[
+        "recommended_live_edge_tpu_modes"
+    ](args.edge_tpu)
     detector_edge_tpu = (
         default_detector_edge_tpu
         if args.detector_edge_tpu is None
@@ -579,15 +585,17 @@ def run(args: argparse.Namespace) -> None:
     embedding_interpreter = deps["create_embedding_interpreter"](embedder_edge_tpu)
     input_width, input_height = deps["input_size"](detection_interpreter)
 
-    cap = open_camera(cv2, args.camera_index)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.camera_width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.camera_height)
-    cap.set(cv2.CAP_PROP_FPS, args.fps)
-    if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-    if not cap.isOpened():
-        raise FaceRecognitionError(f"Could not open camera index {args.camera_index}.")
+    opened = open_camera_source(
+        args.camera_index,
+        width=args.camera_width,
+        height=args.camera_height,
+        fps=args.fps,
+    )
+    if opened.source is None or opened.first_frame is None:
+        detail = opened.error or f"could not open camera index {args.camera_index}"
+        raise FaceRecognitionError(detail)
+    camera = opened.source
+    pending_frame = opened.first_frame
 
     head = HeadController(args.serial_port, args.serial_baud, np)
     print(
@@ -595,12 +603,23 @@ def run(args: argparse.Namespace) -> None:
         f"detector={'Edge TPU' if detector_edge_tpu else 'CPU'}, "
         f"embedder={'Edge TPU' if embedder_edge_tpu else 'CPU'}"
     )
-    print("Press q to stop.")
+    print(f"Camera source: {opened.backend_name}")
+    if headless:
+        print("Headless mode active. Press Ctrl+C to stop.")
+    else:
+        print("Press q to stop.")
 
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
+            if pending_frame is not None:
+                frame = pending_frame
+                pending_frame = None
+            else:
+                ret, frame = camera.read()
+                if not ret or frame is None:
+                    raise FaceRecognitionError("Failed to grab frame from camera.")
+
+            if frame is None:
                 raise FaceRecognitionError("Failed to grab frame from camera.")
 
             frame_height, frame_width = frame.shape[:2]
@@ -735,13 +754,15 @@ def run(args: argparse.Namespace) -> None:
                 (0, 255, 255),
                 2,
             )
-            cv2.imshow("Face Recognition Head Tracking", frame)
+            if not headless:
+                cv2.imshow("Face Recognition Head Tracking", frame)
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
     finally:
-        cap.release()
-        cv2.destroyAllWindows()
+        camera.release()
+        if not headless:
+            cv2.destroyAllWindows()
         head.close()
 
 
@@ -754,6 +775,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     try:
         run(args)
+    except KeyboardInterrupt:
+        print("stopped.", file=sys.stderr)
+        return 130
     except FaceRecognitionError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

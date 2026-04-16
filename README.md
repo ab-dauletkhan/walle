@@ -627,8 +627,11 @@ IF |posError| > 1 (CONTROLLER_THRESHOLD):
 |-------------------|----------------------|---------------------------|
 | --wake-word       | "hey robot"          | Wake phrase                |
 | --listen-timeout  | 1.0                  | Silence timeout (seconds)  |
+| --listen-timeout-long | 1.0              | Mid-sentence silence window |
 | --tts-voice       | en_UK/apope_low      | Mimic3 voice ID            |
 | --stt-model       | small-streaming      | Moonshine model size       |
+| --mic-device      | default input        | PortAudio input device     |
+| --speaker-device  | default output       | PortAudio output device    |
 
 ---
 
@@ -648,8 +651,9 @@ IF |posError| > 1 (CONTROLLER_THRESHOLD):
 9. Start API server (Flask daemon thread, port 5001)
 10. Test TTS health
 11. Load STT model (if voice mode)
-12. Register signal handlers (SIGINT, SIGTERM)
-13. Enter text REPL or voice mode
+12. Confirm first vision frame before reporting the camera healthy
+13. Register signal handlers (SIGINT, SIGTERM)
+14. Enter text REPL or voice mode
 ```
 
 ### 8.2 Shutdown (`_shutdown()`)

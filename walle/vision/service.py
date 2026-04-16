@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 import numpy as np
+from vision.camera_source import open_camera_source
 from vision.face_recognition.common import (
     DEFAULT_DATA_DIR,
     PEOPLE_LABELS_PATH,
@@ -365,32 +366,71 @@ def build_default_vision_registry() -> VisionBackendRegistry:
 class VisionService:
     """Continuously processes camera frames and updates ContextManager with visual context."""
 
+    _STALE_FRAME_TIMEOUT_SEC = 5.0
+    _FIRST_FRAME_TIMEOUT_SEC = 3.0
+
     def __init__(
         self, context_manager: ContextManager, camera_index: int = 0, fps: int = 2
     ):
         self._context_manager = context_manager
         self._camera_index = camera_index
+        self._fps = max(fps, 1)
         self._target_interval = 1.0 / max(fps, 1)
 
         self._backend: Optional[VisionBackend] = None
-        self._cap = None
+        self._camera_source = None
+        self._camera_backend_name = "none"
         self._thread: Optional[threading.Thread] = None
         self._running = False
+        self._ready = False
         self._frame_lock = threading.Lock()
         self._latest_frame: Optional[np.ndarray] = None
+        self._last_error: Optional[str] = None
+        self._last_frame_at: Optional[datetime] = None
 
         # Auto-detect backend
         self._backend = self._create_backend()
 
     @property
     def is_active(self) -> bool:
-        return self._backend is not None and self._running and self._cap is not None
+        if (
+            self._backend is None
+            or not self._running
+            or self._camera_source is None
+            or not self._ready
+            or self._last_frame_at is None
+        ):
+            return False
+        age = (datetime.now() - self._last_frame_at).total_seconds()
+        return age < max(self._STALE_FRAME_TIMEOUT_SEC, self._target_interval * 4)
 
     @property
     def backend_name(self) -> str:
         if self._backend is None:
             return "none"
         return self._backend.__class__.__name__.replace("VisionBackend", "").lower()
+
+    @property
+    def camera_backend_name(self) -> str:
+        return self._camera_backend_name
+
+    @property
+    def last_error(self) -> Optional[str]:
+        return self._last_error
+
+    @property
+    def last_frame_at(self) -> Optional[datetime]:
+        return self._last_frame_at
+
+    @property
+    def status_detail(self) -> str:
+        if self._backend is None:
+            return "disabled"
+        if self.is_active:
+            return f"{self.backend_name} via {self.camera_backend_name}"
+        if self._last_error:
+            return f"{self.backend_name}: {self._last_error}"
+        return f"{self.backend_name} starting"
 
     def _create_backend(self) -> Optional[VisionBackend]:
         """Use the default backend registry to find the first available backend."""
@@ -404,42 +444,40 @@ class VisionService:
 
         if self._camera_index < 0:
             _log.warning("Camera disabled (index < 0)")
+            self._last_error = "camera disabled"
             return
 
-        import cv2
-
-        # Try V4L2 backend first — avoids select() timeouts on Linux/Jetson.
-        # Pattern from vision/face_recognition/track_and_turn_head.py.
-        if hasattr(cv2, "CAP_V4L2"):
-            self._cap = cv2.VideoCapture(self._camera_index, cv2.CAP_V4L2)
-            if not self._cap.isOpened():
-                self._cap.release()
-                self._cap = cv2.VideoCapture(self._camera_index)
-        else:
-            self._cap = cv2.VideoCapture(self._camera_index)
-
-        if not self._cap.isOpened():
+        opened = open_camera_source(
+            self._camera_index,
+            fps=self._fps,
+            first_frame_timeout_sec=self._FIRST_FRAME_TIMEOUT_SEC,
+        )
+        if opened.source is None or opened.first_frame is None:
+            self._last_error = opened.error or "camera did not produce a frame"
+            self._ready = False
+            self._camera_backend_name = opened.backend_name
             _log.warning(
-                "Could not open camera %s, continuing without vision",
+                "Camera %s is not ready, continuing without vision: %s",
                 self._camera_index,
+                self._last_error,
             )
-            self._cap.release()
-            self._cap = None
             return
 
-        # Limit buffer to 1 frame to prevent stale-frame buildup.
-        if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
-            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
+        self._camera_source = opened.source
+        self._camera_backend_name = opened.backend_name
+        self._ready = True
+        self._last_error = None
+        self._record_frame(opened.first_frame)
         self._running = True
         self._thread = threading.Thread(
             target=self._loop, daemon=True, name="vision-service"
         )
         self._thread.start()
         _log.info(
-            "Started (camera=%s, target_fps=%s)",
+            "Started (camera=%s, source=%s, target_fps=%s)",
             self._camera_index,
-            int(1 / self._target_interval),
+            self._camera_backend_name,
+            self._fps,
         )
 
     def stop(self) -> None:
@@ -448,17 +486,23 @@ class VisionService:
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
-        if self._cap is not None:
-            self._cap.release()
-            self._cap = None
+        if self._camera_source is not None:
+            self._camera_source.release()
+            self._camera_source = None
         if self._backend is not None:
             self._backend.close()
+        self._ready = False
         _log.info("Stopped")
 
     def get_latest_frame(self) -> Optional[np.ndarray]:
         """Thread-safe access to the most recent camera frame."""
         with self._frame_lock:
             return self._latest_frame.copy() if self._latest_frame is not None else None
+
+    def _record_frame(self, frame: np.ndarray) -> None:
+        with self._frame_lock:
+            self._latest_frame = frame.copy()
+        self._last_frame_at = datetime.now()
 
     # Error backoff parameters
     _MAX_CONSECUTIVE_ERRORS = 5
@@ -472,14 +516,15 @@ class VisionService:
         while self._running:
             loop_start = time.monotonic()
 
-            ret, frame = self._cap.read()
+            ret, frame = self._camera_source.read()
             if not ret:
+                self._last_error = f"camera read failed via {self._camera_backend_name}"
                 time.sleep(0.1)
                 continue
 
-            # Thread-safe write (matches locked read in get_latest_frame)
-            with self._frame_lock:
-                self._latest_frame = frame
+            self._ready = True
+            self._last_error = None
+            self._record_frame(frame)
 
             try:
                 faces = self._backend.process_frame(frame)
@@ -566,8 +611,9 @@ class CaptureImageExecutor:
             return f"Unknown tool: {fn_name}"
 
         frame = self._vision_service.get_latest_frame()
-        if frame is None:
-            return "No camera available — cannot capture image."
+        if frame is None or not self._vision_service.is_active:
+            detail = self._vision_service.last_error or "no frame available yet"
+            return f"Camera not ready — cannot capture image: {detail}"
 
         detail = args.get("detail", "general")
         prompts = {
