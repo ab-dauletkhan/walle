@@ -136,6 +136,13 @@ class OpenCVCameraSource:
         self._configure_capture(width=width, height=height, fps=fps)
 
     def _configure_capture(self, *, width: int, height: int, fps: int) -> None:
+        # Prefer MJPG over raw YUYV for USB cameras; it reduces bandwidth and
+        # helps avoid V4L2 select() timeouts on Jetson + hub setups.
+        if hasattr(self._cv2, "VideoWriter_fourcc") and hasattr(
+            self._cv2, "CAP_PROP_FOURCC"
+        ):
+            fourcc = self._cv2.VideoWriter_fourcc(*"MJPG")
+            self._cap.set(self._cv2.CAP_PROP_FOURCC, fourcc)
         if hasattr(self._cv2, "CAP_PROP_FRAME_WIDTH"):
             self._cap.set(self._cv2.CAP_PROP_FRAME_WIDTH, width)
         if hasattr(self._cv2, "CAP_PROP_FRAME_HEIGHT"):

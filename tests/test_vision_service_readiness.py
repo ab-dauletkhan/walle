@@ -20,6 +20,11 @@ class ReadyVisionService(service.VisionService):
         return DummyBackend()
 
 
+class CameraOnlyVisionService(service.VisionService):
+    def _create_backend(self):
+        return None
+
+
 class FakeCameraSource:
     backend_name = "gstreamer"
 
@@ -80,3 +85,28 @@ def test_vision_service_marks_ready_after_first_frame(monkeypatch):
 
     vision.stop()
     assert source.released is True
+
+
+def test_vision_service_supports_camera_only_mode(monkeypatch):
+    frame = np.zeros((6, 8, 3), dtype=np.uint8)
+    source = FakeCameraSource(frame)
+    monkeypatch.setattr(
+        service,
+        "open_camera_source",
+        lambda *args, **kwargs: CameraOpenResult(
+            source=source,
+            first_frame=frame,
+            backend_name="opencv-v4l2",
+            error=None,
+        ),
+    )
+
+    vision = CameraOnlyVisionService(ContextManager(), camera_index=0, fps=5)
+    vision.start()
+    time.sleep(0.05)
+
+    assert vision.is_active is True
+    assert vision.status_detail == "camera-only via opencv-v4l2"
+    assert vision.get_latest_frame() is not None
+
+    vision.stop()

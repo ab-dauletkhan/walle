@@ -394,8 +394,7 @@ class VisionService:
     @property
     def is_active(self) -> bool:
         if (
-            self._backend is None
-            or not self._running
+            not self._running
             or self._camera_source is None
             or not self._ready
             or self._last_frame_at is None
@@ -424,10 +423,14 @@ class VisionService:
 
     @property
     def status_detail(self) -> str:
-        if self._backend is None:
-            return "disabled"
         if self.is_active:
+            if self._backend is None:
+                return f"camera-only via {self.camera_backend_name}"
             return f"{self.backend_name} via {self.camera_backend_name}"
+        if self._backend is None:
+            if self._last_error:
+                return f"camera-only: {self._last_error}"
+            return "camera-only starting"
         if self._last_error:
             return f"{self.backend_name}: {self._last_error}"
         return f"{self.backend_name} starting"
@@ -439,8 +442,9 @@ class VisionService:
     def start(self) -> None:
         """Start the background vision processing thread."""
         if self._backend is None:
-            _log.warning("No backend available, skipping start")
-            return
+            _log.warning(
+                "No face-recognition backend available; starting camera-only vision"
+            )
 
         if self._camera_index < 0:
             _log.warning("Camera disabled (index < 0)")
@@ -525,6 +529,14 @@ class VisionService:
             self._ready = True
             self._last_error = None
             self._record_frame(frame)
+
+            if self._backend is None:
+                consecutive_errors = 0
+                elapsed = time.monotonic() - loop_start
+                sleep_time = self._target_interval - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                continue
 
             try:
                 faces = self._backend.process_frame(frame)
