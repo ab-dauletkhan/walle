@@ -17,13 +17,17 @@ class LifecycleManager:
 
     def __init__(self):
         self._hooks: list[tuple[str, Callable[[], None]]] = []
+        self._done = False
 
     def register(self, label: str, hook: Callable[[], None]) -> None:
         """Register a shutdown hook. Last registered = first to execute."""
         self._hooks.append((label, hook))
 
     def shutdown(self) -> None:
-        """Execute all hooks in reverse registration order."""
+        """Execute all hooks in reverse registration order. Idempotent."""
+        if self._done:
+            return
+        self._done = True
         _log.info("Shutting down WALL-E...")
         for label, hook in reversed(self._hooks):
             try:

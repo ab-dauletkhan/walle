@@ -9,6 +9,7 @@ import argparse
 import logging
 import os
 import signal
+import sys
 
 from walle.chat_loop import ChatLoop, ChatSession, LLMStreamer
 from walle.lifecycle import LifecycleManager
@@ -19,12 +20,11 @@ from walle.memory.heartbeat import HeartbeatManager
 from walle.memory.memory_system import ArchivalMemory, Memory, RecallMemory
 from walle.serial_manager import SerialManager
 from walle.tools.communication import CommunicationExecutor
-from walle.tools.knowledge import KnowledgeToolExecutor, get_knowledge_tools
-from walle.tools.memory_tools import MemoryToolExecutor, get_memory_tools
+from walle.tools.knowledge import KnowledgeToolExecutor
+from walle.tools.memory_tools import MemoryToolExecutor
 from walle.tools.personality import (
     PersonalityEngine,
     PersonalityToolExecutor,
-    get_personality_tools,
 )
 from walle.tools.registry import (
     CommunicationToolProvider,
@@ -85,25 +85,22 @@ def build_app(args) -> tuple:
     comm_exec = CommunicationExecutor()
 
     # -- Tool registry (Microkernel: each provider registers independently) --
+    # Memory / personality / knowledge tools are intentionally not registered
+    # with the LLM to keep the tool schema budget small on Jetson. The
+    # executors are kept alive — the memory loop still auto-injects relevant
+    # recall/archival hits via RelevantMemoryProvider without needing the
+    # LLM to self-edit blocks.
+    _ = mem_exec, personality_exec, knowledge_exec  # retained for future re-enable
     registry = ToolRegistry()
     registry.register(CommunicationToolProvider(comm_exec))
     registry.register(SchemaExecutorToolProvider(get_robot_control_tools, robot_exec))
-    registry.register(SchemaExecutorToolProvider(get_memory_tools, mem_exec))
-    registry.register(
-        SchemaExecutorToolProvider(get_personality_tools, personality_exec)
-    )
-    registry.register(
-        SchemaExecutorToolProvider(
-            get_knowledge_tools, knowledge_exec, request_heartbeat_after=True
-        )
-    )
     tool_suite = ToolSuiteFacade(registry)
 
     # -- LLM client --
     client = OpenAI(
-        base_url=f"{conf.OLLAMA_BASE_URL}/v1", api_key="ollama", timeout=30.0
+        base_url=f"{conf.OLLAMA_BASE_URL}/v1", api_key="ollama", timeout=120.0
     )
-    llm_streamer = LLMStreamer(client, conf.OLLAMA_MODEL)
+    llm_streamer = LLMStreamer(client, conf.OLLAMA_MODEL, num_ctx=conf.OLLAMA_NUM_CTX)
 
     # -- Prompt & memory providers --
     prompt_builder = SystemPromptBuilder(
@@ -129,8 +126,8 @@ def build_app(args) -> tuple:
         archival_mem=archival_mem,
         heartbeat=heartbeat,
         context_manager=context_manager,
-        on_turn_start=lambda: robot_exec.set_idle_mode(False),
-        on_turn_end=lambda: robot_exec.set_idle_mode(True),
+        on_turn_start=None,
+        on_turn_end=None,
     )
 
     # -- Register shutdown hooks --
@@ -209,10 +206,60 @@ def _test_tts(url: str) -> bool:
         return False
 
 
+def _parse_audio_device(value: str):
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
+def _query_audio_devices():
+    import sounddevice as sd  # noqa: PLC0415
+
+    return sd.query_devices()
+
+
+def _resolve_audio_device(value, kind: str):
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    needle = value.lower()
+    try:
+        devs = _query_audio_devices()
+    except Exception as exc:
+        _log.warning("Audio device query failed: %s", exc)
+        return None
+    want_input = kind == "input"
+    for idx, dev in enumerate(devs):
+        channels = (
+            dev["max_input_channels"] if want_input else dev["max_output_channels"]
+        )
+        if channels <= 0:
+            continue
+        if needle in dev["name"].lower():
+            return idx
+    _log.warning("No %s device matching '%s' — falling back to default", kind, value)
+    return None
+
+
+def _describe_audio_device(device, kind: str) -> str:
+    if device is None:
+        return f"default {kind}"
+    try:
+        info = _query_audio_devices()[device]
+    except Exception:
+        return f"{kind} #{device}"
+    return f"{kind} #{device} {info['name']}"
+
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
-def parse_args():
+def parse_args(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="WALL-E Unified Orchestrator")
 
     # Mode
@@ -250,14 +297,26 @@ def parse_args():
     parser.add_argument("--tts-voice", default="en_UK/apope_low", help="Mimic3 voice")
 
     # Voice / STT
-    parser.add_argument("--wake-word", default="hey robot", help="Wake word phrase")
+    parser.add_argument("--wake-word", default="hey", help="Wake word phrase")
     parser.add_argument(
         "--listen-timeout", type=float, default=3.0, help="Silence timeout (seconds)"
+    )
+    parser.add_argument(
+        "--listen-timeout-long",
+        type=float,
+        default=1.0,
+        help="Conversational silence timeout once the user is mid-sentence",
+    )
+    parser.add_argument(
+        "--max-utterance",
+        type=float,
+        default=15.0,
+        help="Hard upper bound on a single listen window in seconds",
     )
     parser.add_argument("--language", default="en", help="STT language")
     parser.add_argument(
         "--stt-model",
-        default="small-streaming",
+        default="medium-streaming",
         choices=[
             "tiny-streaming",
             "small-streaming",
@@ -278,32 +337,108 @@ def parse_args():
     parser.add_argument(
         "--embedding-quantization", default="q4", help="Embedding quantization"
     )
+    parser.add_argument(
+        "--mic-device",
+        type=_parse_audio_device,
+        default=None,
+        help="PortAudio input device index or name substring",
+    )
+    parser.add_argument(
+        "--mic-channels",
+        type=int,
+        default=1,
+        help="Microphone input channels (default: 1)",
+    )
+    parser.add_argument(
+        "--mic-blocksize",
+        type=int,
+        default=2048,
+        help="PortAudio blocksize in samples (default: 2048)",
+    )
+    parser.add_argument(
+        "--speaker-device",
+        type=_parse_audio_device,
+        default=None,
+        help="PortAudio output device index or name substring",
+    )
+    parser.add_argument(
+        "--speaker-rate",
+        type=int,
+        default=None,
+        help="Resample playback to this Hz before sending to the speaker device",
+    )
+    parser.add_argument(
+        "--speaker-channels",
+        type=int,
+        default=None,
+        help="Expand mono playback to this many channels before output",
+    )
 
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    args._explicit_stt_model = any(
+        arg == "--stt-model" or str(arg).startswith("--stt-model=") for arg in argv
+    )
+    return args
+
+
+def apply_runtime_overrides(args):
+    if args.jetson:
+        conf.OLLAMA_MODEL = "qwen2.5:3b"
+        conf.EMBEDDING_DEVICE = "cpu"
+        conf.EMBEDDING_BATCH_SIZE = 4
+        conf.USE_FAISS = True
+        conf.USE_SEMANTIC_SEARCH = True
+        conf.VISION_FPS = 1
+        if not getattr(args, "_explicit_stt_model", False):
+            args.stt_model = "tiny-streaming"
+        _log.info(
+            "Jetson mode: model=%s, embedding=%s, fps=%s, stt=%s",
+            conf.OLLAMA_MODEL,
+            conf.EMBEDDING_DEVICE,
+            conf.VISION_FPS,
+            args.stt_model,
+        )
+    return args
 
 
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 def main():
-    setup_logging()
-
     args = parse_args()
 
+    # Voice mode is the live Jetson deployment — suppress debug chatter
+    # (LLM token metrics, stale-turn retries) so only real output is spoken/shown.
+    # Text mode stays verbose for development.
+    run_mode = "debug" if args.text_mode else "test"
+    conf.RUN_MODE = run_mode
+    setup_logging(run_mode)
+
     # --- Jetson overrides ---
-    if args.jetson:
-        conf.OLLAMA_MODEL = "qwen3:4b"
-        conf.EMBEDDING_DEVICE = "cpu"
-        conf.EMBEDDING_BATCH_SIZE = 4
-        conf.USE_FAISS = True
-        conf.USE_SEMANTIC_SEARCH = True
-        conf.VISION_FPS = 1
-        _log.info(
-            "Jetson mode: model=%s, embedding=%s, fps=%s",
-            conf.OLLAMA_MODEL,
-            conf.EMBEDDING_DEVICE,
-            conf.VISION_FPS,
-        )
+    args = apply_runtime_overrides(args)
+
+    args.mic_device = _resolve_audio_device(args.mic_device, "input")
+    args.speaker_device = _resolve_audio_device(args.speaker_device, "output")
+    args._mic_label = _describe_audio_device(args.mic_device, "input")
+    args._speaker_label = _describe_audio_device(args.speaker_device, "output")
+
+    from walle.voice.assistant import set_output_device
+
+    set_output_device(
+        args.speaker_device,
+        rate=args.speaker_rate,
+        channels=args.speaker_channels,
+    )
+    _log.info("Audio input: %s", args._mic_label)
+    if args.speaker_rate is not None or args.speaker_channels is not None:
+        extras = []
+        if args.speaker_rate is not None:
+            extras.append(f"{args.speaker_rate} Hz")
+        if args.speaker_channels is not None:
+            extras.append(f"{args.speaker_channels}ch")
+        _log.info("Audio output: %s (%s)", args._speaker_label, ", ".join(extras))
+    else:
+        _log.info("Audio output: %s", args._speaker_label)
 
     # --- Build the app ---
     status_lines = []
@@ -334,7 +469,7 @@ def main():
         status_lines.append(
             _status_line(
                 "Vision:",
-                f"{vision.backend_name} (cam={args.camera})",
+                f"{vision.status_detail} (cam={args.camera})",
                 vision.is_active,
             )
         )
@@ -379,12 +514,22 @@ def main():
     )
     if not args.no_tts and not tts_ok:
         args.no_tts = True
-    status_lines.append(_status_line("TTS:", tts_label, True))
+    tts_detail = tts_label if args.no_tts else f"{tts_label} -> {args._speaker_label}"
+    if not args.no_tts and (
+        args.speaker_rate is not None or args.speaker_channels is not None
+    ):
+        extras = []
+        if args.speaker_rate is not None:
+            extras.append(f"{args.speaker_rate}Hz")
+        if args.speaker_channels is not None:
+            extras.append(f"{args.speaker_channels}ch")
+        tts_detail += f" ({', '.join(extras)})"
+    status_lines.append(_status_line("TTS:", tts_detail, True))
 
     # STT
     if not args.text_mode:
         _log.info("[7/7] Loading STT model...")
-        stt_label = f"Moonshine {args.stt_model}"
+        stt_label = f"Moonshine {args.stt_model} -> {args._mic_label}"
         status_lines.append(_status_line("STT:", stt_label, True))
     else:
         status_lines.append(_status_line("STT:", "text mode (skipped)", False))
@@ -400,7 +545,7 @@ def main():
     if args.text_mode:
         print('  Type your message. "exit" to quit.\n')
         try:
-            _text_mode_repl(orchestrator)
+            _text_mode_repl(orchestrator, args)
         finally:
             lifecycle.shutdown()
         return
@@ -408,7 +553,11 @@ def main():
     # Voice mode — custom signal handler because VoiceAssistant.run()
     # may not propagate KeyboardInterrupt cleanly through audio threads.
     def _halt(*_):
+        # Restore default handler so a second Ctrl+C force-kills immediately.
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
         lifecycle.shutdown()
+        os._exit(0)
 
     signal.signal(signal.SIGINT, _halt)
     signal.signal(signal.SIGTERM, _halt)
@@ -419,7 +568,15 @@ def main():
 # ---------------------------------------------------------------------------
 # Mode runners
 # ---------------------------------------------------------------------------
-def _text_mode_repl(orchestrator):
+def _text_mode_repl(orchestrator, args):
+    from walle.voice.assistant import ConsoleTTSEngine, Mimic3TTSEngine
+
+    tts = (
+        ConsoleTTSEngine()
+        if args.no_tts
+        else Mimic3TTSEngine(url=args.tts_url, voice=args.tts_voice)
+    )
+
     print(f"\n{'=' * 50}")
     print(f"  WALL-E Text Mode | {conf.OLLAMA_MODEL} via Ollama")
     print("  Type 'exit' or 'quit' to stop.")
@@ -439,6 +596,10 @@ def _text_mode_repl(orchestrator):
             response = orchestrator.chat(user_input)
             if response:
                 print(f"WALL-E: {response}\n")
+                try:
+                    tts.speak(response)
+                except Exception as exc:
+                    _log.warning("TTS failed: %s", exc)
             else:
                 print("WALL-E: (no response)\n")
     except KeyboardInterrupt:
@@ -453,14 +614,21 @@ class _RobotBridge:
     instantiated in voice mode after those deps are lazy-loaded.
     """
 
+    # Voice intents map directly to the unified `drive` tool. The old
+    # wave/dance intents targeted arm/neck servos that no longer exist in
+    # the CLI firmware, so they're dropped rather than silently no-oped.
     ACTION_MAP = {
-        "forward": ("drive_forward", {"speed": 50, "duration_ms": 1000}),
-        "backward": ("drive_backward", {"speed": 50, "duration_ms": 1000}),
-        "left": ("turn_left", {"speed": 50, "duration_ms": 500}),
-        "right": ("turn_right", {"speed": 50, "duration_ms": 500}),
+        "forward": (
+            "drive",
+            {"direction": "forward", "speed": 85, "duration_ms": 2000},
+        ),
+        "backward": (
+            "drive",
+            {"direction": "backward", "speed": 85, "duration_ms": 2000},
+        ),
+        "left": ("drive", {"direction": "left", "speed": 75, "duration_ms": 900}),
+        "right": ("drive", {"direction": "right", "speed": 75, "duration_ms": 900}),
         "stop": ("stop_movement", {}),
-        "wave": ("wave_hello", {}),
-        "dance": ("express_emotion", {"emotion": "happy"}),
     }
 
     def __init__(self, robot_exec):
@@ -489,8 +657,8 @@ def _run_voice_mode(orchestrator, robot_exec, args, lifecycle: LifecycleManager)
         ROBOT_INTENTS,
         ConsoleTTSEngine,
         Mimic3TTSEngine,
-        ModelArch,
         VoiceAssistant,
+        _stt_model_choices,
     )
 
     robot_bridge = _RobotBridge(robot_exec)
@@ -500,14 +668,10 @@ def _run_voice_mode(orchestrator, robot_exec, args, lifecycle: LifecycleManager)
         else Mimic3TTSEngine(url=args.tts_url, voice=args.tts_voice)
     )
 
-    stt_arch_map = {
-        "tiny-streaming": ModelArch.TINY_STREAMING,
-        "small-streaming": ModelArch.SMALL_STREAMING,
-        "medium-streaming": ModelArch.MEDIUM_STREAMING,
-        "tiny": ModelArch.TINY,
-        "base": ModelArch.BASE,
-    }
-    stt_arch = stt_arch_map.get(args.stt_model, ModelArch.SMALL_STREAMING)
+    # ModelArch is lazy-imported inside assistant.py to keep text-mode free
+    # of the moonshine_voice dependency. Resolve the string choice here.
+    stt_arch_map = _stt_model_choices()
+    stt_arch = stt_arch_map.get(args.stt_model, stt_arch_map["medium-streaming"])
 
     wake_sounds_dir = os.path.join(_BASE, "voice", "wake_up_sounds")
     if not os.path.isdir(wake_sounds_dir):
@@ -525,7 +689,12 @@ def _run_voice_mode(orchestrator, robot_exec, args, lifecycle: LifecycleManager)
         intents=ROBOT_INTENTS,
         wake_word=args.wake_word,
         listen_timeout=args.listen_timeout,
+        listen_timeout_long=args.listen_timeout_long,
+        max_utterance=args.max_utterance,
         wake_sounds_dir=wake_sounds_dir,
+        mic_device=args.mic_device,
+        mic_channels=args.mic_channels,
+        mic_blocksize=args.mic_blocksize,
         system_prompt="WALL-E voice mode active.",
     )
 

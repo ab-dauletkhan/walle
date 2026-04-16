@@ -1,13 +1,27 @@
 """
 WALL-E Serial Manager
-Thread-safe shared serial connection to Arduino.
-Used by both the LLM tool pipeline (RobotControlExecutor) and the web API bridge.
+Thread-safe shared serial connection to the Arduino CLI firmware
+(`firmware/wall-e/motor_control_cli.ino`).
+
+Protocol
+--------
+The firmware speaks a line-oriented text CLI at 115200 baud. Every command is
+a single '\n'-terminated line, e.g. ``drive 80 500`` or ``head tick 300``.
+Replies always start with either ``OK -> ...`` on success or ``Rejected: ...``
+on validation failure, and may be followed by zero or more informational
+lines (e.g. ``Timed move complete -> stopped.``). The ``status`` command
+emits a multi-line block that ends with a blank line; we collect lines until
+drain.
+
+This module exposes one shared ``SerialManager`` that both the LLM tool
+executor and the vision face tracker acquire through ``startup.py`` so they
+don't race on the same ``/dev/ttyUSB...`` handle.
 """
 
 import logging
 import threading
 import time
-from typing import Optional
+from typing import List, Optional
 
 _log = logging.getLogger("walle.serial")
 
@@ -20,19 +34,33 @@ except ImportError:
 
 
 class SerialManager:
-    """Thread-safe serial connection to Arduino."""
+    """Thread-safe serial connection to the Arduino CLI firmware."""
+
+    # Time to wait for a reply line after a write. The firmware responds
+    # within a few ms; we only need a cushion for USB serial + Arduino
+    # interrupt latency.
+    _REPLY_TIMEOUT = 1.5
+    _STATUS_TIMEOUT = 2.0
 
     def __init__(self, port: Optional[str] = None, baud_rate: int = 115200):
         self._lock = threading.Lock()
-        self._conn: Optional[serial.Serial] = None
+        self._conn: Optional["serial.Serial"] = None
         self._simulation = True
         self._port = port
         self._baud_rate = baud_rate
 
         if port and SERIAL_AVAILABLE:
             try:
-                self._conn = serial.Serial(port=port, baudrate=baud_rate, timeout=1)
+                self._conn = serial.Serial(port=port, baudrate=baud_rate, timeout=0.2)
                 self._simulation = False
+                # Arduino auto-resets on DTR; give the sketch a moment to boot
+                # and drain its startup banner so the first real command isn't
+                # lost in the noise.
+                time.sleep(1.8)
+                try:
+                    self._conn.reset_input_buffer()
+                except Exception:
+                    pass
                 _log.info("Connected to %s @ %s baud", port, baud_rate)
             except Exception as e:
                 _log.warning("Failed to connect to %s: %s", port, e)
@@ -41,87 +69,60 @@ class SerialManager:
             reason = "no port specified" if not port else "pyserial not installed"
             _log.info("Simulation mode (%s)", reason)
 
-    # Max command length the Arduino buffer can handle (letter + up to 3 digits)
-    _CMD_MAX_LEN = 4
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
 
     def send_command(self, cmd: str) -> str:
-        """Thread-safe write to serial port. Returns status string.
+        """Send one or more newline-separated CLI commands.
 
-        Validates that *cmd* fits the Arduino serial protocol before sending:
-        single-char commands (e.g. ``q``) or a letter followed by up to 3 digits
-        (e.g. ``G50``, ``Y100``, ``X-80``).
+        Returns a human-readable status string combining each command's
+        reply. Multi-line input (``"head tick 300\nspin 80 400"``) is
+        split and each line is dispatched individually so a single bad
+        line doesn't abort the rest.
         """
-        # --- input validation ---
         if not cmd:
             return "Error: empty command"
 
-        # Allow multi-command strings separated by \n (e.g. "L80\nR80")
-        parts = cmd.split("\n")
-        results = []
-        for part in parts:
-            part = part.strip()
-            if not part:
-                continue
-            # Validate: single letter, or letter + optional minus + 1-3 digits
-            if len(part) > 5 or not part[0].isalpha():
-                return f"Error: invalid command '{part}' (expected letter + optional number, max 4 chars)"
-            if len(part) > 1:
-                tail = part[1:]
-                if tail.lstrip("-").isdigit() is False:
-                    return f"Error: invalid command '{part}' (non-numeric payload)"
-            results.append(self._send_single(part))
+        lines = [line.strip() for line in cmd.split("\n") if line.strip()]
+        if not lines:
+            return "Error: empty command"
 
-        return "; ".join(results) if results else "Error: no valid commands"
+        results: List[str] = []
+        for line in lines:
+            results.append(self._send_line(line))
+        return "; ".join(results)
 
-    # How long to wait for the Arduino ACK ("OK\n") after sending a command.
-    _ACK_TIMEOUT = 2.0  # seconds
+    def send_raw(self, cmd: str, timeout: Optional[float] = None) -> List[str]:
+        """Send one command and return the full reply as a list of lines.
 
-    def _send_single(self, cmd: str) -> str:
-        """Send a single validated command and wait for Arduino ACK."""
+        Use this when you need to parse a multi-line response like
+        ``status``. Returns an empty list in simulation mode.
+        """
+        line = cmd.strip()
+        if not line:
+            return []
         with self._lock:
             if self._simulation:
-                _log.debug("SIM >> %s", cmd)
-                return "OK (simulated)"
+                _log.debug("SIM >> %s", line)
+                return []
+            return self._write_and_collect(line, timeout or self._REPLY_TIMEOUT)
 
-            try:
-                if not (self._conn and self._conn.is_open):
-                    _log.warning("Connection closed, simulating: %s", cmd)
-                    return "OK (connection closed, simulated)"
+    def status(self) -> List[str]:
+        """Query the firmware `status` command and return its reply block."""
+        return self.send_raw("status", timeout=self._STATUS_TIMEOUT)
 
-                # Drain any stale data before writing
-                self._conn.reset_input_buffer()
-                self._conn.write(f"{cmd}\n".encode())
-                self._conn.flush()
-
-                # Wait for "OK" acknowledgment from Arduino
-                deadline = time.monotonic() + self._ACK_TIMEOUT
-                while time.monotonic() < deadline:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    old_timeout = self._conn.timeout
-                    self._conn.timeout = min(remaining, 0.5)
-                    try:
-                        line = (
-                            self._conn.readline()
-                            .decode("utf-8", errors="ignore")
-                            .strip()
-                        )
-                    finally:
-                        self._conn.timeout = old_timeout
-                    if line == "OK":
-                        return "OK"
-                    if line:
-                        _log.debug("Arduino: %s", line)  # echo or status line
-
-                _log.warning("No ACK for '%s' within %.1fs", cmd, self._ACK_TIMEOUT)
-                return "OK (no ACK)"
-            except Exception as e:
-                _log.error("Error: %s", e)
-                return f"Serial Error: {e}"
+    def heartbeat(self) -> Optional[str]:
+        """Best-effort connectivity probe. Returns ``None`` on failure."""
+        if self._simulation:
+            return "status (simulated)"
+        lines = self.status()
+        if not lines:
+            return None
+        return "\n".join(lines)
 
     def read_line(self, timeout: float = 0.5) -> Optional[str]:
-        """Thread-safe read from serial port."""
+        """Thread-safe single-line read (e.g. for draining unsolicited output)."""
         with self._lock:
             if self._simulation or not self._conn or not self._conn.is_open:
                 return None
@@ -130,42 +131,8 @@ class SerialManager:
                 self._conn.timeout = timeout
                 line = self._conn.readline().decode("utf-8", errors="ignore").strip()
                 self._conn.timeout = old_timeout
-                return line if line else None
+                return line or None
             except Exception:
-                return None
-
-    def heartbeat(self) -> Optional[str]:
-        """Send status query to Arduino. Returns status string or None on failure."""
-        with self._lock:
-            if self._simulation:
-                return "STATUS 248,560,140,475,270,250,290 M0,0 (simulated)"
-            try:
-                if not (self._conn and self._conn.is_open):
-                    return None
-                self._conn.reset_input_buffer()
-                self._conn.write(b"?\n")
-                self._conn.flush()
-                deadline = time.monotonic() + 1.0
-                while time.monotonic() < deadline:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    old_timeout = self._conn.timeout
-                    self._conn.timeout = min(remaining, 0.5)
-                    try:
-                        line = (
-                            self._conn.readline()
-                            .decode("utf-8", errors="ignore")
-                            .strip()
-                        )
-                    finally:
-                        self._conn.timeout = old_timeout
-                    if line.startswith("STATUS"):
-                        return line
-                _log.debug("No heartbeat response within 1s")
-                return None
-            except Exception as e:
-                _log.debug("Heartbeat error: %s", e)
                 return None
 
     def is_connected(self) -> bool:
@@ -178,5 +145,82 @@ class SerialManager:
     def close(self) -> None:
         with self._lock:
             if self._conn and self._conn.is_open:
+                try:
+                    self._conn.write(b"stopall\n")
+                    self._conn.flush()
+                except Exception:
+                    pass
                 self._conn.close()
                 _log.info("Connection closed")
+
+    # ------------------------------------------------------------------ #
+    # Internals
+    # ------------------------------------------------------------------ #
+
+    def _send_line(self, line: str) -> str:
+        with self._lock:
+            if self._simulation:
+                _log.debug("SIM >> %s", line)
+                return "OK (simulated)"
+
+            if not (self._conn and self._conn.is_open):
+                _log.warning("Connection closed, simulating: %s", line)
+                return "OK (connection closed, simulated)"
+
+            try:
+                reply_lines = self._write_and_collect(line, self._REPLY_TIMEOUT)
+            except Exception as e:
+                _log.error("Serial error on '%s': %s", line, e)
+                return f"Serial Error: {e}"
+
+            if not reply_lines:
+                _log.warning("No reply for '%s' within %.1fs", line, self._REPLY_TIMEOUT)
+                return "OK (no reply)"
+
+            head = reply_lines[0]
+            if head.startswith("OK"):
+                return head
+            if head.startswith("Rejected"):
+                _log.warning("Firmware rejected '%s': %s", line, head)
+                return head
+            # Unknown prefix — pass the first line through so callers can log it.
+            return head
+
+    def _write_and_collect(self, line: str, timeout: float) -> List[str]:
+        """Write one line and collect reply lines until the port goes quiet.
+
+        Must be called with ``self._lock`` held. The firmware sends its reply
+        in a burst, so we keep reading until ``timeout`` elapses OR until we
+        see a blank line after at least one real reply line. We prefer the
+        *first* non-empty line as the primary result.
+        """
+        assert self._conn is not None
+        self._conn.reset_input_buffer()
+        self._conn.write(f"{line}\n".encode())
+        self._conn.flush()
+
+        deadline = time.monotonic() + timeout
+        collected: List[str] = []
+        old_timeout = self._conn.timeout
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._conn.timeout = min(remaining, 0.2)
+                raw = self._conn.readline()
+                if not raw:
+                    # No more data within the short read window; if we already
+                    # have a reply line we can return — otherwise keep waiting.
+                    if collected:
+                        break
+                    continue
+                text = raw.decode("utf-8", errors="ignore").strip()
+                if not text:
+                    if collected:
+                        break
+                    continue
+                collected.append(text)
+        finally:
+            self._conn.timeout = old_timeout
+        return collected

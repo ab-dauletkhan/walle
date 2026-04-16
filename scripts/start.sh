@@ -14,6 +14,26 @@ MIMIC3_URL="${MIMIC3_URL:-http://localhost:59125}"
 UV_EXTRAS="${UV_EXTRAS:---extra jetson}"
 WALLE_ARGS="${WALLE_ARGS:-}"
 CORAL39_PY="${WALLE_CORAL_PYTHON39:-$PROJECT_ROOT/.venv-coral39/bin/python}"
+# Quick mode: ./scripts/start.sh --llm-only  →  text REPL, no vision/tts
+if [[ " $* " == *" --llm-only "* ]]; then
+    WALLE_ARGS="$WALLE_ARGS --text-mode --no-vision --no-tts"
+    set -- $(echo "$@" | sed 's/--llm-only//')
+fi
+
+
+# Jetson UMA: keep model pinned on GPU and shrink KV cache so cudaMalloc
+# doesn't fragment once walle's Python stack loads alongside it.
+export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:-24h}"
+export OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-2048}"
+export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-1}"
+export OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-1}"
+
+# Free reclaimable page cache before Ollama tries to allocate on UMA.
+# Non-fatal if sudo is not available (running outside Jetson).
+sudo -n sysctl -w vm.drop_caches=3 >/dev/null 2>&1 || true
+
+# Kill any stale ollama runner processes from a crashed previous session.
+pkill -f "ollama runner" 2>/dev/null || true
 
 # Collect PIDs of services we start so we can clean up
 CHILD_PIDS=()
@@ -33,26 +53,35 @@ trap cleanup EXIT INT TERM
 
 # ---------- 1. Ollama ----------
 echo "=== Checking Ollama ==="
-if curl -sf "$OLLAMA_URL" >/dev/null 2>&1; then
-    echo "  Ollama is running."
-else
-    echo "  Starting Ollama..."
-    ollama serve &
-    CHILD_PIDS+=($!)
-
-    # Wait for Ollama to be ready (max 30s)
-    for i in $(seq 1 30); do
-        if curl -sf "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
-            echo "  Ollama ready."
-            break
-        fi
-        sleep 1
+# Always kill any running ollama so it is restarted with our Jetson env vars
+# (OLLAMA_KEEP_ALIVE, OLLAMA_CONTEXT_LENGTH). An ollama started from a plain
+# shell won't have them, which causes UMA OOM when walle connects later.
+if curl -sf "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
+    echo "  Existing Ollama detected — restarting with Jetson env vars..."
+    pkill -f "ollama serve" 2>/dev/null || true
+    pkill -f "ollama runner" 2>/dev/null || true
+    for i in $(seq 1 10); do
+        curl -sf "$OLLAMA_URL/api/tags" >/dev/null 2>&1 || break
+        sleep 0.5
     done
+fi
 
-    if ! curl -sf "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
-        echo "  ERROR: Ollama failed to start within 30s."
-        exit 1
+echo "  Starting Ollama (keep_alive=$OLLAMA_KEEP_ALIVE, ctx=$OLLAMA_CONTEXT_LENGTH)..."
+ollama serve >/tmp/ollama.log 2>&1 &
+CHILD_PIDS+=($!)
+
+# Wait for Ollama to be ready (max 30s)
+for i in $(seq 1 30); do
+    if curl -sf "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
+        echo "  Ollama ready."
+        break
     fi
+    sleep 1
+done
+
+if ! curl -sf "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
+    echo "  ERROR: Ollama failed to start within 30s. See /tmp/ollama.log"
+    exit 1
 fi
 
 # Check if model is pulled
@@ -61,6 +90,23 @@ if ollama list 2>/dev/null | grep -q "$OLLAMA_MODEL"; then
 else
     echo "  Model '$OLLAMA_MODEL' not found. Pulling..."
     ollama pull "$OLLAMA_MODEL"
+fi
+
+# Preload model onto GPU BEFORE walle's Python stack grabs RAM.
+# On Jetson UMA, delaying this until the first chat request fragments
+# the allocator and fails with NvMapMemAllocInternal error 12.
+echo "  Preloading '$OLLAMA_MODEL' onto GPU (num_ctx=$OLLAMA_CONTEXT_LENGTH, keep_alive=$OLLAMA_KEEP_ALIVE)..."
+curl -sf "$OLLAMA_URL/api/generate" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$OLLAMA_MODEL\",\"prompt\":\"\",\"keep_alive\":\"$OLLAMA_KEEP_ALIVE\",\"options\":{\"num_ctx\":$OLLAMA_CONTEXT_LENGTH}}" \
+    >/dev/null && echo "  Model resident on GPU." \
+    || echo "  WARNING: preload call failed; chat may OOM on first request."
+
+# Verify model is actually loaded (api/ps should list it).
+if curl -sf "$OLLAMA_URL/api/ps" 2>/dev/null | grep -q "$OLLAMA_MODEL"; then
+    echo "  Verified: $OLLAMA_MODEL is resident."
+else
+    echo "  WARNING: $OLLAMA_MODEL not found in /api/ps after preload."
 fi
 
 # ---------- 2. Mimic3 TTS ----------

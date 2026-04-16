@@ -87,7 +87,7 @@ def test_tool_suite_facade_dispatches_via_registry():
     from walle.tools.knowledge import get_knowledge_tools
     from walle.tools.robot.executor import get_robot_control_tools
 
-    robot = FakeExecutor({"drive_forward": "Driving"})
+    robot = FakeExecutor({"drive": "Driving"})
     knowledge = FakeExecutor({"consult_internet_for_facts": "facts"})
 
     registry = ToolRegistry()
@@ -99,14 +99,15 @@ def test_tool_suite_facade_dispatches_via_registry():
     )
     facade = ToolSuiteFacade(registry)
 
+    args = {"direction": "forward", "speed": 25, "duration_ms": 1000}
     result = facade.execute_tool(
-        name="drive_forward",
-        args={"speed": 25},
+        name="drive",
+        args=dict(args),
         user_message_already_sent=False,
     )
 
     assert result.tool_result == "Driving"
-    assert robot.calls == [("drive_forward", {"speed": 25})]
+    assert robot.calls == [("drive", args)]
 
 
 def test_vision_service_exposes_public_state():

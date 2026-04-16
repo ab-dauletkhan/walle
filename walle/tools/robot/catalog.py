@@ -1,5 +1,23 @@
 """
-Robot tool catalog and command objects.
+Robot tool catalog for the WALL-E CLI firmware
+(`firmware/wall-e/motor_control_cli.ino`).
+
+Every action emits one or more text-line commands from the firmware's help:
+
+    help | status | home | off | stop | stopall | trim VALUE
+    head center | head pos PCT | head tick TICK | head step DELTA | head off
+    left SPEED [MS] | right SPEED [MS] | drive SPEED [MS]
+    spin SPEED [MS] | tank LEFT RIGHT [MS] | mix MOVE TURN [MS]
+
+Speed range is -200..200. Duration is optional and capped at 5000 ms by the
+firmware. Head pan lives on PCA9685 channel 2 with ticks 150..550 and a
+60-tick-per-command safety clamp, so we rely on `head step` for smooth
+tracking updates instead of jumping absolute ticks.
+
+Only actions that the hardware can actually perform are exposed. The old
+arm / neck / eye servos were removed from the firmware, so the matching
+tools (`express_emotion`, `wave_hello`, etc.) no longer exist here — the
+LLM should not be given the ability to call commands that silently fail.
 """
 
 from __future__ import annotations
@@ -7,7 +25,17 @@ from __future__ import annotations
 import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import List, Optional, Protocol, Sequence
+
+
+# Hardware limits mirrored from motor_control_cli.ino so the Python layer
+# can clamp before hitting the firmware's "Rejected:" path.
+MAX_MOTOR_SPEED = 200
+MAX_TIMED_MOVE_MS = 5000
+HEAD_TICK_MIN = 150
+HEAD_TICK_MAX = 550
+HEAD_TICK_CENTER = 350
+HEAD_MAX_DELTA = 60
 
 
 class RobotRuntime(Protocol):
@@ -15,7 +43,7 @@ class RobotRuntime(Protocol):
 
     def sleep(self, seconds: float) -> None: ...
 
-    def heartbeat(self) -> str | None: ...
+    def heartbeat(self) -> Optional[str]: ...
 
 
 @dataclass(frozen=True)
@@ -23,7 +51,7 @@ class RobotToolSpec:
     name: str
     description: str
     properties: dict
-    required: tuple[str, ...] = ()
+    required: tuple = ()
 
     def to_schema(self) -> dict:
         return {
@@ -40,26 +68,33 @@ class RobotToolSpec:
         }
 
 
-@dataclass(frozen=True)
-class RobotPose:
-    head_rotation: int | None = None
-    neck_top: int | None = None
-    neck_bottom: int | None = None
-    left_arm: int | None = None
-    right_arm: int | None = None
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    def to_commands(self) -> list[str]:
-        commands = []
-        for prefix, value in (
-            ("G", self.head_rotation),
-            ("T", self.neck_top),
-            ("B", self.neck_bottom),
-            ("L", self.left_arm),
-            ("R", self.right_arm),
-        ):
-            if value is not None:
-                commands.append(f"{prefix}{max(0, min(100, int(value)))}")
-        return commands
+
+def _clamp(value, low: int, high: int) -> int:
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        v = 0
+    return max(low, min(high, v))
+
+
+def _clamp_speed(value) -> int:
+    return _clamp(value, -MAX_MOTOR_SPEED, MAX_MOTOR_SPEED)
+
+
+def _clamp_speed_percent(value) -> int:
+    """LLM-facing speed is 0..100 for readability; clamp + scale to ticks."""
+    percent = _clamp(value, 0, 100)
+    return int(round(percent * MAX_MOTOR_SPEED / 100))
+
+
+def _clamp_duration(value) -> int:
+    if value is None:
+        return 0
+    return _clamp(value, 0, MAX_TIMED_MOVE_MS)
 
 
 class RobotAction(ABC):
@@ -71,81 +106,126 @@ class RobotAction(ABC):
         raise NotImplementedError
 
     @staticmethod
-    def _clamp_percent(value) -> int:
-        return max(0, min(100, int(value)))
+    def _send_checked(runtime: RobotRuntime, cmd: str) -> str:
+        """Send a line and raise if the firmware rejected it.
 
-    @staticmethod
-    def _clamp_position(value) -> int:
-        return max(0, min(100, int(value)))
-
-    @staticmethod
-    def _send_checked(runtime: RobotRuntime, cmd: str) -> None:
+        Accepts both ``OK`` (old protocol, simulation) and ``OK -> ...`` (new
+        CLI firmware). Multi-line replies are joined by ``;`` in SerialManager
+        so we only need to check whether every segment starts with ``OK``.
+        """
         status = str(runtime.send_command(cmd))
-        if not all(part.strip().startswith("OK") for part in status.split(";")):
+        for part in status.split(";"):
+            part = part.strip()
+            if not part or part.startswith("OK"):
+                continue
             raise RuntimeError(f"{cmd}: {status}")
-
-    def _apply_pose(self, runtime: RobotRuntime, pose: RobotPose) -> None:
-        for cmd in pose.to_commands():
-            self._send_checked(runtime, cmd)
+        return status
 
 
-class TimedAxisAction(RobotAction):
-    def __init__(
-        self, spec: RobotToolSpec, axis: str, direction: int, action_label: str
-    ):
-        super().__init__(spec)
-        self._axis = axis
-        self._direction = direction
-        self._action_label = action_label
+# ---------------------------------------------------------------------------
+# Drive / wheels
+# ---------------------------------------------------------------------------
+
+
+class DriveAction(RobotAction):
+    """High-level `drive` tool — dispatches to firmware CLI commands.
+
+    direction=forward|backward → ``drive SPEED MS`` (both wheels same sign)
+    direction=left|right       → ``spin SPEED MS`` (tank turn in place)
+    """
 
     def execute(self, runtime: RobotRuntime, args: dict) -> str:
-        speed = self._clamp_percent(args.get("speed", 50))
-        duration_ms = max(0, int(args.get("duration_ms", 0)))
-        signed_speed = speed * self._direction
-        self._send_checked(runtime, f"{self._axis}{signed_speed}")
+        direction = str(args.get("direction", "forward")).lower()
+        speed_percent = _clamp(args.get("speed", 50), 0, 100)
+        duration_ms = _clamp_duration(args.get("duration_ms", 0))
+        speed_abs = _clamp_speed_percent(speed_percent)
+
+        if direction == "forward":
+            signed = speed_abs
+            cli = f"drive {signed}"
+        elif direction == "backward":
+            signed = -speed_abs
+            cli = f"drive {signed}"
+        elif direction == "left":
+            # spin SPEED uses left=-speed, right=+speed; positive = spin left
+            cli = f"spin {speed_abs}"
+        elif direction == "right":
+            cli = f"spin {-speed_abs}"
+        else:
+            return f"Unknown direction: {direction}"
+
         if duration_ms > 0:
-            self._send_checked(runtime, f"D{duration_ms}")
-            return f"{self._action_label} at {speed}% for {duration_ms}ms"
-        return f"{self._action_label} at {speed}% (continuous)"
+            cli = f"{cli} {duration_ms}"
+            suffix = f" for {duration_ms}ms"
+        else:
+            suffix = " (continuous)"
+
+        self._send_checked(runtime, cli)
+        return f"Driving {direction} at {speed_percent}%{suffix}"
 
 
-class SetPositionAction(RobotAction):
-    def __init__(self, spec: RobotToolSpec, command_prefix: str, label: str):
-        super().__init__(spec)
-        self._command_prefix = command_prefix
-        self._label = label
-
-    def execute(self, runtime: RobotRuntime, args: dict) -> str:
-        position = self._clamp_position(args.get("position", 50))
-        self._send_checked(runtime, f"{self._command_prefix}{position}")
-        return f"{self._label} to {position}"
-
-
-class CoordinatedNeckAction(RobotAction):
-    """Adapter from a single logical neck position to the two-neck-servo firmware protocol."""
+class TankDriveAction(RobotAction):
+    """Direct left/right wheel speeds. Lets the vision/tracking loop steer."""
 
     def execute(self, runtime: RobotRuntime, args: dict) -> str:
-        position = self._clamp_position(args.get("position", 50))
-        pose = RobotPose(
-            neck_top=position,
-            neck_bottom=100 - position,
+        left = _clamp_speed(args.get("left", 0))
+        right = _clamp_speed(args.get("right", 0))
+        duration_ms = _clamp_duration(args.get("duration_ms", 0))
+        cli = f"tank {left} {right}"
+        if duration_ms > 0:
+            cli = f"{cli} {duration_ms}"
+        self._send_checked(runtime, cli)
+        return f"tank left={left} right={right}" + (
+            f" for {duration_ms}ms" if duration_ms else ""
         )
-        self._apply_pose(runtime, pose)
-        return f"Neck to {position}"
-
-
-class SetBothArmsAction(RobotAction):
-    def execute(self, runtime: RobotRuntime, args: dict) -> str:
-        left = self._clamp_position(args.get("left", 50))
-        right = self._clamp_position(args.get("right", 50))
-        self._send_checked(runtime, f"L{left}\nR{right}")
-        return f"Arms set to left={left}, right={right}"
 
 
 class StopMovementAction(RobotAction):
     def execute(self, runtime: RobotRuntime, args: dict) -> str:
-        self._send_checked(runtime, "q")
-        return "Emergency stop"
+        self._send_checked(runtime, "stop")
+        return "Motors stopped"
+
+
+class HomeAction(RobotAction):
+    def execute(self, runtime: RobotRuntime, args: dict) -> str:
+        self._send_checked(runtime, "home")
+        return "Head centered"
+
+
+class StopAllAction(RobotAction):
+    def execute(self, runtime: RobotRuntime, args: dict) -> str:
+        self._send_checked(runtime, "stopall")
+        return "Motors stopped, head servo off"
+
+
+# ---------------------------------------------------------------------------
+# Head pan (single servo on PCA9685 channel 2)
+# ---------------------------------------------------------------------------
+
+
+class HeadPanAction(RobotAction):
+    """Absolute head position as a percentage, 0=left, 50=center, 100=right.
+
+    The firmware enforces max 60 ticks of jump per command, so large swings
+    are split into a short sequence of `head step` commands. This keeps the
+    mechanical head from lurching even when the LLM asks for a big move.
+    """
+
+    def execute(self, runtime: RobotRuntime, args: dict) -> str:
+        percent = _clamp(args.get("position", 50), 0, 100)
+        self._send_checked(runtime, f"head pos {percent}")
+        return f"Head pan -> {percent}%"
+
+
+class HeadStepAction(RobotAction):
+    """Relative head move by raw ticks, capped to firmware's ±60 safety."""
+
+    def execute(self, runtime: RobotRuntime, args: dict) -> str:
+        delta = _clamp(args.get("delta", 0), -HEAD_MAX_DELTA, HEAD_MAX_DELTA)
+        if delta == 0:
+            return "Head step 0 (no-op)"
+        self._send_checked(runtime, f"head step {delta}")
+        return f"Head step {delta:+d}"
 
 
 class ScanSurroundingsAction(RobotAction):
@@ -154,76 +234,58 @@ class ScanSurroundingsAction(RobotAction):
     def execute(self, runtime: RobotRuntime, args: dict) -> str:
         speed = str(args.get("speed", "normal"))
         delay = self._DELAYS.get(speed, self._DELAYS["normal"])
-        commands = ("G20", "G50", "G80", "G50")
-        for index, cmd in enumerate(commands):
+        sequence = ("head pos 20", "head pos 50", "head pos 80", "head pos 50")
+        for index, cmd in enumerate(sequence):
             self._send_checked(runtime, cmd)
-            if index < len(commands) - 1:
+            if index < len(sequence) - 1:
                 runtime.sleep(delay)
         return f"Scanned surroundings ({speed})"
 
 
-class ExpressEmotionAction(RobotAction):
-    _EMOTION_COMMANDS = {
-        "happy": RobotPose(neck_top=80, neck_bottom=20, left_arm=80, right_arm=80),
-        "sad": RobotPose(neck_top=20, neck_bottom=80, left_arm=20, right_arm=20),
-        "neutral": RobotPose(neck_top=50, neck_bottom=50, left_arm=40, right_arm=40),
-    }
-
-    def execute(self, runtime: RobotRuntime, args: dict) -> str:
-        emotion = str(args.get("emotion", "neutral"))
-        pose = self._EMOTION_COMMANDS.get(emotion, self._EMOTION_COMMANDS["neutral"])
-        self._apply_pose(runtime, pose)
-        return f"Expression set to {emotion}"
-
-
-class WaveHelloAction(RobotAction):
-    def execute(self, runtime: RobotRuntime, args: dict) -> str:
-        self._send_checked(runtime, "L40")
-        self._send_checked(runtime, "R80")
-        runtime.sleep(0.3)
-        for _ in range(2):
-            self._send_checked(runtime, "R35")
-            runtime.sleep(0.3)
-            self._send_checked(runtime, "R80")
-            runtime.sleep(0.3)
-        self._send_checked(runtime, "R40")
-        return "Waved hello"
-
-
-class ResetToNeutralAction(RobotAction):
-    def execute(self, runtime: RobotRuntime, args: dict) -> str:
-        self._send_checked(runtime, "A0")
-        return "Neutral position"
+# ---------------------------------------------------------------------------
+# Status
+# ---------------------------------------------------------------------------
 
 
 class GetStatusAction(RobotAction):
-    """Query Arduino for current servo positions and motor state."""
+    """Query the firmware `status` block and compact it for the LLM."""
 
     def execute(self, runtime: RobotRuntime, args: dict) -> str:
         raw = runtime.heartbeat()
         if not raw:
             return "Status unavailable (no connection)"
-        return self._parse(raw)
+        return self._summarize(raw)
 
     @staticmethod
-    def _parse(raw: str) -> str:
-        # FORMAT: "STATUS 248,560,140,475,270,250,290 M0,0"
-        # Servos: head, neck_top, neck_bottom, eye_r, eye_l, arm_l, arm_r
-        # Motors: left_speed, right_speed
-        try:
-            parts = raw.split()
-            servos = parts[1].split(",")
-            motors = parts[2].lstrip("M").split(",")
-            motor_l, motor_r = int(motors[0]), int(motors[1])
-            moving = motor_l != 0 or motor_r != 0
-            return (
-                f"motors={'moving' if moving else 'stopped'} "
-                f"(left={motor_l}, right={motor_r}), "
-                f"head={servos[0]}, neck_top={servos[1]}, neck_bottom={servos[2]}, "
-                f"arm_left={servos[5]}, arm_right={servos[6]}"
-            )
-        except (IndexError, ValueError):
-            return f"raw status: {raw}"
+    def _summarize(raw: str) -> str:
+        head_tick: Optional[str] = None
+        head_pct: Optional[str] = None
+        left_motor: Optional[str] = None
+        right_motor: Optional[str] = None
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("tick ="):
+                head_tick = stripped.split("=", 1)[1].strip()
+            elif stripped.startswith("percent ="):
+                head_pct = stripped.split("=", 1)[1].strip()
+            elif stripped.startswith("left ="):
+                left_motor = stripped.split("=", 1)[1].strip()
+            elif stripped.startswith("right ="):
+                right_motor = stripped.split("=", 1)[1].strip()
+        if head_tick is None and left_motor is None:
+            # Firmware didn't answer in the expected format — just echo it.
+            return f"raw status: {raw[:200]}"
+        moving = (left_motor not in (None, "0")) or (right_motor not in (None, "0"))
+        return (
+            f"motors={'moving' if moving else 'stopped'} "
+            f"(left={left_motor or 0}, right={right_motor or 0}), "
+            f"head tick={head_tick or '?'} ({head_pct or '?'}%)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
 
 
 class RobotToolRegistry:
@@ -231,10 +293,10 @@ class RobotToolRegistry:
         self._actions = list(actions)
         self._action_map = {action.spec.name: action for action in self._actions}
 
-    def get_tool_schemas(self) -> list[dict]:
+    def get_tool_schemas(self) -> List[dict]:
         return [action.spec.to_schema() for action in self._actions]
 
-    def get_tool_names(self) -> list[str]:
+    def get_tool_names(self) -> List[str]:
         return [action.spec.name for action in self._actions]
 
     def execute(self, runtime: RobotRuntime, fn_name: str, args: dict) -> str:
@@ -247,230 +309,75 @@ class RobotToolRegistry:
 def build_default_robot_registry() -> RobotToolRegistry:
     return RobotToolRegistry(
         [
-            # --- Servo position tools ---
-            SetPositionAction(
+            DriveAction(
                 RobotToolSpec(
-                    "set_head_rotation",
-                    "Call when the user asks to look left/right or face a direction. "
-                    "Sets head rotation angle. Returns confirmation with final position.",
+                    "drive",
+                    "Move the robot. direction=forward/backward/left/right. "
+                    "speed is 0-100 (percent of max). duration_ms is optional, "
+                    "max 5000; omit or set 0 for continuous motion that keeps "
+                    "running until `stop_movement` is called or the firmware "
+                    "watchdog fires after 3s.",
                     {
-                        "position": {
+                        "direction": {
+                            "type": "string",
+                            "enum": ["forward", "backward", "left", "right"],
+                        },
+                        "speed": {"type": "integer", "minimum": 0, "maximum": 100},
+                        "duration_ms": {
                             "type": "integer",
                             "minimum": 0,
-                            "maximum": 100,
-                            "description": "Head angle: 0=full left, 50=center, 100=full right. Example: 25=slightly left.",
-                        }
+                            "maximum": MAX_TIMED_MOVE_MS,
+                        },
                     },
-                    ("position",),
-                ),
-                command_prefix="G",
-                label="Head",
-            ),
-            CoordinatedNeckAction(
-                RobotToolSpec(
-                    "set_neck_position",
-                    "Call when the user asks to look up/down or nod. "
-                    "Sets neck tilt angle. Returns confirmation with final position.",
-                    {
-                        "position": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": 100,
-                            "description": "Neck tilt: 0=looking down, 50=level, 100=looking up. Example: 80=looking up.",
-                        }
-                    },
-                    ("position",),
+                    ("direction", "speed"),
                 )
             ),
-            SetBothArmsAction(
-                RobotToolSpec(
-                    "set_both_arms",
-                    "Call when the user asks to raise/lower arms or make a gesture. "
-                    "Sets both arm positions independently. Returns confirmation.",
-                    {
-                        "left": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": 100,
-                            "description": "Left arm: 0=fully lowered, 50=horizontal, 100=fully raised.",
-                        },
-                        "right": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": 100,
-                            "description": "Right arm: 0=fully lowered, 50=horizontal, 100=fully raised.",
-                        },
-                    },
-                    ("left", "right"),
-                )
-            ),
-            # --- Timed movement tools ---
-            TimedAxisAction(
-                RobotToolSpec(
-                    "drive_forward",
-                    "Call when the user asks to move forward or approach something. "
-                    "Drives forward for the specified duration then stops automatically. "
-                    "Returns distance estimate. Reference: speed=50 for 1000ms covers ~30cm.",
-                    {
-                        "speed": {
-                            "type": "integer",
-                            "minimum": 10,
-                            "maximum": 100,
-                            "description": "Motor power in percent. 30=slow, 50=normal, 80=fast.",
-                        },
-                        "duration_ms": {
-                            "type": "integer",
-                            "minimum": 100,
-                            "maximum": 5000,
-                            "description": "Duration in ms, max 5000 per call. For longer moves, call multiple times. Example: 1000=1s.",
-                        },
-                    },
-                    ("speed", "duration_ms"),
-                ),
-                axis="Y",
-                direction=1,
-                action_label="Driving forward",
-            ),
-            TimedAxisAction(
-                RobotToolSpec(
-                    "drive_backward",
-                    "Call when the user asks to move backward or retreat. "
-                    "Drives backward for the specified duration then stops automatically. "
-                    "Returns distance estimate. Reference: speed=50 for 1000ms covers ~30cm.",
-                    {
-                        "speed": {
-                            "type": "integer",
-                            "minimum": 10,
-                            "maximum": 100,
-                            "description": "Motor power in percent. 30=slow, 50=normal, 80=fast.",
-                        },
-                        "duration_ms": {
-                            "type": "integer",
-                            "minimum": 100,
-                            "maximum": 5000,
-                            "description": "Duration in ms, max 5000 per call. For longer moves, call multiple times. Example: 1000=1s.",
-                        },
-                    },
-                    ("speed", "duration_ms"),
-                ),
-                axis="Y",
-                direction=-1,
-                action_label="Driving backward",
-            ),
-            TimedAxisAction(
-                RobotToolSpec(
-                    "turn_left",
-                    "Call when the user asks to turn/rotate left. "
-                    "Rotates left in place for the specified duration then stops. "
-                    "Returns angle estimate. Reference at speed=50: 500ms=~90°, 1000ms=~180°, 2000ms=~360°.",
-                    {
-                        "speed": {
-                            "type": "integer",
-                            "minimum": 10,
-                            "maximum": 100,
-                            "description": "Motor power in percent. 50=normal turning speed.",
-                        },
-                        "duration_ms": {
-                            "type": "integer",
-                            "minimum": 100,
-                            "maximum": 5000,
-                            "description": "Duration in ms, max 5000 per call. For longer turns, call multiple times. 500=~90°, 1000=~180°, 2000=~360°.",
-                        },
-                    },
-                    ("speed", "duration_ms"),
-                ),
-                axis="X",
-                direction=-1,
-                action_label="Turning left",
-            ),
-            TimedAxisAction(
-                RobotToolSpec(
-                    "turn_right",
-                    "Call when the user asks to turn/rotate right. "
-                    "Rotates right in place for the specified duration then stops. "
-                    "Returns angle estimate. Reference at speed=50: 500ms=~90°, 1000ms=~180°, 2000ms=~360°.",
-                    {
-                        "speed": {
-                            "type": "integer",
-                            "minimum": 10,
-                            "maximum": 100,
-                            "description": "Motor power in percent. 50=normal turning speed.",
-                        },
-                        "duration_ms": {
-                            "type": "integer",
-                            "minimum": 100,
-                            "maximum": 5000,
-                            "description": "Duration in ms, max 5000 per call. For longer turns, call multiple times. 500=~90°, 1000=~180°, 2000=~360°.",
-                        },
-                    },
-                    ("speed", "duration_ms"),
-                ),
-                axis="X",
-                direction=1,
-                action_label="Turning right",
-            ),
-            # --- Instant actions ---
             StopMovementAction(
                 RobotToolSpec(
                     "stop_movement",
-                    "Call to immediately halt all drive motors. Use in emergencies or when the user says stop.",
+                    "Immediately stop both wheel motors.",
                     {},
                 )
             ),
-            ExpressEmotionAction(
+            HeadPanAction(
                 RobotToolSpec(
-                    "express_emotion",
-                    "Call when the user asks to show a feeling or when contextually appropriate "
-                    "(e.g. greet with happy, apologize with sad). "
-                    "Sets head, neck, and arm positions to match the emotion.",
+                    "head_pan",
+                    "Turn the head to an absolute horizontal position. "
+                    "position=0 is fully left, 50 is centered, 100 is fully right.",
                     {
-                        "emotion": {
-                            "type": "string",
-                            "enum": ["happy", "sad", "neutral"],
-                            "description": "happy=head up, arms raised. sad=head down, arms lowered. neutral=relaxed centered pose.",
+                        "position": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 100,
                         }
                     },
-                    ("emotion",),
+                    ("position",),
+                )
+            ),
+            HomeAction(
+                RobotToolSpec(
+                    "reset_to_neutral",
+                    "Center the head back to its home position.",
+                    {},
                 )
             ),
             ScanSurroundingsAction(
                 RobotToolSpec(
                     "scan_surroundings",
-                    "Call when the user asks to look around or check the environment. "
-                    "Sweeps head left→center→right→center. Returns completion status.",
+                    "Sweep the head left-center-right-center to look around.",
                     {
                         "speed": {
                             "type": "string",
                             "enum": ["slow", "normal", "fast"],
-                            "description": "Pause between positions: slow=1.5s, normal=0.8s, fast=0.4s.",
                         }
                     },
                     ("speed",),
                 )
             ),
-            WaveHelloAction(
-                RobotToolSpec(
-                    "wave_hello",
-                    "Call when the user says hello/hi/greetings or asks the robot to wave. "
-                    "Raises one arm and waves back and forth twice.",
-                    {},
-                )
-            ),
-            ResetToNeutralAction(
-                RobotToolSpec(
-                    "reset_to_neutral",
-                    "Call to return all servos (head, neck, arms) to centered resting position. "
-                    "Use after finishing a sequence of movements.",
-                    {},
-                )
-            ),
-            # --- Feedback ---
             GetStatusAction(
                 RobotToolSpec(
                     "get_robot_status",
-                    "Call after movement commands to verify execution completed. "
-                    "Returns current servo positions and motor state (moving/stopped). "
-                    "Use this to confirm the robot finished a maneuver before issuing the next one.",
+                    "Report the current head position and wheel motor speeds.",
                     {},
                 )
             ),

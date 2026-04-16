@@ -9,6 +9,8 @@ from typing import Optional
 
 import numpy as np
 
+from .errors import FaceRecognitionError
+
 FACE_DIR = Path(__file__).resolve().parent
 MODELS_DIR = FACE_DIR / "models"
 DEFAULT_DATA_DIR = FACE_DIR / "scanned_people"
@@ -19,11 +21,6 @@ DETECTION_MODEL = "ssd_mobilenet_v2_face_quant_postprocess.tflite"
 DETECTION_EDGE_TPU_MODEL = "ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite"
 EMBEDDING_MODEL = "Mobilenet1_triplet1589223569_triplet_quant.tflite"
 EMBEDDING_EDGE_TPU_MODEL = "Mobilenet1_triplet1589223569_triplet_quant_edgetpu.tflite"
-
-
-class FaceRecognitionError(RuntimeError):
-    """Raised when the face recognition utilities cannot run safely."""
-
 
 @dataclass(frozen=True)
 class Detection:
@@ -104,14 +101,21 @@ def create_interpreter(model_path: Path, edge_tpu: bool):
 
     delegates = None
     if edge_tpu:
-        try:
-            delegates = [load_delegate("libedgetpu.so.1.0")]
-        except (OSError, ValueError) as exc:
+        delegate_errors = []
+        for library_name in ("libedgetpu.so.1.0", "libedgetpu.so.1"):
+            try:
+                delegates = [load_delegate(library_name)]
+                break
+            except (OSError, ValueError) as exc:
+                delegate_errors.append(f"{library_name}: {exc}")
+        if delegates is None:
             raise FaceRecognitionError(
-                "Coral Edge TPU runtime library `libedgetpu.so.1.0` is missing "
-                "or failed to load. Install the Coral Edge TPU runtime on the "
-                "Jetson/Linux host, then rerun the command."
-            ) from exc
+                "Coral Edge TPU runtime library failed to load. Tried "
+                "`libedgetpu.so.1.0` and `libedgetpu.so.1`. Install or repair "
+                "the Coral Edge TPU runtime on the Jetson/Linux host, then "
+                "rerun the command. "
+                + "; ".join(delegate_errors)
+            )
 
     if delegates is None:
         return Interpreter(model_path=str(model_path))

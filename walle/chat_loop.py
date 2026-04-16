@@ -7,6 +7,7 @@ from object construction and lifecycle management.
 
 import json
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -17,14 +18,75 @@ from typing import Optional
 from walle.memory.config import conf
 from walle.memory.context_manager import InteractionContext, SensorSimulator
 
+_DUMP_PROMPT = os.environ.get("WALLE_DUMP_PROMPT", "").lower() in ("1", "true", "yes")
+
 _log = logging.getLogger("walle.chat")
+
+_OOM_MARKERS = (
+    "out of memory",
+    "cuda",
+    "cudamalloc",
+    "failed to allocate",
+)
+
+
+def _is_oom_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _OOM_MARKERS)
+
+
+def _force_unload_ollama_model(model: str) -> None:
+    """Best-effort POST to unload a model from Ollama's GPU cache."""
+    try:
+        import requests
+
+        requests.post(
+            f"{conf.OLLAMA_BASE_URL}/api/generate",
+            json={"model": model, "keep_alive": 0},
+            timeout=5,
+        )
+    except Exception as unload_err:
+        _log.debug("Ollama unload failed: %s", unload_err)
+
+def _dump_messages_debug(messages, tools) -> None:
+    """Print the exact compiled prompt with per-section char/rough-token counts.
+
+    Enabled by WALLE_DUMP_PROMPT=1. Rough-token = chars // 4 (indicative only;
+    real counts come from Ollama's usage.prompt_tokens in the response).
+    """
+    print("=" * 72, flush=True)
+    print("WALLE_DUMP_PROMPT: compiled request", flush=True)
+    print("=" * 72, flush=True)
+    total_chars = 0
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "?")
+        content = msg.get("content") or ""
+        ch = len(content)
+        total_chars += ch
+        header = f"[{i}] role={role} chars={ch} (~{ch // 4} tok)"
+        if msg.get("tool_calls"):
+            header += f" tool_calls={len(msg['tool_calls'])}"
+        if msg.get("tool_call_id"):
+            header += f" tool_call_id={msg['tool_call_id']}"
+        print(header, flush=True)
+        if content:
+            preview = content if len(content) < 2000 else content[:2000] + "\n...[truncated]"
+            print(preview, flush=True)
+        print("-" * 72, flush=True)
+
+    tool_chars = len(json.dumps(tools)) if tools else 0
+    total_chars += tool_chars
+    print(
+        f"[tools] count={len(tools or [])} json_chars={tool_chars} (~{tool_chars // 4} tok)",
+        flush=True,
+    )
+    print(f"TOTAL: ~{total_chars} chars (~{total_chars // 4} tok rough)", flush=True)
+    print("=" * 72, flush=True)
+
 
 _MOTOR_TOOLS = frozenset(
     {
-        "drive_forward",
-        "drive_backward",
-        "turn_left",
-        "turn_right",
+        "drive",
         "stop_movement",
         "get_robot_status",
     }
@@ -75,47 +137,154 @@ class ChatSession:
 class LLMStreamer:
     """Wraps the OpenAI-compatible streaming API."""
 
-    def __init__(self, client, model: str):
+    def __init__(self, client, model: str, num_ctx: int | None = None):
         self._client = client
         self._model = model
+        self._num_ctx = num_ctx
 
     def stream(self, messages, tools, max_retries=2):
-        """Call LLM and return (content, tool_calls_list)."""
+        """Call LLM and return (content, tool_calls_list).
+
+        Streams the response in real time, prints content as it arrives,
+        and logs TTFT + tokens/sec in debug mode.
+        """
+        debug = _log.isEnabledFor(logging.DEBUG)
+
+        if _DUMP_PROMPT:
+            _dump_messages_debug(messages, tools)
+
         for attempt in range(max_retries):
             try:
-                response = self._client.chat.completions.create(
+                t_start = time.perf_counter()
+                t_first: Optional[float] = None
+                usage = None
+
+                # Pass num_ctx via extra_body so Ollama keeps the same KV
+                # buffer as the preload — otherwise it reloads the model
+                # mid-request and fragments Jetson UMA.
+                extra_body = (
+                    {"options": {"num_ctx": self._num_ctx}}
+                    if self._num_ctx
+                    else None
+                )
+                stream = self._client.chat.completions.create(
                     model=self._model,
                     messages=messages,
                     tools=tools,
                     tool_choice="auto",
+                    stream=True,
+                    stream_options={"include_usage": True},
+                    extra_body=extra_body,
                 )
 
-                choice = response.choices[0]
-                content = choice.message.content or ""
+                acc_content: list[str] = []
+                acc_tools: dict[int, dict] = {}
 
-                if content and _log.isEnabledFor(logging.DEBUG):
-                    print(f"   \U0001f4ad {content}")
+                for chunk in stream:
+                    if getattr(chunk, "usage", None):
+                        usage = chunk.usage
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
 
-                tool_calls_list = []
-                if choice.message.tool_calls:
-                    for tc in choice.message.tool_calls:
-                        tool_calls_list.append(
-                            ToolCallEnvelope(
-                                id=tc.id,
-                                function=ToolFunctionCall(
-                                    name=tc.function.name,
-                                    arguments=tc.function.arguments or "{}",
-                                ),
+                    if delta.content:
+                        if t_first is None:
+                            t_first = time.perf_counter()
+                        acc_content.append(delta.content)
+                        if debug:
+                            print(delta.content, end="", flush=True)
+
+                    if delta.tool_calls:
+                        if t_first is None:
+                            t_first = time.perf_counter()
+                        for tc_delta in delta.tool_calls:
+                            slot = acc_tools.setdefault(
+                                tc_delta.index,
+                                {"id": "", "name": "", "arguments": ""},
                             )
-                        )
+                            if tc_delta.id:
+                                slot["id"] = tc_delta.id
+                            fn = tc_delta.function
+                            if fn is not None:
+                                if fn.name:
+                                    slot["name"] += fn.name
+                                if fn.arguments:
+                                    slot["arguments"] += fn.arguments
+
+                t_end = time.perf_counter()
+                content = "".join(acc_content)
+
+                tool_calls_list = [
+                    ToolCallEnvelope(
+                        id=slot["id"],
+                        function=ToolFunctionCall(
+                            name=slot["name"],
+                            arguments=slot["arguments"] or "{}",
+                        ),
+                    )
+                    for _, slot in sorted(acc_tools.items())
+                ]
+
+                if debug:
+                    if acc_content:
+                        print()
+                    total = t_end - t_start
+                    # Prefer real token counts from Ollama's usage payload.
+                    if usage is not None:
+                        prompt_tokens = getattr(usage, "prompt_tokens", None)
+                        completion_tokens = getattr(usage, "completion_tokens", None)
+                    else:
+                        prompt_tokens = None
+                        completion_tokens = None
+                    n_out = completion_tokens if completion_tokens is not None else (
+                        len(content.split())
+                        + sum(len(s["arguments"].split()) for s in acc_tools.values())
+                    )
+                    if t_first is not None:
+                        ttft = t_first - t_start
+                        gen = max(t_end - t_first, 1e-6)
+                        rate = n_out / gen
+                        if prompt_tokens is not None:
+                            _log.debug(
+                                "[prompt %d tok | TTFT %.2fs => prefill %.1f tok/s] [%d out tok @ %.1f tok/s] [total %.2fs]",
+                                prompt_tokens,
+                                ttft,
+                                prompt_tokens / max(ttft, 1e-6),
+                                n_out,
+                                rate,
+                                total,
+                            )
+                        else:
+                            _log.debug(
+                                "[TTFT %.2fs] [%d tok @ %.1f tok/s] [total %.2fs]",
+                                ttft,
+                                n_out,
+                                rate,
+                                total,
+                            )
+                    else:
+                        _log.debug("[no tokens] [total %.2fs]", total)
 
                 return content, tool_calls_list
 
             except Exception as e:
-                _log.warning(
-                    "LLM error (attempt %d/%d): %s", attempt + 1, max_retries, e
-                )
-                time.sleep(1)
+                if _is_oom_error(e):
+                    _log.warning(
+                        "LLM OOM (attempt %d/%d): %s — unloading model",
+                        attempt + 1,
+                        max_retries,
+                        e,
+                    )
+                    _force_unload_ollama_model(self._model)
+                    time.sleep(2)
+                else:
+                    _log.warning(
+                        "LLM error (attempt %d/%d): %s",
+                        attempt + 1,
+                        max_retries,
+                        e,
+                    )
+                    time.sleep(1)
 
         _log.error("Failed to generate LLM response after %d retries", max_retries)
         return (
@@ -129,7 +298,10 @@ class LLMStreamer:
             resp = self._client.chat.completions.create(
                 model=self._model,
                 messages=[
-                    {"role": "user", "content": f"Summarize this concisely:\n{text}"}
+                    {
+                        "role": "user",
+                        "content": f"/no_think\n\nSummarize this concisely:\n{text}",
+                    }
                 ],
                 max_tokens=200,
             )
@@ -223,12 +395,10 @@ class ChatLoop:
         return result
 
     _MAX_ITERATIONS = 20
-    _MAX_STALE = 3
 
     def _tool_loop(self, memory_context: str) -> Optional[str]:
         """Inner loop: call LLM → execute tools → repeat until send_message."""
         iteration = 0
-        stale_count = 0
         user_received_message = False
 
         while iteration < self._MAX_ITERATIONS:
@@ -244,19 +414,12 @@ class ChatLoop:
                 if content:
                     self._session.add("assistant", content)
                     if not user_received_message:
-                        stale_count += 1
-                        if stale_count >= self._MAX_STALE:
-                            _log.debug(
-                                "Stale after %d attempts without send_message",
-                                stale_count,
-                            )
-                            break
-                        _log.debug(
-                            "No send_message called, prompting... (%d/%d)",
-                            stale_count,
-                            self._MAX_STALE,
-                        )
-                        continue
+                        # Small local models (qwen2.5:3b) often skip the
+                        # send_message tool and just emit plain text. Treat
+                        # that text as the reply instead of dropping it.
+                        self._comm_exec._send_message({"message": content})
+                        self._recall_mem.insert("assistant", content)
+                        user_received_message = True
                 break
 
             # Validate all tool call arguments before committing to session
@@ -276,7 +439,6 @@ class ChatLoop:
                 continue
 
             self._session.add("assistant", content or "", tool_calls)
-            stale_count = 0
             hb_req = False
 
             for tc, args in parsed_calls:
@@ -319,8 +481,6 @@ class ChatLoop:
     # -- Memory compression (background) --
 
     def _start_compression_if_needed(self) -> None:
-        if self._recall_mem.get_count() <= conf.RECALL_MEMORY_LIMIT:
-            return
         if not self._compression_lock.acquire(blocking=False):
             return
 
@@ -329,6 +489,7 @@ class ChatLoop:
                 self._recall_mem.compress_old_memories(
                     self._llm.summarize,
                     self._archival_mem,
+                    batch_size=conf.RECALL_COMPRESSION_BATCH,
                 )
             finally:
                 self._compression_lock.release()

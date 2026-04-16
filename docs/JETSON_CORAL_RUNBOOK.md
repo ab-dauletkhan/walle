@@ -84,7 +84,7 @@ Expected startup behavior:
 Primary command:
 
 ```bash
-uv run walle-face-track-head --edge-tpu --serial-port /dev/ttyCH341USB0
+uv run walle-face-track-head --edge-tpu --serial-port /dev/ttyCH341USB0 --headless
 ```
 
 Expected behavior:
@@ -92,7 +92,7 @@ Expected behavior:
 - opens camera
 - connects to serial
 - prints `Serial connected: /dev/ttyCH341USB0 @ 115200`
-- shows tracking window
+- runs without a tracking window in headless mode
 - moves the head in small steps to center the strongest detected face
 - when the target is lost long enough, it slowly returns toward center
 - on exit, it sends the head back to center
@@ -108,7 +108,11 @@ The current code is reasonable to run as-is. Important behavior details:
 - Head movement depends only on face detection, so tracking should still work even if embeddings or name matching are missing
 - If serial connection fails, the script does not crash; it logs a warning and keeps vision running
 - The script uses `/dev/ttyCH341USB0` by default, so override `--serial-port` if your Arduino enumerates differently
-- The script uses `cv2.CAP_V4L2` first, then falls back to the default camera backend
+- The script uses the shared camera-source helper:
+  - OpenCV V4L2 first
+  - OpenCV default second
+  - Python GStreamer fallback last
+- If `DISPLAY` is unset, headless mode is the default even without `--headless`
 
 ## Recommended pre-run checks for head tracking
 
@@ -163,3 +167,26 @@ bash scripts/start.sh
 ```
 
 That allows the main app vision service to use the Coral Python 3.9 worker while the rest of the app remains in the standard environment.
+
+For full voice mode, make sure both Ollama and Mimic3 are running before or during startup:
+
+```bash
+curl -sf http://localhost:11434/api/tags >/dev/null
+curl -sf http://localhost:59125 >/dev/null
+```
+
+The unified `walle` entrypoint now accepts the same Jetson-friendly audio flags as the standalone assistant:
+
+```bash
+uv run walle --jetson \
+  --mic-device "USB Composite Device" \
+  --speaker-device "UACDemoV1.0" \
+  --speaker-rate 48000 \
+  --speaker-channels 2
+```
+
+Useful notes:
+
+- Jetson voice mode defaults to `tiny-streaming` unless `--stt-model` is explicitly set
+- Vision is only reported healthy after the first frame is captured
+- `capture_image` now returns a camera-not-ready error instead of pretending vision is available when no live frame exists

@@ -7,10 +7,33 @@ interface for the voice pipeline and exposes chat() for API/REPL.
 """
 
 import logging
+import re
 import time
 from typing import Iterator, Optional
 
 _log = logging.getLogger("walle.orchestrator")
+
+# Small local models (qwen2.5:3b / qwen3:4b) frequently emit the send_message
+# tool call as literal plain text instead of a structured call, producing
+# prefixes like "Message sent to user: ...", "Send_message: ...", or
+# "Message sent_message: ...". Strip them before handing the reply to TTS.
+_TOOL_PREFIX_RE = re.compile(
+    r"^\s*(?:message\s+sent(?:_message|\s+to\s+user)?|send_?message)\s*[:\-]\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_tool_prefix(text: str) -> str:
+    if not text:
+        return text
+    cleaned = text
+    # Loop — handles cases like "Message sent_message: Send_message: hi"
+    for _ in range(3):
+        new = _TOOL_PREFIX_RE.sub("", cleaned, count=1)
+        if new == cleaned:
+            break
+        cleaned = new
+    return cleaned.strip() or text
 
 
 class WallEOrchestrator:
@@ -42,7 +65,8 @@ class WallEOrchestrator:
         self.vision_service = vision_service
 
     def chat(self, user_input: str) -> Optional[str]:
-        return self._chat_loop.run(user_input)
+        reply = self._chat_loop.run(user_input)
+        return _strip_tool_prefix(reply) if reply else reply
 
     def stream_chat(self, messages: list[dict]) -> Iterator[str]:
         user_text = ""

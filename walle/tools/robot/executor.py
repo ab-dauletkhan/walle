@@ -1,23 +1,22 @@
 """
-WALL-E robot control tools.
+WALL-E robot control tool executor.
+
+Thin adapter between the LLM tool-calling layer and the shared
+``SerialManager`` that speaks the CLI firmware (``motor_control_cli.ino``).
+All real serial I/O is delegated to ``SerialManager`` so the face tracker
+and the LLM can share one port without racing.
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from typing import Optional
 
 from walle.tools.base_executor import BaseToolExecutor
 from walle.tools.robot.catalog import RobotRuntime, build_default_robot_registry
 
 _log = logging.getLogger("walle.robot")
-
-try:
-    import serial
-
-    SERIAL_AVAILABLE = True
-except ImportError:
-    SERIAL_AVAILABLE = False
 
 
 _ROBOT_REGISTRY = build_default_robot_registry()
@@ -32,86 +31,63 @@ def get_robot_tool_names():
 
 
 class RobotControlExecutor(BaseToolExecutor, RobotRuntime):
-    """Executor for robot control tools."""
+    """Executor for robot control tools.
 
-    def __init__(self, serial_port=None, baud_rate=115200, serial_manager=None):
+    Always routes through a shared ``SerialManager``. If one isn't provided
+    (e.g. tests), the executor runs in simulation mode and logs commands
+    instead of writing to hardware.
+    """
+
+    def __init__(self, serial_manager=None, **_legacy_kwargs):
+        # _legacy_kwargs absorbs old serial_port / baud_rate arguments so
+        # existing callers keep working without creating a second pyserial
+        # connection behind SerialManager's back.
         self._serial_manager = serial_manager
         self._registry = _ROBOT_REGISTRY
-        self.serial_connection = None
-        self.simulation = True
-
-        if serial_manager is not None:
-            self.simulation = serial_manager.simulation
-            if not self.simulation:
-                _log.info("Robot using shared serial connection")
-            else:
-                _log.info("Robot using shared serial (simulation mode)")
-        elif serial_port and SERIAL_AVAILABLE:
-            try:
-                self.serial_connection = serial.Serial(
-                    port=serial_port,
-                    baudrate=baud_rate,
-                    timeout=1,
-                )
-                self.simulation = False
-                _log.info("Connected to robot on %s", serial_port)
-            except Exception as exc:
-                _log.warning("Failed to connect to %s: %s", serial_port, exc)
-                _log.warning("   Running in simulation mode")
-                self.simulation = True
+        self.simulation = serial_manager is None or serial_manager.simulation
+        if serial_manager is None:
+            _log.info("Robot running without a SerialManager (simulation mode)")
+        elif self.simulation:
+            _log.info("Robot using shared serial (simulation mode)")
         else:
-            _log.info("Running in simulation mode (no serial port specified)")
-            self.simulation = True
+            _log.info("Robot using shared serial connection")
+
+    # ------------------------------------------------------------------ #
+    # Tool dispatch
+    # ------------------------------------------------------------------ #
 
     def execute(self, fn_name: str, args: dict) -> str:
         _log.info("tool=%s args=%s", fn_name, args)
-        result = self._registry.execute(self, fn_name, args)
+        try:
+            result = self._registry.execute(self, fn_name, args)
+        except RuntimeError as exc:
+            _log.warning("Tool %s failed: %s", fn_name, exc)
+            return f"Error: {exc}"
         _log.info("result=%s", result)
         return result
 
+    # ------------------------------------------------------------------ #
+    # RobotRuntime protocol
+    # ------------------------------------------------------------------ #
+
     def send_command(self, cmd: str) -> str:
-        if self._serial_manager is not None:
-            return self._serial_manager.send_command(cmd)
-
-        parts = [part.strip() for part in cmd.split("\n") if part.strip()]
-        if not parts:
-            return "Error: empty command"
-
-        results = [self._send_single_command(part) for part in parts]
-        return "; ".join(results)
-
-    def _send_single_command(self, cmd: str) -> str:
-        if self.simulation:
-            _log.info("[SERIAL SIM] >> %s", cmd)
+        if self._serial_manager is None:
+            _log.debug("[SERIAL SIM] >> %s", cmd)
             return "OK (simulated)"
-
-        try:
-            if self.serial_connection and self.serial_connection.is_open:
-                self.serial_connection.write(f"{cmd}\n".encode())
-                self.serial_connection.flush()
-                return "OK"
-            _log.warning("Serial connection closed, simulating: %s", cmd)
-            return "OK (connection closed, simulated)"
-        except Exception as exc:
-            _log.warning("Serial Error: %s", exc)
-            return f"Serial Error: {exc}"
+        return self._serial_manager.send_command(cmd)
 
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)
 
-    def heartbeat(self) -> str | None:
-        if self._serial_manager is not None:
-            return self._serial_manager.heartbeat()
-        if self.simulation:
-            return "STATUS 248,560,140,475,270,250,290 M0,0 (simulated)"
-        return None
+    def heartbeat(self) -> Optional[str]:
+        if self._serial_manager is None:
+            return "status (simulated)"
+        return self._serial_manager.heartbeat()
 
-    def set_idle_mode(self, enabled: bool) -> None:
-        self.send_command("M1" if enabled else "M0")
+    # ------------------------------------------------------------------ #
+    # Lifecycle
+    # ------------------------------------------------------------------ #
 
-    def close(self):
-        if self._serial_manager is not None:
-            return
-        if self.serial_connection and self.serial_connection.is_open:
-            self.serial_connection.close()
-            _log.info("Serial connection closed")
+    def close(self) -> None:
+        # The SerialManager owns the port; nothing to tear down here.
+        return
