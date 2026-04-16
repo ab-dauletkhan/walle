@@ -248,7 +248,7 @@ def parse_args():
     # Voice / STT
     parser.add_argument("--wake-word", default="hey", help="Wake word phrase")
     parser.add_argument(
-        "--listen-timeout", type=float, default=0.5, help="Silence timeout (seconds)"
+        "--listen-timeout", type=float, default=3.0, help="Silence timeout (seconds)"
     )
     parser.add_argument("--language", default="en", help="STT language")
     parser.add_argument(
@@ -409,7 +409,11 @@ def main():
     # Voice mode — custom signal handler because VoiceAssistant.run()
     # may not propagate KeyboardInterrupt cleanly through audio threads.
     def _halt(*_):
+        # Restore default handler so a second Ctrl+C force-kills immediately.
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
         lifecycle.shutdown()
+        os._exit(0)
 
     signal.signal(signal.SIGINT, _halt)
     signal.signal(signal.SIGTERM, _halt)

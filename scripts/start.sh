@@ -14,6 +14,12 @@ MIMIC3_URL="${MIMIC3_URL:-http://localhost:59125}"
 UV_EXTRAS="${UV_EXTRAS:---extra jetson}"
 WALLE_ARGS="${WALLE_ARGS:-}"
 CORAL39_PY="${WALLE_CORAL_PYTHON39:-$PROJECT_ROOT/.venv-coral39/bin/python}"
+# Quick mode: ./scripts/start.sh --llm-only  →  text REPL, no vision/tts
+if [[ " $* " == *" --llm-only "* ]]; then
+    WALLE_ARGS="$WALLE_ARGS --text-mode --no-vision --no-tts"
+    set -- $(echo "$@" | sed 's/--llm-only//')
+fi
+
 
 # Jetson UMA: keep model pinned on GPU and shrink KV cache so cudaMalloc
 # doesn't fragment once walle's Python stack loads alongside it.

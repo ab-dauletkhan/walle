@@ -408,7 +408,16 @@ class VisionService:
 
         import cv2
 
-        self._cap = cv2.VideoCapture(self._camera_index)
+        # Try V4L2 backend first — avoids select() timeouts on Linux/Jetson.
+        # Pattern from vision/face_recognition/track_and_turn_head.py.
+        if hasattr(cv2, "CAP_V4L2"):
+            self._cap = cv2.VideoCapture(self._camera_index, cv2.CAP_V4L2)
+            if not self._cap.isOpened():
+                self._cap.release()
+                self._cap = cv2.VideoCapture(self._camera_index)
+        else:
+            self._cap = cv2.VideoCapture(self._camera_index)
+
         if not self._cap.isOpened():
             _log.warning(
                 "Could not open camera %s, continuing without vision",
@@ -417,6 +426,10 @@ class VisionService:
             self._cap.release()
             self._cap = None
             return
+
+        # Limit buffer to 1 frame to prevent stale-frame buildup.
+        if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         self._running = True
         self._thread = threading.Thread(
