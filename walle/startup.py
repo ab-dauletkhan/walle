@@ -771,6 +771,22 @@ def _run_voice_mode(orchestrator, robot_exec, args, lifecycle: LifecycleManager)
             announced = router.announce(phrase)
             if announced:
                 _log.info("Vision greeting: %s", phrase)
+            else:
+                # Hit by design when the user is mid-conversation —
+                # log the reason so operators can tell "no greeting"
+                # (gated) from "no detection" (no callback fired).
+                reason_parts = []
+                if router._processing:
+                    reason_parts.append("turn in flight")
+                elif router._is_gated():
+                    reason_parts.append("mic gated / TTS busy")
+                else:
+                    reason_parts.append("unknown skip")
+                _log.info(
+                    "Vision greeting SKIPPED for %s (%s)",
+                    name,
+                    ", ".join(reason_parts),
+                )
 
         vision.set_face_callback(_greet_face)
 

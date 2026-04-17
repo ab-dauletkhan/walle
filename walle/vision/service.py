@@ -404,6 +404,13 @@ class VisionService:
         self._face_last_greeted: Dict[str, float] = {}
         self._greeter_last_fire: float = 0.0
 
+        # Diagnostic log throttling — at VISION_FPS we'd otherwise emit
+        # one line per frame (60-120 log lines/min). Throttle the
+        # per-frame summary so operators can still see what the camera
+        # is reporting without drowning walle.log.
+        self._last_frame_log_at: float = 0.0
+        self._last_frame_log_signature: str = ""
+
         # Auto-detect backend
         self._backend = self._create_backend()
 
@@ -538,6 +545,40 @@ class VisionService:
     _BACKOFF_BASE = 0.5  # seconds, doubles each consecutive error
     _BACKOFF_MAX = 30.0  # cap
 
+    def _log_frame_faces(self, faces: List[Dict]) -> None:
+        """Emit an INFO line when the face set meaningfully changes, and a
+        DEBUG line every few seconds otherwise.
+
+        Without this, the vision thread runs silently and it's impossible
+        to tell whether the camera is seeing anyone at all or whether a
+        face is being recognized as Unknown vs. a named person.
+        """
+        now = time.time()
+        if not faces:
+            signature = "none"
+        else:
+            signature = " | ".join(
+                f"{(f.get('name') or 'Unknown')}@{f.get('confidence', 0)}"
+                for f in faces
+            )
+
+        # INFO when the signature changes (face appears/disappears/switches
+        # identity) — this is the line a human operator actually wants to
+        # read while testing recognition.
+        if signature != self._last_frame_log_signature:
+            self._last_frame_log_signature = signature
+            self._last_frame_log_at = now
+            if faces:
+                _log.info("faces: %s", signature)
+            else:
+                _log.info("faces: none in frame")
+            return
+
+        # Throttled heartbeat so logs don't explode at 1 FPS × 60 s.
+        if now - self._last_frame_log_at >= 10.0:
+            _log.debug("faces (still): %s", signature)
+            self._last_frame_log_at = now
+
     def _maybe_greet(self, faces: List[Dict]) -> None:
         """Fire the face-greet callback for any known face that just reappeared.
 
@@ -576,8 +617,15 @@ class VisionService:
             if not fresh_appearance:
                 continue
             if now - self._greeter_last_fire < self._FACE_MIN_GREET_INTERVAL_SEC:
+                _log.debug(
+                    "greeter: %s reappeared but rate-limited (%.1fs < %.1fs)",
+                    name,
+                    now - self._greeter_last_fire,
+                    self._FACE_MIN_GREET_INTERVAL_SEC,
+                )
                 continue
 
+            _log.info("greeter: firing callback for %s", name)
             self._face_last_greeted[name] = now
             self._greeter_last_fire = now
             try:
@@ -620,6 +668,7 @@ class VisionService:
                     timestamp=datetime.now(),
                 )
                 self._context_manager.update_visual(visual)
+                self._log_frame_faces(faces)
                 self._maybe_greet(faces)
                 consecutive_errors = 0  # reset on success
             except Exception as e:
