@@ -441,6 +441,95 @@ class Mimic3TTSEngine(BaseTTSEngine):
             print(f"  [TTS-fallback] {text}")
 
 
+class PiperTTSEngine(BaseTTSEngine):
+    """In-process Piper TTS — faster and more natural than Mimic3.
+
+    Piper runs an ONNX voice model directly in this process. No HTTP
+    server, no network hop: per-sentence synthesis is ~100 ms on
+    Jetson vs ~500 ms for Mimic3. Combined with the existing
+    sentence-level LLM→TTS pipelining this feels like streaming
+    speech. For each sentence we collect the yielded int16 chunks
+    and hand the concatenated buffer to `_play_audio_stable`, which
+    already handles the UACDemoV1.0 48 kHz stereo quirks.
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        speaker_id: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"Piper voice model not found: {model_path}. "
+                "Download one from "
+                "https://huggingface.co/rhasspy/piper-voices "
+                "(both the .onnx and .onnx.json)."
+            )
+        config_path = model_path + ".json"
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(
+                f"Piper voice config not found: {config_path}. "
+                "Each .onnx model needs a matching .onnx.json beside it."
+            )
+        from piper import PiperVoice  # noqa: PLC0415
+
+        self._voice = PiperVoice.load(model_path, config_path=config_path)
+        self._speaker_id = speaker_id
+        # piper-tts >=1.3 yields AudioChunk objects from `synthesize(text)`.
+        # Older builds expose `synthesize_stream_raw(text)` which yields raw
+        # int16 bytes. Detect once so the hot path stays branch-free.
+        self._has_chunk_api = hasattr(
+            self._voice, "synthesize"
+        ) and not hasattr(self._voice, "synthesize_stream_raw")
+        self._fallback_rate = getattr(
+            getattr(self._voice, "config", None), "sample_rate", 22050
+        )
+
+    def _iter_int16_chunks(self, text: str):
+        """Yield (int16 numpy array, sample_rate) for each synthesis chunk."""
+        if self._has_chunk_api:
+            kwargs = {}
+            if self._speaker_id is not None:
+                kwargs["speaker_id"] = self._speaker_id
+            for chunk in self._voice.synthesize(text, **kwargs):
+                arr = getattr(chunk, "audio_int16_array", None)
+                if arr is None:
+                    raw = getattr(chunk, "audio_int16_bytes", None)
+                    if raw is None:
+                        continue
+                    arr = np.frombuffer(raw, dtype=np.int16)
+                sr = getattr(chunk, "sample_rate", self._fallback_rate)
+                yield arr, sr
+        else:
+            kwargs = {}
+            if self._speaker_id is not None:
+                kwargs["speaker_id"] = self._speaker_id
+            for raw in self._voice.synthesize_stream_raw(text, **kwargs):
+                yield np.frombuffer(raw, dtype=np.int16), self._fallback_rate
+
+    def _synthesize_and_play(self, text: str) -> None:
+        if self._stop_event.is_set():
+            return
+        try:
+            chunks = []
+            sample_rate = self._fallback_rate
+            for arr, sr in self._iter_int16_chunks(text):
+                if self._stop_event.is_set():
+                    return
+                chunks.append(arr)
+                sample_rate = sr
+            if not chunks:
+                return
+            if self._stop_event.is_set():
+                return
+            audio = np.concatenate(chunks)
+            _play_audio_stable(audio, sample_rate)
+        except Exception as e:
+            print(f"  Piper TTS error: {e} — falling back to console", file=sys.stderr)
+            print(f"  [TTS-fallback] {text}")
+
+
 # ─────────────────────────────────────────────────────────────
 # Layer 3: Speech Router (Intent + LLM fallback)
 # ─────────────────────────────────────────────────────────────
@@ -1331,14 +1420,31 @@ def parse_args():
         "--no-tts", action="store_true", help="Disable audio TTS (console-only)"
     )
     tts_group.add_argument(
+        "--tts-engine",
+        default="piper",
+        choices=["piper", "mimic3"],
+        help="TTS engine (default: piper — local, natural, no HTTP server)",
+    )
+    tts_group.add_argument(
+        "--piper-model",
+        default="voices/en_US-lessac-medium.onnx",
+        help="Path to Piper .onnx voice model (needs matching .onnx.json).",
+    )
+    tts_group.add_argument(
+        "--piper-speaker",
+        type=int,
+        default=None,
+        help="Piper speaker id for multi-speaker models (omit for single-speaker).",
+    )
+    tts_group.add_argument(
         "--tts-url",
         default="http://localhost:59125",
-        help="Mimic3 TTS server URL (default: http://localhost:59125)",
+        help="Mimic3 TTS server URL (only when --tts-engine=mimic3)",
     )
     tts_group.add_argument(
         "--tts-voice",
         default="en_US/vctk_low#p236",
-        help="TTS voice (default: en_US/vctk_low#p236)",
+        help="Mimic3 voice (only when --tts-engine=mimic3)",
     )
 
     robot_group = p.add_argument_group("Robot")
@@ -1417,6 +1523,11 @@ def main():
     if args.no_tts:
         tts = ConsoleTTSEngine()
         print("TTS: Console only (use without --no-tts for audio)", file=sys.stderr)
+    elif args.tts_engine == "piper":
+        tts = PiperTTSEngine(
+            model_path=args.piper_model, speaker_id=args.piper_speaker
+        )
+        print(f"TTS: Piper ({args.piper_model})", file=sys.stderr)
     else:
         tts = Mimic3TTSEngine(url=args.tts_url, voice=args.tts_voice)
         print(

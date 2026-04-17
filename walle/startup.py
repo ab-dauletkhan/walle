@@ -206,6 +206,16 @@ def _test_tts(url: str) -> bool:
         return False
 
 
+def _test_piper(model_path: str) -> bool:
+    """Verify a Piper voice is usable without actually loading the ONNX.
+
+    Loading takes a few hundred ms on Jetson, so we only check file
+    presence here — the engine constructor does the real load and will
+    raise if the model is corrupt.
+    """
+    return os.path.exists(model_path) and os.path.exists(model_path + ".json")
+
+
 def _parse_audio_device(value: str):
     if value is None or value == "":
         return None
@@ -292,9 +302,32 @@ def parse_args(argv=None):
     # TTS
     parser.add_argument("--no-tts", action="store_true", help="Console TTS (no audio)")
     parser.add_argument(
-        "--tts-url", default="http://localhost:59125", help="Mimic3 TTS URL"
+        "--tts-engine",
+        default="piper",
+        choices=["piper", "mimic3"],
+        help="TTS engine (default: piper — local, natural, no HTTP server)",
     )
-    parser.add_argument("--tts-voice", default="en_UK/apope_low", help="Mimic3 voice")
+    parser.add_argument(
+        "--piper-model",
+        default="voices/en_US-lessac-medium.onnx",
+        help="Path to Piper .onnx voice (needs matching .onnx.json)",
+    )
+    parser.add_argument(
+        "--piper-speaker",
+        type=int,
+        default=None,
+        help="Piper speaker id for multi-speaker voices",
+    )
+    parser.add_argument(
+        "--tts-url",
+        default="http://localhost:59125",
+        help="Mimic3 TTS URL (only when --tts-engine=mimic3)",
+    )
+    parser.add_argument(
+        "--tts-voice",
+        default="en_UK/apope_low",
+        help="Mimic3 voice (only when --tts-engine=mimic3)",
+    )
 
     # Voice / STT
     parser.add_argument("--wake-word", default="hey", help="Wake word phrase")
@@ -508,10 +541,26 @@ def main():
     _log.info("[6/7] TTS engine...")
     tts_ok = False
     if not args.no_tts:
-        tts_ok = _test_tts(args.tts_url)
-    tts_label = (
-        "Console" if args.no_tts else ("Mimic3" if tts_ok else "Console (fallback)")
-    )
+        if args.tts_engine == "piper":
+            tts_ok = _test_piper(args.piper_model)
+            if not tts_ok:
+                _log.warning(
+                    "Piper voice not found at %s — falling back to console TTS. "
+                    "Download: curl -L -o %s "
+                    "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+                    "en/en_US/lessac/medium/en_US-lessac-medium.onnx "
+                    "(and the same URL + .json)",
+                    args.piper_model,
+                    args.piper_model,
+                )
+        else:
+            tts_ok = _test_tts(args.tts_url)
+    if args.no_tts:
+        tts_label = "Console"
+    elif tts_ok:
+        tts_label = "Piper" if args.tts_engine == "piper" else "Mimic3"
+    else:
+        tts_label = "Console (fallback)"
     if not args.no_tts and not tts_ok:
         args.no_tts = True
     tts_detail = tts_label if args.no_tts else f"{tts_label} -> {args._speaker_label}"
@@ -569,13 +618,20 @@ def main():
 # Mode runners
 # ---------------------------------------------------------------------------
 def _text_mode_repl(orchestrator, args):
-    from walle.voice.assistant import ConsoleTTSEngine, Mimic3TTSEngine
-
-    tts = (
-        ConsoleTTSEngine()
-        if args.no_tts
-        else Mimic3TTSEngine(url=args.tts_url, voice=args.tts_voice)
+    from walle.voice.assistant import (
+        ConsoleTTSEngine,
+        Mimic3TTSEngine,
+        PiperTTSEngine,
     )
+
+    if args.no_tts:
+        tts = ConsoleTTSEngine()
+    elif args.tts_engine == "piper":
+        tts = PiperTTSEngine(
+            model_path=args.piper_model, speaker_id=args.piper_speaker
+        )
+    else:
+        tts = Mimic3TTSEngine(url=args.tts_url, voice=args.tts_voice)
 
     print(f"\n{'=' * 50}")
     print(f"  WALL-E Text Mode | {conf.OLLAMA_MODEL} via Ollama")
@@ -657,16 +713,20 @@ def _run_voice_mode(orchestrator, robot_exec, args, lifecycle: LifecycleManager)
         ROBOT_INTENTS,
         ConsoleTTSEngine,
         Mimic3TTSEngine,
+        PiperTTSEngine,
         VoiceAssistant,
         _stt_model_choices,
     )
 
     robot_bridge = _RobotBridge(robot_exec)
-    tts = (
-        ConsoleTTSEngine()
-        if args.no_tts
-        else Mimic3TTSEngine(url=args.tts_url, voice=args.tts_voice)
-    )
+    if args.no_tts:
+        tts = ConsoleTTSEngine()
+    elif args.tts_engine == "piper":
+        tts = PiperTTSEngine(
+            model_path=args.piper_model, speaker_id=args.piper_speaker
+        )
+    else:
+        tts = Mimic3TTSEngine(url=args.tts_url, voice=args.tts_voice)
 
     # ModelArch is lazy-imported inside assistant.py to keep text-mode free
     # of the moonshine_voice dependency. Resolve the string choice here.

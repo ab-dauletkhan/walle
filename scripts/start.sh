@@ -109,31 +109,60 @@ else
     echo "  WARNING: $OLLAMA_MODEL not found in /api/ps after preload."
 fi
 
-# ---------- 2. Mimic3 TTS ----------
-echo "=== Checking Mimic3 TTS ==="
-if curl -sf "$MIMIC3_URL" >/dev/null 2>&1; then
-    echo "  Existing Mimic3 detected — reusing."
+# ---------- 2. TTS ----------
+# Detect requested engine — default piper (local, natural). Users can opt
+# back into Mimic3 with --tts-engine mimic3 or --tts-engine=mimic3.
+TTS_ENGINE="piper"
+if [[ " $* " == *" --tts-engine mimic3 "* ]] || [[ " $* " == *" --tts-engine=mimic3 "* ]]; then
+    TTS_ENGINE="mimic3"
+fi
+
+if [[ "$TTS_ENGINE" == "piper" ]]; then
+    echo "=== Checking Piper TTS voice ==="
+    # Match the default --piper-model path in walle/startup.py. Override
+    # by exporting PIPER_MODEL=/path/to/voice.onnx before running.
+    PIPER_MODEL="${PIPER_MODEL:-$PROJECT_ROOT/voices/en_US-lessac-medium.onnx}"
+    PIPER_ONNX_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx"
+    PIPER_JSON_URL="${PIPER_ONNX_URL}.json"
+    if [[ -f "$PIPER_MODEL" && -f "$PIPER_MODEL.json" ]]; then
+        echo "  Piper voice ready: $PIPER_MODEL"
+    else
+        mkdir -p "$(dirname "$PIPER_MODEL")"
+        echo "  Piper voice not found — downloading en_US-lessac-medium (~63 MB)..."
+        if curl -fL --retry 3 -o "$PIPER_MODEL" "$PIPER_ONNX_URL" \
+        && curl -fL --retry 3 -o "$PIPER_MODEL.json" "$PIPER_JSON_URL"; then
+            echo "  Piper voice downloaded."
+        else
+            echo "  WARNING: Piper voice download failed. Console TTS fallback."
+            WALLE_ARGS="$WALLE_ARGS --no-tts"
+        fi
+    fi
 else
-    if command -v mimic3-server >/dev/null 2>&1; then
-        echo "  Starting mimic3-server on $MIMIC3_URL..."
-        mimic3-server --port 59125 >/tmp/mimic3.log 2>&1 &
-        CHILD_PIDS+=($!)
-        for i in $(seq 1 30); do
-            if curl -sf "$MIMIC3_URL" >/dev/null 2>&1; then
-                echo "  Mimic3 ready."
-                break
+    echo "=== Checking Mimic3 TTS ==="
+    if curl -sf "$MIMIC3_URL" >/dev/null 2>&1; then
+        echo "  Existing Mimic3 detected — reusing."
+    else
+        if command -v mimic3-server >/dev/null 2>&1; then
+            echo "  Starting mimic3-server on $MIMIC3_URL..."
+            mimic3-server --port 59125 >/tmp/mimic3.log 2>&1 &
+            CHILD_PIDS+=($!)
+            for i in $(seq 1 30); do
+                if curl -sf "$MIMIC3_URL" >/dev/null 2>&1; then
+                    echo "  Mimic3 ready."
+                    break
+                fi
+                sleep 1
+            done
+            if ! curl -sf "$MIMIC3_URL" >/dev/null 2>&1; then
+                echo "  WARNING: Mimic3 failed to start within 30s. See /tmp/mimic3.log"
+                echo "  Continuing with console TTS fallback..."
+                WALLE_ARGS="$WALLE_ARGS --no-tts"
             fi
-            sleep 1
-        done
-        if ! curl -sf "$MIMIC3_URL" >/dev/null 2>&1; then
-            echo "  WARNING: Mimic3 failed to start within 30s. See /tmp/mimic3.log"
+        else
+            echo "  mimic3-server not installed on PATH. Install it or pass --no-tts."
             echo "  Continuing with console TTS fallback..."
             WALLE_ARGS="$WALLE_ARGS --no-tts"
         fi
-    else
-        echo "  mimic3-server not installed on PATH. Install it or pass --no-tts."
-        echo "  Continuing with console TTS fallback..."
-        WALLE_ARGS="$WALLE_ARGS --no-tts"
     fi
 fi
 
