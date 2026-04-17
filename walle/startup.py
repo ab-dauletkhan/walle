@@ -452,7 +452,14 @@ def apply_runtime_overrides(args):
         conf.EMBEDDING_BATCH_SIZE = 4
         conf.USE_FAISS = True
         conf.USE_SEMANTIC_SEARCH = True
-        conf.VISION_FPS = 1
+        # 10 FPS gives the head tracker near-real-time face position
+        # updates. The Coral subprocess caps effective throughput at
+        # whatever it can do (~5-8 FPS realistic) — setting the ceiling
+        # to 10 just means the loop won't artificially idle. Previous
+        # value of 1 meant ~1 s of lag between 'user moves' and 'head
+        # receives new target', which felt like the servo was slow even
+        # when it wasn't.
+        conf.VISION_FPS = 10
         if not getattr(args, "_explicit_stt_model", False):
             args.stt_model = "small-streaming"
         _log.info(

@@ -609,9 +609,14 @@ class VisionService:
             self._last_frame_log_at = now
 
     def _drive_head_tracker(self, faces: List[Dict]) -> None:
-        """Feed the strongest detected face into the head tracker so the
-        neck servo follows it.  When no face is present, call on_no_face()
-        so the tracker can drift back to center.
+        """Feed the strongest NAMED face into the head tracker.
+
+        Ignores "Unknown" detections entirely — they're frequently
+        one-off false positives (the detector fires on a textured
+        background or a half-face from behind), and picking them as the
+        tracker target made the head lurch away from the real user
+        every time a stray detection appeared. If no named face is
+        visible, treat the frame as 'no face'.
         """
         tracker = self._head_tracker
         if tracker is None:
@@ -623,6 +628,9 @@ class VisionService:
         best_center: Optional[float] = None
         best_conf = -1.0
         for face in faces or []:
+            name = face.get("name")
+            if not name or name == "Unknown":
+                continue
             conf = float(face.get("confidence") or 0.0)
             if conf <= best_conf:
                 continue
