@@ -102,6 +102,15 @@ class SerialManager:
         sluggish. The firmware still processes the command — we just
         don't block the caller for the response.
 
+        Even though we don't want the reply, we still drain the RX
+        buffer before/after writing. The firmware prints an "OK -> ..."
+        line for every command, and at 30 Hz those replies quickly
+        saturate the kernel tty buffer. Once the host-side buffer is
+        full, the USB endpoint NAKs, the CH341 backs up, and the
+        Arduino's Serial.print starts blocking — which stalls the
+        firmware's main loop and makes the LLM's subsequent commands
+        time out. Draining keeps the pipe flowing.
+
         Returns silently in simulation mode. Thread-safe.
         """
         line = cmd.strip()
@@ -113,6 +122,12 @@ class SerialManager:
                 return
             if not (self._conn and self._conn.is_open):
                 return
+            try:
+                pending = self._conn.in_waiting
+                if pending:
+                    self._conn.read(pending)
+            except Exception:
+                pass
             try:
                 self._conn.write(f"{line}\n".encode())
                 self._conn.flush()
