@@ -716,13 +716,28 @@ class SpeechRouter(TranscriptEventListener):
                 qdepth_hwm = getattr(stats, "queue_depth_hwm", -1)
                 dropped = getattr(stats, "dropped_partial", 0)
                 audio_events = getattr(stats, "audio_thread_events", -1)
+        # Several MicTranscriber versions don't expose is_running();
+        # fall back to the presence of a live stream/thread attribute so
+        # we don't spam "err" every 5 s.
         mic_running = "?"
         mic = getattr(self, "_mic_ref", None)
         if mic is not None:
-            try:
-                mic_running = str(mic.is_running())
-            except Exception:
-                mic_running = "err"
+            for attr in ("is_running", "running", "is_active", "active"):
+                if hasattr(mic, attr):
+                    val = getattr(mic, attr)
+                    try:
+                        mic_running = str(val() if callable(val) else val)
+                    except Exception:
+                        mic_running = "err"
+                    break
+            else:
+                # Best-effort: if there's a `_stream` or `_thread` attr,
+                # infer liveness from that.
+                stream = getattr(mic, "_stream", None) or getattr(mic, "stream", None)
+                if stream is not None:
+                    mic_running = f"stream={type(stream).__name__}"
+                else:
+                    mic_running = "unknown"
         _log.info(
             "router heartbeat: state=%s gated=%s processing=%s tts_busy=%s "
             "last_partial=%s qdepth_hwm=%d dropped_partials=%d "
