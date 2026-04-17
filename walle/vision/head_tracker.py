@@ -29,22 +29,29 @@ HEAD_MAX_TICK = max(HEAD_RIGHT_TICK, HEAD_LEFT_TICK)
 HEAD_CENTER_TRIM = 0
 HEAD_OPTICAL_CENTER_TICK = HEAD_CENTER_TICK + HEAD_CENTER_TRIM
 
-# Tracking parameters: same as the reference script, tuned at 30 FPS.
-# At the voice-mode VISION_FPS (~1-2 Hz) updates are much less frequent,
-# so the per-update tick step can actually be larger — but keep it
-# conservative so the firmware's 60-tick/command rate limit is never hit.
+# Tracking parameters. The reference script ran the loop at ~30 FPS and
+# clamped each update to a ≤6-tick micro-step for visual smoothness. In
+# voice mode VisionService ticks at ~1 FPS (Jetson CPU budget), so a
+# per-update cap of a few ticks means the servo can traverse at most
+# ~6 ticks/second — 60+ seconds to cross the 400-tick range. Instead
+# we walk straight to the target per update, splitting the move into
+# firmware-legal 60-tick `head step` chunks inside _send_tick so the
+# firmware's per-command rate limit never rejects it.
 MEDIAN_WINDOW = 3
-SMOOTH_ALPHA = 0.45
+SMOOTH_ALPHA = 0.55
 DEADBAND_PX = 30
 REVERSE_HYSTERESIS_PX = 15
-SEND_INTERVAL_SEC = 0.03
-MIN_SEND_DELTA = 1
-MAX_STEP_BASE = 4
-MAX_STEP_EXTRA = 18
-MAX_STEP_CAP = 24
+SEND_INTERVAL_SEC = 0.0  # vision loop paces us — no extra throttle
+MIN_SEND_DELTA = 2
 LOST_TARGET_TIMEOUT_SEC = 1.8
-RETURN_TO_CENTER_STEP = 3
+RETURN_TO_CENTER_STEP = 40
 EDGE_MARGIN_RATIO = 0.18
+
+# Firmware safety: each `head step N` command may move at most this many
+# ticks (motor_control_cli.ino enforces). Larger requested deltas are
+# step-walked.
+HEAD_MAX_STEP_PER_CMD = 60
+STEP_WALK_DELAY_SEC = 0.02
 
 
 class HeadTracker:
@@ -89,7 +96,9 @@ class HeadTracker:
 
         # Initialize firmware position so subsequent deltas land in
         # a known place. Best-effort — a simulation-mode SerialManager
-        # will just log the command.
+        # will just log the command. We emit `head tick N` here (not
+        # `head step`) because there's no cached firmware position yet;
+        # firmware accepts a full-range absolute set at boot.
         try:
             self._send(f"head tick {self.current_tick}")
         except Exception:
@@ -153,28 +162,52 @@ class HeadTracker:
         self._last_command_dir = 0
 
     def _send_tick(self, tick: int, force: bool = False) -> bool:
+        """Move the servo to absolute `tick`, step-walking through any
+        delta larger than the firmware's per-command limit.
+
+        At 1-2 Hz vision updates a single tracking step can span 300+
+        ticks (face jumps left-to-right), so sending one `head tick N`
+        with delta > 60 gets clamped by the firmware and the servo
+        stalls halfway. We split the move into ≤60-tick `head step`
+        commands with a short delay between so the firmware processes
+        each one cleanly.
+        """
         tick = _clamp_tick(tick)
         now = time.monotonic()
+        delta_total = tick - self.current_tick
         if not force:
-            if (
-                self._last_sent_tick is not None
-                and abs(tick - self._last_sent_tick) < MIN_SEND_DELTA
-            ):
+            if abs(delta_total) < MIN_SEND_DELTA:
                 return False
             if now - self._last_send_time < SEND_INTERVAL_SEC:
                 return False
         old_tick = self.current_tick
-        self.current_tick = tick
-        try:
-            self._send(f"head tick {tick}")
-        except Exception:
-            _log.debug("head tick send failed", exc_info=True)
-        if tick > old_tick:
+
+        remaining = delta_total
+        while abs(remaining) > HEAD_MAX_STEP_PER_CMD:
+            step = (
+                HEAD_MAX_STEP_PER_CMD if remaining > 0 else -HEAD_MAX_STEP_PER_CMD
+            )
+            try:
+                self._send(f"head step {step}")
+            except Exception:
+                _log.debug("head step send failed", exc_info=True)
+            self.current_tick += step
+            remaining -= step
+            if STEP_WALK_DELAY_SEC > 0:
+                time.sleep(STEP_WALK_DELAY_SEC)
+        if remaining != 0:
+            try:
+                self._send(f"head step {remaining}")
+            except Exception:
+                _log.debug("head step send failed", exc_info=True)
+            self.current_tick += remaining
+
+        if self.current_tick > old_tick:
             self._last_command_dir = 1
-        elif tick < old_tick:
+        elif self.current_tick < old_tick:
             self._last_command_dir = -1
-        self._last_sent_tick = tick
-        self._last_send_time = now
+        self._last_sent_tick = self.current_tick
+        self._last_send_time = time.monotonic()
         return True
 
     def _update_locked(self, face_center_x: float, frame_width: int) -> None:
@@ -228,22 +261,14 @@ class HeadTracker:
             target_tick = self.current_tick
 
         target_tick = _clamp_tick(target_tick)
-        error_ratio = abs(effective_error_px) / max(1.0, frame_center_x)
-        dynamic_max_step = min(
-            MAX_STEP_BASE + int(error_ratio * MAX_STEP_EXTRA), MAX_STEP_CAP
-        )
         if desired_dir == 0:
-            dynamic_max_step = 0
-
-        tick_error = target_tick - self.current_tick
-        if tick_error > dynamic_max_step:
-            tick_error = dynamic_max_step
-        elif tick_error < -dynamic_max_step:
-            tick_error = -dynamic_max_step
-        else:
-            tick_error = int(round(tick_error))
-
-        self._send_tick(int(round(self.current_tick + tick_error)))
+            # Inside deadband — hold position rather than drift.
+            return
+        # Jump straight to target; _send_tick step-walks the delta into
+        # firmware-legal 60-tick chunks. At 1-2 Hz vision frames there
+        # is no point spreading the move across N update cycles — the
+        # face may well have moved again by then.
+        self._send_tick(int(round(target_tick)))
 
     def _on_lost_locked(self) -> None:
         now = time.monotonic()
