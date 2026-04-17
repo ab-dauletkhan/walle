@@ -1235,18 +1235,12 @@ class VoiceAssistant:
         )
 
         # -- Speech router (wake-word-gated LLM fallback) --
-        # Hybrid mic-pause: stop the PortAudio stream only during actual
-        # TTS playback (inside `_begin_speaking`/`_end_speaking`), never
-        # during LLM generation. Closing the stream while the speaker is
-        # active prevents two compounding failures observed on Jetson:
-        #   1. MicTranscriber input-overflow — ONNX STT can't drain its
-        #      callbacks fast enough while Piper+LLM+playback share CPU.
-        #   2. Echo bleed — Piper's natural voice makes Moonshine transcribe
-        #      self-audio as "user" text on the next turn, slipping past
-        #      the post-turn gate.
-        # The transcript-level `_is_gated()` check still runs as a
-        # belt-and-suspenders cover, and `_POST_TURN_GATE` absorbs any
-        # audio still in PortAudio's buffer when the stream restarts.
+        # No mic_pause/mic_resume callbacks: stopping the PortAudio stream
+        # during TTS kills echo bleed but also kills the stop-intent
+        # barge-in channel (line 895-900 in SpeechRouter). We keep the
+        # stream running and rely on the transcript-level `_is_gated()`
+        # check + content-based `_is_echo()` filter (echo window widened
+        # to 2.5 s to cover Piper's cleaner voice re-triggering STT).
         self._router = SpeechRouter(
             llm=llm,
             tts=tts,
@@ -1256,8 +1250,6 @@ class VoiceAssistant:
             listen_timeout_long=listen_timeout_long,
             max_utterance=max_utterance,
             wake_sounds_dir=wake_sounds_dir,
-            mic_pause=self._safe_mic_stop,
-            mic_resume=self._safe_mic_start,
         )
 
         # -- Register robot intents --
@@ -1271,24 +1263,6 @@ class VoiceAssistant:
         # Add listeners in order: intent recognizer first, then router
         self._mic.add_listener(self._intent_recognizer)
         self._mic.add_listener(self._router)
-
-    def _safe_mic_stop(self) -> None:
-        """Stop the PortAudio input stream for the duration of TTS playback.
-
-        Wrapped in try/except because some moonshine_voice versions raise
-        when stopped twice in a row. Silently swallowing is correct: a
-        "stream already stopped" state is exactly what we want.
-        """
-        try:
-            self._mic.stop()
-        except Exception as e:  # pragma: no cover - best-effort only
-            print(f"  ... mic stop skipped: {e}", file=sys.stderr)
-
-    def _safe_mic_start(self) -> None:
-        try:
-            self._mic.start()
-        except Exception as e:  # pragma: no cover - best-effort only
-            print(f"  ... mic start skipped: {e}", file=sys.stderr)
 
     def _make_intent_handler(self, action: str):
         """Create a closure that handles a matched intent.
