@@ -969,12 +969,17 @@ class SpeechRouter(TranscriptEventListener):
             print("  ... no command heard, going back to sleep.")
 
     def _is_stop_intent(self, text: str) -> bool:
-        """Match any stop phrase anywhere in the utterance.
+        """Match a stop intent without false-positiving on long utterances.
 
-        Exact-match was too strict — Moonshine often transcribes the
-        stop word with extras ("stop please", "wall-e stop now",
-        "okay stop"), which slipped past `normalized in _stop_phrases`
-        and let long TTS responses continue uninterrupted.
+        Three rules, roughly most-specific to least-specific:
+          1. Exact match against `_stop_phrases` (covers bare "stop",
+             "shut up", "wall-e stop", etc.).
+          2. Short utterance (≤ 2 tokens) containing a stop keyword —
+             lets "stop please" / "okay stop" / "stop talking" through
+             without matching "if you want me to stop or keep going".
+          3. Multi-word phrase substring (e.g. "wall-e stop" inside a
+             longer utterance) — only for phrases that already include
+             the wake word, so the user is being intentional.
         """
         normalized = self._strip_punctuation(text).lower().strip()
         if not normalized:
@@ -982,10 +987,9 @@ class SpeechRouter(TranscriptEventListener):
         if normalized in self._stop_phrases:
             return True
         tokens = normalized.split()
-        # Leading-word match: "stop please", "cancel that", "quiet now"
-        if tokens and tokens[0] in {"stop", "cancel", "quiet"}:
+        _keywords = {"stop", "cancel", "quiet"}
+        if len(tokens) <= 2 and any(t in _keywords for t in tokens):
             return True
-        # Substring match for multi-word phrases like "wall-e stop".
         return any(
             phrase in normalized for phrase in self._stop_phrases if " " in phrase
         )
@@ -1334,6 +1338,13 @@ class VoiceAssistant:
         print("  Press Ctrl+C to stop.\n", file=sys.stderr)
 
         self._mic.start()
+        # Spoken "ready" cue — the robot runs headless so the operator
+        # has no terminal/log to confirm startup finished. Non-fatal if
+        # TTS isn't connected (ConsoleTTSEngine just prints it).
+        try:
+            self._tts.speak("At your command.")
+        except Exception as e:
+            print(f"  ... ready announcement skipped: {e}", file=sys.stderr)
         try:
             while True:
                 time.sleep(0.1)
