@@ -35,6 +35,7 @@ from walle.tools.registry import (
     ToolSuiteFacade,
 )
 from walle.tools.robot.executor import RobotControlExecutor, get_robot_control_tools
+from walle.vision.fast_tracker import FastFaceTracker
 from walle.vision.head_tracker import HeadTracker
 from walle.vision.service import (
     CaptureImageExecutor,
@@ -183,6 +184,7 @@ def attach_vision(
             get_capture_image_tools, capture_exec, request_heartbeat_after=True
         )
     )
+    tracker = None
     if (
         serial_manager is not None
         and getattr(args, "head_tracking", True)
@@ -198,8 +200,24 @@ def attach_vision(
             _log.info("Head tracker attached to vision service")
         except Exception:
             _log.exception("Failed to initialise HeadTracker; continuing without it")
+            tracker = None
     vision.start()
     lifecycle.register("vision", vision.stop)
+
+    # Start the dedicated 30 FPS detect-only face tracker so the head
+    # servo follows at standalone-script speed. The recognition path in
+    # VisionService stays at its slower rate for context/greeter.
+    if tracker is not None:
+        try:
+            fast_tracker = FastFaceTracker(vision, tracker)
+            fast_tracker.start()
+            lifecycle.register("fast-face-tracker", fast_tracker.stop)
+            _log.info("FastFaceTracker attached (30 FPS detection path)")
+        except Exception:
+            _log.exception(
+                "Failed to start FastFaceTracker; head tracking falls back to "
+                "the recognition-path rate"
+            )
     return vision
 
 

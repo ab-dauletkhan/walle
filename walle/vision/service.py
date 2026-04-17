@@ -371,6 +371,11 @@ class VisionService:
 
     _STALE_FRAME_TIMEOUT_SEC = 5.0
     _FIRST_FRAME_TIMEOUT_SEC = 3.0
+    # Native camera rate requested from V4L2 — independent of the
+    # recognition-loop FPS. The FastFaceTracker reads fresh frames at
+    # ~30 Hz; the camera must be wide open to feed it. The processing
+    # loop subsamples via its own target_interval.
+    _CAMERA_NATIVE_FPS = 30
 
     # Face greeter parameters. The vision loop runs at VISION_FPS (1-2 Hz),
     # so a known face will be reported on consecutive frames. Greeting on
@@ -394,10 +399,12 @@ class VisionService:
         self._camera_source = None
         self._camera_backend_name = "none"
         self._thread: Optional[threading.Thread] = None
+        self._camera_thread: Optional[threading.Thread] = None
         self._running = False
         self._ready = False
         self._frame_lock = threading.Lock()
         self._latest_frame: Optional[np.ndarray] = None
+        self._frame_event = threading.Event()
         self._last_error: Optional[str] = None
         self._last_frame_at: Optional[datetime] = None
 
@@ -504,7 +511,7 @@ class VisionService:
 
         opened = open_camera_source(
             self._camera_index,
-            fps=self._fps,
+            fps=self._CAMERA_NATIVE_FPS,
             first_frame_timeout_sec=self._FIRST_FRAME_TIMEOUT_SEC,
         )
         if opened.source is None or opened.first_frame is None:
@@ -524,6 +531,14 @@ class VisionService:
         self._last_error = None
         self._record_frame(opened.first_frame)
         self._running = True
+        # Camera reader thread runs at the camera's native rate so the
+        # FastFaceTracker (and any other consumer) always sees a fresh
+        # frame. The processing loop picks up frames at its own (slower)
+        # cadence and does recognition + greeter + context.
+        self._camera_thread = threading.Thread(
+            target=self._camera_reader_loop, daemon=True, name="vision-camera"
+        )
+        self._camera_thread.start()
         self._thread = threading.Thread(
             target=self._loop, daemon=True, name="vision-service"
         )
@@ -538,9 +553,13 @@ class VisionService:
     def stop(self) -> None:
         """Stop the background thread and release camera."""
         self._running = False
+        self._frame_event.set()  # wake the processing loop out of wait()
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
+        if self._camera_thread is not None:
+            self._camera_thread.join(timeout=5.0)
+            self._camera_thread = None
         if self._camera_source is not None:
             self._camera_source.release()
             self._camera_source = None
@@ -568,6 +587,9 @@ class VisionService:
             self._last_frame_width = int(frame.shape[1])
         except Exception:
             pass
+        # Signal consumers (processing loop, FastFaceTracker) that a
+        # fresh frame is available. set() is a no-op if already set.
+        self._frame_event.set()
 
     # Error backoff parameters
     _MAX_CONSECUTIVE_ERRORS = 5
@@ -609,14 +631,17 @@ class VisionService:
             self._last_frame_log_at = now
 
     def _drive_head_tracker(self, faces: List[Dict]) -> None:
-        """Feed the strongest NAMED face into the head tracker.
+        """Feed the strongest face detection into the head tracker.
 
-        Ignores "Unknown" detections entirely — they're frequently
-        one-off false positives (the detector fires on a textured
-        background or a half-face from behind), and picking them as the
-        tracker target made the head lurch away from the real user
-        every time a stray detection appeared. If no named face is
-        visible, treat the frame as 'no face'.
+        Matches the standalone track_and_turn_head.py: the head follows
+        the highest-confidence *detection*, whether or not the embedder
+        matched it to a known person. Filtering by `name != "Unknown"`
+        made the head drop track every time the embedder's cosine
+        similarity dipped across the match threshold — at slow
+        recognition rates that flicker happens every few frames. The
+        existing score floor (VISION_FACE_RECOGNITION_MIN = 0.8) plus
+        HeadTracker's median/EMA/deadband smoothing already absorb the
+        occasional false positive this used to guard against.
         """
         tracker = self._head_tracker
         if tracker is None:
@@ -628,9 +653,6 @@ class VisionService:
         best_center: Optional[float] = None
         best_conf = -1.0
         for face in faces or []:
-            name = face.get("name")
-            if not name or name == "Unknown":
-                continue
             conf = float(face.get("confidence") or 0.0)
             if conf <= best_conf:
                 continue
@@ -707,22 +729,53 @@ class VisionService:
             # when multiple known faces are in view.
             return
 
-    def _loop(self) -> None:
-        """Background loop: capture frame -> detect faces -> update context."""
-        consecutive_errors = 0
+    def _camera_reader_loop(self) -> None:
+        """Pull frames from the camera as fast as it delivers them.
 
+        Runs separately from the processing loop so the camera buffer
+        never backs up and `_latest_frame` stays fresh for high-rate
+        consumers like the FastFaceTracker. OpenCV's VideoCapture.read()
+        blocks until the next camera frame is ready, which provides
+        natural pacing at the camera's native FPS.
+        """
         while self._running:
-            loop_start = time.monotonic()
-
-            ret, frame = self._camera_source.read()
-            if not ret:
-                self._last_error = f"camera read failed via {self._camera_backend_name}"
+            try:
+                ret, frame = self._camera_source.read()
+            except Exception as exc:
+                self._last_error = f"camera read raised: {exc}"
+                time.sleep(0.1)
+                continue
+            if not ret or frame is None:
+                self._last_error = (
+                    f"camera read failed via {self._camera_backend_name}"
+                )
                 time.sleep(0.1)
                 continue
 
             self._ready = True
             self._last_error = None
             self._record_frame(frame)
+
+    def _loop(self) -> None:
+        """Background loop: sample latest frame -> recognize -> update context."""
+        consecutive_errors = 0
+
+        while self._running:
+            loop_start = time.monotonic()
+
+            # Wait for the camera reader to produce a fresh frame.
+            # _frame_event is cleared once we consume so we block here
+            # instead of busy-looping when the camera is slower than
+            # our target interval.
+            self._frame_event.wait(timeout=self._target_interval + 0.5)
+            if not self._running:
+                break
+            self._frame_event.clear()
+
+            frame = self.get_latest_frame()
+            if frame is None:
+                time.sleep(0.05)
+                continue
 
             if self._backend is None:
                 consecutive_errors = 0
