@@ -640,11 +640,15 @@ class SpeechRouter(TranscriptEventListener):
     #    2) _is_echo() checks word overlap against last spoken text (content-based)
     #    Together they reliably filter self-heard audio on slow STT pipelines.
 
-    _ECHO_COOLDOWN = 0.25  # hard mic-mute after TTS; covers PortAudio buffer flush on Jetson
-    _ECHO_WINDOW = (
-        1.5  # seconds after TTS to keep content-based echo filtering
-    )
-    _POST_TURN_GATE = 0.5  # time-based mic gate after a full LLM+TTS turn ends
+    # Widened after moving to Piper TTS + hybrid mic-pause. mic.start()
+    # itself takes ~200-500 ms to deliver its first clean callback, and
+    # Piper's natural voice is easier for Moonshine to transcribe back
+    # as "user" text than Mimic3's robotic output was — so the windows
+    # need to absorb both the restart transient and any tail audio that
+    # leaked into PortAudio's buffer during playback.
+    _ECHO_COOLDOWN = 0.3
+    _ECHO_WINDOW = 2.5
+    _POST_TURN_GATE = 1.0
     _WAKE_DEBOUNCE_SECONDS = 1.5
 
     _INITIAL_LISTEN_WINDOW = 10.0  # seconds to start speaking after wake / after TTS
@@ -1231,6 +1235,18 @@ class VoiceAssistant:
         )
 
         # -- Speech router (wake-word-gated LLM fallback) --
+        # Hybrid mic-pause: stop the PortAudio stream only during actual
+        # TTS playback (inside `_begin_speaking`/`_end_speaking`), never
+        # during LLM generation. Closing the stream while the speaker is
+        # active prevents two compounding failures observed on Jetson:
+        #   1. MicTranscriber input-overflow — ONNX STT can't drain its
+        #      callbacks fast enough while Piper+LLM+playback share CPU.
+        #   2. Echo bleed — Piper's natural voice makes Moonshine transcribe
+        #      self-audio as "user" text on the next turn, slipping past
+        #      the post-turn gate.
+        # The transcript-level `_is_gated()` check still runs as a
+        # belt-and-suspenders cover, and `_POST_TURN_GATE` absorbs any
+        # audio still in PortAudio's buffer when the stream restarts.
         self._router = SpeechRouter(
             llm=llm,
             tts=tts,
@@ -1240,12 +1256,8 @@ class VoiceAssistant:
             listen_timeout_long=listen_timeout_long,
             max_utterance=max_utterance,
             wake_sounds_dir=wake_sounds_dir,
-            # Intentionally NOT passing mic_pause/mic_resume. Previously we
-            # called self._mic.stop()/start() each turn to gate the mic, which
-            # tore down the PortAudio input stream and leaked buffered audio
-            # into the next callback. We now gate transcripts via
-            # SpeechRouter._is_gated() and leave the stream running — same
-            # pattern box uses for its `audio_tracker.active` gate.
+            mic_pause=self._safe_mic_stop,
+            mic_resume=self._safe_mic_start,
         )
 
         # -- Register robot intents --
@@ -1259,6 +1271,24 @@ class VoiceAssistant:
         # Add listeners in order: intent recognizer first, then router
         self._mic.add_listener(self._intent_recognizer)
         self._mic.add_listener(self._router)
+
+    def _safe_mic_stop(self) -> None:
+        """Stop the PortAudio input stream for the duration of TTS playback.
+
+        Wrapped in try/except because some moonshine_voice versions raise
+        when stopped twice in a row. Silently swallowing is correct: a
+        "stream already stopped" state is exactly what we want.
+        """
+        try:
+            self._mic.stop()
+        except Exception as e:  # pragma: no cover - best-effort only
+            print(f"  ... mic stop skipped: {e}", file=sys.stderr)
+
+    def _safe_mic_start(self) -> None:
+        try:
+            self._mic.start()
+        except Exception as e:  # pragma: no cover - best-effort only
+            print(f"  ... mic start skipped: {e}", file=sys.stderr)
 
     def _make_intent_handler(self, action: str):
         """Create a closure that handles a matched intent.
