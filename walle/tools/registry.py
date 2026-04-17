@@ -170,7 +170,6 @@ class SystemPromptBuilder:
         # prefix-cache it. Per-turn values must live in the dynamic tail
         # below, not here.
         static_prefix = (
-            "/no_think\n\n"
             "You are WALL-E, a small physical robot built by the user as a hobby project. "
             "You are NOT the Pixar character and have no connection to a Buy-n-Large corporation, "
             "Earth cleanup mission, EVE, Axiom, Cogito Robotics, Pandora, or Mars. "
