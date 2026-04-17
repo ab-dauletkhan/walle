@@ -125,6 +125,20 @@ def _to_float32_audio(audio: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(audio)
 
 
+def _resample_mono(
+    audio: np.ndarray, src_rate: int, dst_rate: int
+) -> np.ndarray:
+    if src_rate == dst_rate:
+        return audio
+    from scipy.signal import resample_poly  # noqa: PLC0415
+    from math import gcd  # noqa: PLC0415
+
+    g = gcd(int(dst_rate), int(src_rate))
+    up = int(dst_rate) // g
+    down = int(src_rate) // g
+    return resample_poly(audio, up, down).astype(np.float32)
+
+
 def _play_audio_stable(
     audio: np.ndarray, sample_rate: int, blocking: bool = True
 ) -> None:
@@ -136,13 +150,7 @@ def _play_audio_stable(
     # paInvalidSampleRate. Doing it here keeps every caller unaware.
     target_rate = OUTPUT_RATE if OUTPUT_RATE is not None else sample_rate
     if target_rate != sample_rate:
-        from scipy.signal import resample_poly  # noqa: PLC0415
-        from math import gcd  # noqa: PLC0415
-
-        g = gcd(int(target_rate), int(sample_rate))
-        up = int(target_rate) // g
-        down = int(sample_rate) // g
-        audio = resample_poly(audio, up, down).astype(np.float32)
+        audio = _resample_mono(audio, sample_rate, target_rate)
         sample_rate = target_rate
 
     if OUTPUT_CHANNELS is not None and audio.ndim == 1 and OUTPUT_CHANNELS >= 2:
@@ -159,7 +167,35 @@ def _play_audio_stable(
     )
     if OUTPUT_DEVICE is not None:
         kwargs["device"] = OUTPUT_DEVICE
-    _sd().play(audio, **kwargs)
+    try:
+        _sd().play(audio, **kwargs)
+    except Exception as primary_err:
+        # The default ALSA output on Jetson frequently rejects Mimic3's
+        # native rate (22050 Hz) with paErrorCode -9999. Fall back once to
+        # 48000 Hz stereo — the near-universal rate for USB DACs and HDMI.
+        # If the user passed --speaker-rate/--speaker-device we respect
+        # their choice and don't retry.
+        if OUTPUT_RATE is not None:
+            raise
+        print(
+            f"  TTS playback retry: default output rejected {sample_rate} Hz "
+            f"({primary_err}); resampling to 48000 Hz stereo.",
+            file=sys.stderr,
+        )
+        mono_1d = audio if audio.ndim == 1 else audio[:, 0]
+        retry_audio = _resample_mono(mono_1d, sample_rate, 48000)
+        retry_audio = np.ascontiguousarray(
+            np.repeat(retry_audio[:, None], 2, axis=1)
+        )
+        retry_kwargs = dict(
+            samplerate=48000,
+            blocking=blocking,
+            latency=AUDIO_LATENCY,
+            blocksize=AUDIO_BLOCKSIZE,
+        )
+        if OUTPUT_DEVICE is not None:
+            retry_kwargs["device"] = OUTPUT_DEVICE
+        _sd().play(retry_audio, **retry_kwargs)
 
 
 # ─────────────────────────────────────────────────────────────
