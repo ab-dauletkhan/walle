@@ -11,8 +11,10 @@ subprocess IPC is the bottleneck), so we split the job into two layers:
    — no serial I/O.
 2. A background thread inside HeadTracker ticks at ~30 Hz and walks
    `current_tick` toward `target_tick` in the same 6-tick chunks the
-   standalone script uses, sending one `head step N` per tick. Serial
-   I/O stays under the firmware's per-command delta cap.
+   standalone script uses, sending one absolute `head tick N` per
+   tick (same protocol as the standalone). Serial I/O stays under
+   the firmware's per-command delta cap because we never step by
+   more than MAX_STEP_CAP ticks between sends.
 
 Body-assist spin turns from the standalone are intentionally dropped —
 the voice pipeline drives the wheels, and having the tracker also spin
@@ -101,6 +103,10 @@ class HeadTracker:
         self._last_face_seen_at = 0.0
         self._last_command_dir = 0
         self._error_ratio = 0.0  # |err| / half_frame, set in update_from_face
+        # Emit the first few sends at INFO so operators can confirm the
+        # servo loop is actually writing to the serial port. Further
+        # sends drop to DEBUG to keep the log quiet.
+        self._debug_sends_logged = 0
 
         # Suspend window for explicit voice "look left" / head_pan calls.
         self._suspend_until = 0.0
@@ -310,10 +316,28 @@ class HeadTracker:
 
         # Serial I/O OUTSIDE the lock — firmware ack is 10-50 ms and we
         # don't want face-update callers to block on it.
+        #
+        # Absolute `head tick {N}` matches the standalone script's send
+        # protocol exactly. The relative `head step` variant accumulates
+        # state on the firmware side, so any drift between our
+        # `current_tick` and the firmware's headPan.currentTick (e.g.
+        # after an LLM head_pan tool call that doesn't call
+        # notify_manual_tick) stays wrong forever. Sending the absolute
+        # target lets the firmware's own delta-guard catch desyncs
+        # instead of silently walking the servo to the wrong place.
+        if self._debug_sends_logged < 5:
+            _log.info(
+                "HeadTracker send: head tick %d (target=%d)",
+                new_tick,
+                self._target_tick,
+            )
+            self._debug_sends_logged += 1
+        else:
+            _log.debug("head tick %d", new_tick)
         try:
-            self._send(f"head step {actual_step}")
+            self._send(f"head tick {new_tick}")
         except Exception:
-            _log.debug("head step send failed", exc_info=True)
+            _log.debug("head tick send failed", exc_info=True)
 
 
 def _clamp_tick(tick) -> int:
