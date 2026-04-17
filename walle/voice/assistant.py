@@ -840,19 +840,42 @@ class SpeechRouter(TranscriptEventListener):
 
         threading.Thread(target=_play, daemon=True).start()
 
+    def prime_echo_guard(self, spoken_text: str) -> None:
+        """Seed the echo filter and mic gate for a non-LLM TTS utterance.
+
+        Call this after any `tts.speak(...)` that happens outside the
+        normal `_handle_llm_query` flow — e.g. the startup "At your
+        command." announcement. Without it, PortAudio's buffer tail
+        delivers the speaker output back to the mic after the TTS
+        `_tts_busy` flag has already cleared, so `_is_gated()` returns
+        False and `_is_echo()` has no `_echo_words` to match against.
+        """
+        cleaned = self._strip_punctuation(spoken_text).lower().split()
+        if cleaned:
+            self._echo_words = set(cleaned)
+        now = time.time()
+        self._mic_gate_until = max(self._mic_gate_until, now + self._POST_TURN_GATE)
+        self._echo_suppress_until = max(
+            self._echo_suppress_until, now + self._ECHO_WINDOW
+        )
+
     def _is_echo(self, text: str) -> bool:
-        """Content-based check: is this text just the mic hearing our own TTS?"""
-        if time.time() > self._echo_suppress_until:
-            return False
+        """Content-based check: is this text just the mic hearing our own TTS?
+
+        Intentionally NOT time-gated anymore. Under Jetson load Moonshine
+        often finalizes the echoed transcript several seconds after Piper
+        finished speaking — past any reasonable `_echo_suppress_until`
+        window. A >70% word overlap with the last TTS text is a strong
+        signal it's self-echo regardless of when it arrives, so we hold
+        `_echo_words` until the next turn overwrites it.
+        """
         if not self._echo_words:
             return False
         words = set(self._strip_punctuation(text).lower().split())
         if not words:
             return False
         overlap = len(words & self._echo_words) / len(words)
-        return (
-            overlap > 0.6
-        )  # Raised from 0.4 to reduce false positives on short phrases
+        return overlap > 0.7
 
     # -- Wake word detection --
 
@@ -1360,8 +1383,13 @@ class VoiceAssistant:
         # Spoken "ready" cue — the robot runs headless so the operator
         # has no terminal/log to confirm startup finished. Non-fatal if
         # TTS isn't connected (ConsoleTTSEngine just prints it).
+        ready_text = "At your command."
         try:
-            self._tts.speak("At your command.")
+            self._tts.speak(ready_text)
+            # PortAudio delivers the speaker tail back to the mic for
+            # ~500 ms after `speak()` returns. Arm the router's echo
+            # filter so that tail isn't transcribed as a user command.
+            self._router.prime_echo_guard(ready_text)
         except Exception as e:
             print(f"  ... ready announcement skipped: {e}", file=sys.stderr)
         try:

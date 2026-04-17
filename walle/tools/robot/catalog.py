@@ -210,9 +210,16 @@ class StopAllAction(RobotAction):
 
 
 def _percent_to_tick(percent: int) -> int:
+    """Convert 'percent left-to-right' to a PCA9685 tick.
+
+    The servo is mounted such that tick=150 is the robot's physical
+    right and tick=550 is its physical left. Users think in terms of
+    the robot's own left/right (position=0 → look left), so invert
+    here instead of rewiring.
+    """
     percent = _clamp(percent, 0, 100)
     span = HEAD_TICK_MAX - HEAD_TICK_MIN
-    return HEAD_TICK_MIN + int(round(span * percent / 100))
+    return HEAD_TICK_MAX - int(round(span * percent / 100))
 
 
 # Module-level cache of the last commanded head tick. The firmware's
