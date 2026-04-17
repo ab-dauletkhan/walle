@@ -64,6 +64,11 @@ MIN_SEND_DELTA = 1
 # resync and for clarity.
 HEAD_MAX_STEP_PER_CMD = 60
 
+# INFO log cadence for `head tick` sends. Tick loop runs at 30 Hz; the
+# previous one-shot "first 5 sends" log meant operators lost visibility
+# after startup. 5 s matches the vision-side face-log cadence.
+_SEND_LOG_INTERVAL_SEC = 5.0
+
 # After this many seconds with no face, drift back to centre.
 LOST_TARGET_TIMEOUT_SEC = 1.8
 
@@ -103,10 +108,11 @@ class HeadTracker:
         self._last_face_seen_at = 0.0
         self._last_command_dir = 0
         self._error_ratio = 0.0  # |err| / half_frame, set in update_from_face
-        # Emit the first few sends at INFO so operators can confirm the
-        # servo loop is actually writing to the serial port. Further
-        # sends drop to DEBUG to keep the log quiet.
-        self._debug_sends_logged = 0
+        # Time-throttled INFO log so operators can see sustained activity
+        # without 30 Hz spam. Kept at INFO every _SEND_LOG_INTERVAL_SEC;
+        # individual sends still log at DEBUG.
+        self._last_send_log_at = 0.0
+        self._sends_since_log = 0
 
         # Suspend window for explicit voice "look left" / head_pan calls.
         self._suspend_until = 0.0
@@ -325,13 +331,18 @@ class HeadTracker:
         # notify_manual_tick) stays wrong forever. Sending the absolute
         # target lets the firmware's own delta-guard catch desyncs
         # instead of silently walking the servo to the wrong place.
-        if self._debug_sends_logged < 5:
+        self._sends_since_log += 1
+        now_mono = time.monotonic()
+        if now_mono - self._last_send_log_at >= _SEND_LOG_INTERVAL_SEC:
             _log.info(
-                "HeadTracker send: head tick %d (target=%d)",
+                "HeadTracker tick=%d target=%d (%d sends in last %.1fs)",
                 new_tick,
                 self._target_tick,
+                self._sends_since_log,
+                now_mono - self._last_send_log_at if self._last_send_log_at else 0.0,
             )
-            self._debug_sends_logged += 1
+            self._last_send_log_at = now_mono
+            self._sends_since_log = 0
         else:
             _log.debug("head tick %d", new_tick)
         try:

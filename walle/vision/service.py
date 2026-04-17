@@ -625,39 +625,35 @@ class VisionService:
     _BACKOFF_BASE = 0.5  # seconds, doubles each consecutive error
     _BACKOFF_MAX = 30.0  # cap
 
-    def _log_frame_faces(self, faces: List[Dict]) -> None:
-        """Emit an INFO line when the face set meaningfully changes, and a
-        DEBUG line every few seconds otherwise.
+    _FRAME_LOG_MIN_INTERVAL_SEC = 5.0
 
-        Without this, the vision thread runs silently and it's impossible
-        to tell whether the camera is seeing anyone at all or whether a
-        face is being recognized as Unknown vs. a named person.
+    def _log_frame_faces(self, faces: List[Dict]) -> None:
+        """Emit at most one INFO line every 5 s.
+
+        Signature keyed on the *name set* only — confidence excluded
+        because the embedder jitters across its match threshold (e.g.
+        Miras@0.99 ↔ Miras@1.0) every few frames and that flooded the
+        terminal. Enforces a strict 5 s floor so even rapid Miras ↔
+        Unknown flicker collapses into a single line per window.
         """
         now = time.time()
         if not faces:
             signature = "none"
         else:
-            signature = " | ".join(
-                f"{(f.get('name') or 'Unknown')}@{f.get('confidence', 0)}"
-                for f in faces
-            )
+            names = sorted({(f.get("name") or "Unknown") for f in faces})
+            signature = ",".join(names)
 
-        # INFO when the signature changes (face appears/disappears/switches
-        # identity) — this is the line a human operator actually wants to
-        # read while testing recognition.
-        if signature != self._last_frame_log_signature:
-            self._last_frame_log_signature = signature
-            self._last_frame_log_at = now
-            if faces:
-                _log.info("faces: %s", signature)
-            else:
-                _log.info("faces: none in frame")
+        if now - self._last_frame_log_at < self._FRAME_LOG_MIN_INTERVAL_SEC:
+            return
+        if signature == self._last_frame_log_signature:
             return
 
-        # Throttled heartbeat so logs don't explode at 1 FPS × 60 s.
-        if now - self._last_frame_log_at >= 10.0:
-            _log.debug("faces (still): %s", signature)
-            self._last_frame_log_at = now
+        self._last_frame_log_signature = signature
+        self._last_frame_log_at = now
+        if faces:
+            _log.info("faces: %s", signature)
+        else:
+            _log.info("faces: none in frame")
 
     def _drive_head_tracker(self, faces: List[Dict]) -> None:
         """Feed the strongest face detection into the head tracker.

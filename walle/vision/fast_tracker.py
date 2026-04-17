@@ -37,10 +37,14 @@ import numpy as np
 
 _log = logging.getLogger("walle.vision.fast_tracker")
 
-_TARGET_FPS = 30
+# 15 Hz is enough for smooth head tracking once HeadTracker's median +
+# EMA + deadband smoothing is applied, and halves the CPU / GIL load of
+# the detect-only op versus 30 Hz. Moonshine's audio thread needs that
+# headroom on the Jetson — at 30 Hz this loop starved the STT pipeline.
+_TARGET_FPS = 15
 _TARGET_INTERVAL_SEC = 1.0 / _TARGET_FPS
 _DETECTION_THRESHOLD = 0.80  # matches track_and_turn_head.FACE_SCORE_THRESHOLD
-_FPS_LOG_INTERVAL_SEC = 10.0
+_FPS_LOG_INTERVAL_SEC = 5.0
 
 
 class FastFaceTracker:

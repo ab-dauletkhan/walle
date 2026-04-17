@@ -44,6 +44,8 @@ except ImportError:  # pragma: no cover - exercised on voice-less hosts
 
 from walle.voice.llm_client import LLMClient, MockLLMClient
 
+_log = logging.getLogger("walle.voice.assistant")
+
 
 # sounddevice and moonshine_voice are voice-only deps. Importing them
 # eagerly makes `walle --text-mode` crash on hosts where they aren't
@@ -647,7 +649,66 @@ class SpeechRouter(TranscriptEventListener):
         # signalling `_request_stop`.
         self._partial_stop_hits: int = 0
 
+        # Diagnostic heartbeat. Logs one line every 5 s with gate state +
+        # dispatcher stats + last-partial age so freezes (e.g. STT stops
+        # firing while vision is running) can be diagnosed without
+        # sprinkling ad-hoc prints.
+        self._last_partial_ts: float = 0.0
+        self._dispatcher_ref = None  # attached post-init by VoiceAssistant
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name="router-heartbeat",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+
     _INTENT_COOLDOWN = 2.0  # seconds: skip LLM routing after intent fires
+    _HEARTBEAT_INTERVAL_SEC = 5.0
+
+    def attach_dispatcher(self, dispatcher) -> None:
+        """Late-binding hook so the heartbeat can report dispatcher stats.
+
+        Router is built before the dispatcher (dispatcher needs router as
+        a listener), so this wire-up happens post-construction from
+        VoiceAssistant.
+        """
+        self._dispatcher_ref = dispatcher
+
+    def _heartbeat_loop(self) -> None:
+        while not self._heartbeat_stop.wait(self._HEARTBEAT_INTERVAL_SEC):
+            try:
+                self._emit_heartbeat()
+            except Exception:
+                _log.exception("router heartbeat failed")
+
+    def _emit_heartbeat(self) -> None:
+        now = time.time()
+        if self._last_partial_ts:
+            partial_age = f"{now - self._last_partial_ts:.1f}s"
+        else:
+            partial_age = "never"
+        tts_busy_ev = getattr(self._tts, "_tts_busy", None)
+        tts_busy = bool(tts_busy_ev and tts_busy_ev.is_set())
+        dispatcher = self._dispatcher_ref
+        qdepth_hwm = -1
+        dropped = 0
+        if dispatcher is not None:
+            stats = getattr(dispatcher, "stats", None)
+            if stats is not None:
+                qdepth_hwm = getattr(stats, "queue_depth_hwm", -1)
+                dropped = getattr(stats, "dropped_partial", 0)
+        _log.info(
+            "router heartbeat: state=%s gated=%s processing=%s tts_busy=%s "
+            "last_partial=%s qdepth_hwm=%d dropped_partials=%d",
+            self._state,
+            self._is_gated(),
+            self._processing,
+            tts_busy,
+            partial_age,
+            qdepth_hwm,
+            dropped,
+        )
 
     # -- Called by IntentRecognizer callback to mark a line as handled --
 
@@ -1108,6 +1169,10 @@ class SpeechRouter(TranscriptEventListener):
 
     def on_line_text_changed(self, event):
         text = event.line.text
+        # Stamp *before* the gate check so the heartbeat shows a fresh
+        # age even while we're intentionally dropping transcripts — the
+        # goal is to tell "STT is silent" apart from "STT is gated".
+        self._last_partial_ts = time.time()
         # Barge-in on partial transcripts too. Under heavy CPU load
         # Moonshine often doesn't finalize a line while TTS is playing,
         # so `on_line_completed` never fires — the stop intent would
@@ -1449,6 +1514,7 @@ class VoiceAssistant:
             on_stop_intent=self._router._request_stop,
             logger=logging.getLogger("walle.voice.dispatcher"),
         )
+        self._router.attach_dispatcher(self._dispatcher)
         self._mic.add_listener(self._dispatcher)
 
     def _make_intent_handler(self, action: str):
