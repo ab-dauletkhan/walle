@@ -17,6 +17,7 @@ python3 -m stt_tts.main --wake-word "hey, rocket" --listen-timeout 3.0
 
 import argparse
 import io
+import logging
 import os
 import queue
 import random
@@ -1117,6 +1118,13 @@ class SpeechRouter(TranscriptEventListener):
         # LLM is mid-reply otherwise self-interrupts. Two consecutive
         # partials within one Moonshine line mean the word was stable
         # across endpointing refinements — a real utterance.
+        #
+        # If the dispatcher dropped partials between the previous
+        # delivered event and this one, the "consecutive" invariant is
+        # broken — reset the counter so a stop-match here can only fire
+        # if paired with a fresh follow-up match.
+        if getattr(event, "dispatcher_drops_since_last", 0):
+            self._partial_stop_hits = 0
         if self._audio_active.is_set() and self._is_stop_intent(text):
             self._partial_stop_hits += 1
             if self._partial_stop_hits >= 2:
@@ -1421,9 +1429,27 @@ class VoiceAssistant:
                 self._make_intent_handler(action),
             )
 
-        # Add listeners in order: intent recognizer first, then router
-        self._mic.add_listener(self._intent_recognizer)
-        self._mic.add_listener(self._router)
+        # Decouple listener callbacks from moonshine's audio thread. Both
+        # the IntentRecognizer (embedding similarity, ~20-100 ms on Jetson)
+        # and SpeechRouter (SSH prints, serial round-trips via intent
+        # handler, tts.drain on barge-in) would otherwise run synchronously
+        # on the thread that drains PortAudio, and the ring buffer
+        # overflows under LLM+TTS load. The dispatcher is the only listener
+        # moonshine sees; it forwards events to the real listeners via a
+        # bounded queue consumed by a dedicated thread, preserving the
+        # [intent_recognizer, router] ordering that `mark_handled` /
+        # `_handled_utterances` depends on.
+        from walle.voice.listener_dispatch import ListenerDispatcher
+
+        self._dispatcher = ListenerDispatcher(
+            listeners=[self._intent_recognizer, self._router],
+            queue_size=32,
+            stop_intent_fn=self._router._is_stop_intent,
+            stop_active_fn=self._router._audio_active.is_set,
+            on_stop_intent=self._router._request_stop,
+            logger=logging.getLogger("walle.voice.dispatcher"),
+        )
+        self._mic.add_listener(self._dispatcher)
 
     def _make_intent_handler(self, action: str):
         """Create a closure that handles a matched intent.
@@ -1441,8 +1467,22 @@ class VoiceAssistant:
                 return
             if self._router._detect_wake(utterance) is not None:
                 return
+            # mark_handled MUST stay inline — SpeechRouter.on_line_completed
+            # runs immediately after this on the dispatcher's consumer
+            # thread and reads `_handled_utterances` / `_intent_cooldown_until`.
             self._router.mark_handled(utterance)
-            self._robot.execute(action, utterance, similarity)
+            # robot.execute goes through the serial port (~20-100 ms round
+            # trip). That's now on the dispatcher consumer thread; keeping
+            # it inline would stall subsequent callbacks and refill the
+            # queue. Fire-and-forget on a short-lived daemon is acceptable
+            # because BaseRobotController.execute is semantically one-shot
+            # (the return value is only used for logging).
+            threading.Thread(
+                target=self._robot.execute,
+                args=(action, utterance, similarity),
+                daemon=True,
+                name="robot-exec",
+            ).start()
 
         return handler
 
@@ -1480,7 +1520,13 @@ class VoiceAssistant:
         except KeyboardInterrupt:
             print("\n\n  Shutting down...")
         finally:
+            # Order matters: stop the producer first so no new events arrive,
+            # then drain the dispatcher (with a bounded timeout — under SIGINT
+            # this finally never runs because startup.py:_halt calls
+            # os._exit(0), so this path is for normal-exit cleanup only),
+            # then close the STT model and downstream resources.
             self._mic.stop()
+            self._dispatcher.stop()
             self._mic.close()
             self._intent_recognizer.close()
             self._robot.close()
