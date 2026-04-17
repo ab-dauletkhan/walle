@@ -971,15 +971,17 @@ class SpeechRouter(TranscriptEventListener):
     def _is_stop_intent(self, text: str) -> bool:
         """Match a stop intent without false-positiving on long utterances.
 
-        Three rules, roughly most-specific to least-specific:
-          1. Exact match against `_stop_phrases` (covers bare "stop",
-             "shut up", "wall-e stop", etc.).
+        Two rules:
+          1. Exact match against `_stop_phrases` — bare "stop",
+             "shut up", "wall-e stop", etc.
           2. Short utterance (≤ 2 tokens) containing a stop keyword —
-             lets "stop please" / "okay stop" / "stop talking" through
-             without matching "if you want me to stop or keep going".
-          3. Multi-word phrase substring (e.g. "wall-e stop" inside a
-             longer utterance) — only for phrases that already include
-             the wake word, so the user is being intentional.
+             lets "stop please", "okay stop", "stop talking" through
+             without matching a paragraph that happens to say "stop".
+
+        Substring matching was removed because TTS that coached the
+        user ("just say: stop wall-e") echoed back through the mic
+        and self-interrupted. A genuine barge-in is either one or
+        two words long anyway.
         """
         normalized = self._strip_punctuation(text).lower().strip()
         if not normalized:
@@ -987,12 +989,11 @@ class SpeechRouter(TranscriptEventListener):
         if normalized in self._stop_phrases:
             return True
         tokens = normalized.split()
-        _keywords = {"stop", "cancel", "quiet"}
-        if len(tokens) <= 2 and any(t in _keywords for t in tokens):
+        if len(tokens) <= 2 and any(
+            t in {"stop", "cancel", "quiet"} for t in tokens
+        ):
             return True
-        return any(
-            phrase in normalized for phrase in self._stop_phrases if " " in phrase
-        )
+        return False
 
     def _request_stop(self) -> None:
         """Signal the active LLM/TTS turn to bail out as soon as possible."""

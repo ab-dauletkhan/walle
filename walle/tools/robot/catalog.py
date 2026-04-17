@@ -370,11 +370,15 @@ def build_default_robot_registry() -> RobotToolRegistry:
             DriveAction(
                 RobotToolSpec(
                     "drive",
-                    "Move the robot. direction=forward/backward/left/right. "
-                    "speed is 0-100 (percent of max). duration_ms is optional, "
-                    "max 5000; omit or set 0 for continuous motion that keeps "
-                    "running until `stop_movement` is called or the firmware "
-                    "watchdog fires after 3s.",
+                    "Drive the robot's WHEELS to move the whole body. Use for: "
+                    "'move forward/backward', 'go forward', 'turn left/right' "
+                    "(left/right spin the body in place). DO NOT use for "
+                    "'look left/right' — that is a head motion, use head_pan "
+                    "instead. direction=forward/backward/left/right. speed is "
+                    "0-100 (percent of max). duration_ms is optional, max 5000; "
+                    "omit or set 0 for continuous motion that keeps running "
+                    "until `stop_movement` is called or the firmware watchdog "
+                    "fires after 3s.",
                     {
                         "direction": {
                             "type": "string",
@@ -400,8 +404,11 @@ def build_default_robot_registry() -> RobotToolRegistry:
             HeadPanAction(
                 RobotToolSpec(
                     "head_pan",
-                    "Turn the head to an absolute horizontal position. "
-                    "position=0 is fully left, 50 is centered, 100 is fully right.",
+                    "Turn just the HEAD horizontally (body stays still). Use "
+                    "for: 'look left/right', 'turn your head', 'face the "
+                    "door', 'look at me'. Do NOT use `drive` for these — "
+                    "that spins the whole robot. position=0 is fully left, "
+                    "50 is centered, 100 is fully right.",
                     {
                         "position": {
                             "type": "integer",
