@@ -1,11 +1,22 @@
 """Head-tracking driver for the vision thread.
 
-Ports the tracking math from `vision/face_recognition/track_and_turn_head.py`
-into a form VisionService can feed at frame rate, using the shared
-`SerialManager` instead of opening its own serial port.
+Same motion profile as `vision/face_recognition/track_and_turn_head.py`:
+the servo is stepped at ~30 Hz in ≤6-tick micro-moves, which gives the
+smooth "following my face" feel. In WALL-E the face *detection* runs at
+the vision service's slow rate (1-2 Hz on Jetson because the Coral
+subprocess IPC is the bottleneck), so we split the job into two layers:
 
-Only head tracking — body-assist turns from the standalone script are
-dropped so the tracker never fights with voice-driven drive commands.
+1. VisionService calls `update_from_face(x, frame_width)` whenever it
+   has a fresh detection. That call only recomputes the *target* tick
+   — no serial I/O.
+2. A background thread inside HeadTracker ticks at ~30 Hz and walks
+   `current_tick` toward `target_tick` in the same 6-tick chunks the
+   standalone script uses, sending one `head step N` per tick. Serial
+   I/O stays under the firmware's per-command delta cap.
+
+Body-assist spin turns from the standalone are intentionally dropped —
+the voice pipeline drives the wheels, and having the tracker also spin
+the base would fight the drive tool.
 """
 
 from __future__ import annotations
@@ -18,9 +29,8 @@ from typing import Callable, Optional
 
 _log = logging.getLogger("walle.vision.head_tracker")
 
-# Servo tick map matches the reference script and the firmware's head
-# step-walking bounds. Optical center trim is zero — adjust here if the
-# mounted camera is biased off-axis relative to the servo.
+# Servo tick map — same as the reference script. tick=150 is the
+# robot's physical right, tick=550 is its physical left.
 HEAD_RIGHT_TICK = 150
 HEAD_CENTER_TICK = 350
 HEAD_LEFT_TICK = 550
@@ -29,37 +39,40 @@ HEAD_MAX_TICK = max(HEAD_RIGHT_TICK, HEAD_LEFT_TICK)
 HEAD_CENTER_TRIM = 0
 HEAD_OPTICAL_CENTER_TICK = HEAD_CENTER_TICK + HEAD_CENTER_TRIM
 
-# Tracking parameters. The reference script ran the loop at ~30 FPS and
-# clamped each update to a ≤6-tick micro-step for visual smoothness. In
-# voice mode VisionService ticks at ~1 FPS (Jetson CPU budget), so a
-# per-update cap of a few ticks means the servo can traverse at most
-# ~6 ticks/second — 60+ seconds to cross the 400-tick range. Instead
-# we walk straight to the target per update, splitting the move into
-# firmware-legal 60-tick `head step` chunks inside _send_tick so the
-# firmware's per-command rate limit never rejects it.
+# Smoothing / deadband — match the standalone script.
 MEDIAN_WINDOW = 3
-SMOOTH_ALPHA = 0.55
+SMOOTH_ALPHA = 0.45
 DEADBAND_PX = 30
 REVERSE_HYSTERESIS_PX = 15
-SEND_INTERVAL_SEC = 0.0  # vision loop paces us — no extra throttle
-MIN_SEND_DELTA = 2
-LOST_TARGET_TIMEOUT_SEC = 1.8
-RETURN_TO_CENTER_STEP = 40
 EDGE_MARGIN_RATIO = 0.18
 
-# Firmware safety: each `head step N` command may move at most this many
-# ticks (motor_control_cli.ino enforces). Larger requested deltas are
-# step-walked.
+# Motion parameters — copied from the reference's HeadController. The
+# tick-thread runs at TICK_HZ and moves at most MAX_STEP_CAP ticks each
+# iteration. At 30 Hz × 6 ticks = 180 ticks/sec, a full-range swing
+# takes ~2.2 s — visibly smooth, same as standalone.
+TICK_HZ = 30
+TICK_INTERVAL_SEC = 1.0 / TICK_HZ
+MAX_STEP_BASE = 1
+MAX_STEP_EXTRA = 6
+MAX_STEP_CAP = 6
+MIN_SEND_DELTA = 1
+
+# Firmware's per-command tick-delta safety ceiling. Even a single step
+# is well below this; kept here as a hard cap for `notify_manual_tick`
+# resync and for clarity.
 HEAD_MAX_STEP_PER_CMD = 60
-STEP_WALK_DELAY_SEC = 0.02
+
+# After this many seconds with no face, drift back to centre.
+LOST_TARGET_TIMEOUT_SEC = 1.8
 
 
 class HeadTracker:
     """Minimal head-only tracker driven by face coordinates.
 
-    Caller must supply a `send_command(cmd: str)` callable that writes
-    one CLI line (without trailing newline) to the firmware — typically
-    bound to `SerialManager.send_command`.
+    Call `update_from_face()` whenever new face data is available (any
+    rate — 1 Hz on Jetson is fine). The internal 30 Hz thread walks the
+    servo toward the most recent target in firmware-legal micro-steps,
+    identical to the standalone script.
     """
 
     def __init__(
@@ -71,146 +84,115 @@ class HeadTracker:
         self._send = send_command
         self._manual_override_sec = manual_override_sec
 
-        # NumPy is imported lazily so this module can be imported in
-        # text-mode/test paths that don't pull the vision stack.
-        import numpy as np  # noqa: PLC0415
-
+        import numpy as np  # noqa: PLC0415 — lazy for text-mode hosts
         self._np = np
 
         self._lock = threading.Lock()
         self._enabled = True
+        self._running = False
 
         self.current_tick = HEAD_OPTICAL_CENTER_TICK
+        self._target_tick = HEAD_OPTICAL_CENTER_TICK
         self._last_sent_tick: Optional[int] = None
-        self._last_send_time = 0.0
+        self._last_send_monotonic = 0.0
 
         self._recent_face_x: deque = deque(maxlen=MEDIAN_WINDOW)
         self._smoothed_x: Optional[float] = None
-        self._last_target_time = 0.0
+        self._last_face_seen_at = 0.0
         self._last_command_dir = 0
+        self._error_ratio = 0.0  # |err| / half_frame, set in update_from_face
 
-        # When the voice pipeline's head_pan tool runs, suspend vision
-        # tracking briefly so the user's explicit "look left" is honoured
-        # instead of being overwritten by the next face update.
+        # Suspend window for explicit voice "look left" / head_pan calls.
         self._suspend_until = 0.0
 
-        # Initialize firmware position so subsequent deltas land in
-        # a known place. Best-effort — a simulation-mode SerialManager
-        # will just log the command. We emit `head tick N` here (not
-        # `head step`) because there's no cached firmware position yet;
-        # firmware accepts a full-range absolute set at boot.
+        # Send an initial absolute centre so the firmware's internal
+        # position matches our `current_tick` state.
         try:
             self._send(f"head tick {self.current_tick}")
         except Exception:
             _log.debug("initial head-center send failed", exc_info=True)
 
-    # ---- public API ------------------------------------------------
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._tick_loop, name="head-tracker-tick", daemon=True
+        )
+        self._thread.start()
+
+    # ----- public API ------------------------------------------------
 
     def set_enabled(self, enabled: bool) -> None:
         with self._lock:
             self._enabled = enabled
             if not enabled:
-                self._reset_tracking_state()
+                self._reset_tracking_state_locked()
 
     def suspend(self, duration_sec: Optional[float] = None) -> None:
-        """Block updates for `duration_sec` seconds after a manual command."""
+        """Pause tracking for N seconds (e.g. after a manual head_pan)."""
         dur = (
             duration_sec if duration_sec is not None else self._manual_override_sec
         )
         with self._lock:
             self._suspend_until = time.monotonic() + dur
-            self._reset_tracking_state()
+            self._reset_tracking_state_locked()
 
     def notify_manual_tick(self, tick: int) -> None:
-        """Tell the tracker that an external actor (voice tool) just moved
-        the head. Resets the cached `current_tick` so we don't fight it
-        and suspends tracking briefly."""
+        """External code (voice head_pan) just moved the servo — resync."""
         with self._lock:
             self.current_tick = _clamp_tick(tick)
+            self._target_tick = self.current_tick
             self._suspend_until = time.monotonic() + self._manual_override_sec
-            self._reset_tracking_state()
+            self._reset_tracking_state_locked()
 
     def update_from_face(self, face_center_x: float, frame_width: int) -> None:
-        """Feed one face's center-x (pixels, original-frame coords)."""
+        """Recompute the target tick from a new face observation.
+
+        Cheap — only updates state, no serial I/O. The tick thread picks
+        up the new target on its next iteration.
+        """
         with self._lock:
             if not self._enabled:
                 return
             if time.monotonic() < self._suspend_until:
                 return
-            self._update_locked(face_center_x, frame_width)
+            self._update_target_locked(face_center_x, frame_width)
 
     def on_no_face(self) -> None:
-        """Drift back toward center after `LOST_TARGET_TIMEOUT_SEC` of no faces."""
+        """Called when a vision frame contained no face."""
+        now = time.monotonic()
         with self._lock:
             if not self._enabled:
                 return
-            if time.monotonic() < self._suspend_until:
+            if now < self._suspend_until:
                 return
-            self._on_lost_locked()
+            if self._last_face_seen_at == 0.0:
+                # Never seen a face — stay centred.
+                self._target_tick = HEAD_OPTICAL_CENTER_TICK
+                return
+            if now - self._last_face_seen_at >= LOST_TARGET_TIMEOUT_SEC:
+                self._reset_tracking_state_locked()
+                self._target_tick = HEAD_OPTICAL_CENTER_TICK
 
     def close(self) -> None:
+        self._running = False
+        t = getattr(self, "_thread", None)
+        if t is not None:
+            t.join(timeout=1.0)
         try:
             self._send(f"head tick {HEAD_OPTICAL_CENTER_TICK}")
         except Exception:
             _log.debug("close head-center send failed", exc_info=True)
 
-    # ---- internals -------------------------------------------------
+    # ----- internals -------------------------------------------------
 
-    def _reset_tracking_state(self) -> None:
+    def _reset_tracking_state_locked(self) -> None:
         self._recent_face_x.clear()
         self._smoothed_x = None
         self._last_command_dir = 0
+        self._error_ratio = 0.0
 
-    def _send_tick(self, tick: int, force: bool = False) -> bool:
-        """Move the servo to absolute `tick`, step-walking through any
-        delta larger than the firmware's per-command limit.
-
-        At 1-2 Hz vision updates a single tracking step can span 300+
-        ticks (face jumps left-to-right), so sending one `head tick N`
-        with delta > 60 gets clamped by the firmware and the servo
-        stalls halfway. We split the move into ≤60-tick `head step`
-        commands with a short delay between so the firmware processes
-        each one cleanly.
-        """
-        tick = _clamp_tick(tick)
-        now = time.monotonic()
-        delta_total = tick - self.current_tick
-        if not force:
-            if abs(delta_total) < MIN_SEND_DELTA:
-                return False
-            if now - self._last_send_time < SEND_INTERVAL_SEC:
-                return False
-        old_tick = self.current_tick
-
-        remaining = delta_total
-        while abs(remaining) > HEAD_MAX_STEP_PER_CMD:
-            step = (
-                HEAD_MAX_STEP_PER_CMD if remaining > 0 else -HEAD_MAX_STEP_PER_CMD
-            )
-            try:
-                self._send(f"head step {step}")
-            except Exception:
-                _log.debug("head step send failed", exc_info=True)
-            self.current_tick += step
-            remaining -= step
-            if STEP_WALK_DELAY_SEC > 0:
-                time.sleep(STEP_WALK_DELAY_SEC)
-        if remaining != 0:
-            try:
-                self._send(f"head step {remaining}")
-            except Exception:
-                _log.debug("head step send failed", exc_info=True)
-            self.current_tick += remaining
-
-        if self.current_tick > old_tick:
-            self._last_command_dir = 1
-        elif self.current_tick < old_tick:
-            self._last_command_dir = -1
-        self._last_sent_tick = self.current_tick
-        self._last_send_time = time.monotonic()
-        return True
-
-    def _update_locked(self, face_center_x: float, frame_width: int) -> None:
+    def _update_target_locked(
+        self, face_center_x: float, frame_width: int
+    ) -> None:
         np = self._np
         frame_center_x = frame_width / 2.0
         self._recent_face_x.append(face_center_x)
@@ -220,11 +202,11 @@ class HeadTracker:
             self._smoothed_x = filtered_x
         else:
             self._smoothed_x = (
-                (1.0 - SMOOTH_ALPHA) * self._smoothed_x + SMOOTH_ALPHA * filtered_x
+                (1.0 - SMOOTH_ALPHA) * self._smoothed_x
+                + SMOOTH_ALPHA * filtered_x
             )
 
         raw_error_px = self._smoothed_x - frame_center_x
-        effective_error_px = raw_error_px
 
         desired_dir = 0
         if raw_error_px < -DEADBAND_PX:
@@ -232,7 +214,7 @@ class HeadTracker:
         elif raw_error_px > DEADBAND_PX:
             desired_dir = -1
 
-        # Hysteresis — don't reverse direction on small oscillations.
+        # Reverse-direction hysteresis — stay put on small oscillations.
         if (
             self._last_command_dir != 0
             and desired_dir != 0
@@ -240,13 +222,18 @@ class HeadTracker:
             and abs(raw_error_px) < (DEADBAND_PX + REVERSE_HYSTERESIS_PX)
         ):
             desired_dir = 0
-            effective_error_px = 0.0
 
         if abs(raw_error_px) < DEADBAND_PX:
             desired_dir = 0
-            effective_error_px = 0.0
 
-        self._last_target_time = time.monotonic()
+        self._last_face_seen_at = time.monotonic()
+
+        if desired_dir == 0:
+            # Inside deadband — hold target at current position so the
+            # tick thread stops stepping.
+            self._target_tick = self.current_tick
+            self._error_ratio = 0.0
+            return
 
         edge_margin_px = frame_width * EDGE_MARGIN_RATIO
         left_x = edge_margin_px
@@ -254,38 +241,79 @@ class HeadTracker:
         mapped_x = min(max(self._smoothed_x, left_x), right_x)
 
         target_tick = float(
-            np.interp(mapped_x, [left_x, right_x], [HEAD_LEFT_TICK, HEAD_RIGHT_TICK])
+            np.interp(
+                mapped_x, [left_x, right_x], [HEAD_LEFT_TICK, HEAD_RIGHT_TICK]
+            )
         )
+        self._target_tick = _clamp_tick(target_tick)
+        self._error_ratio = abs(raw_error_px) / max(1.0, frame_center_x)
 
-        if desired_dir == 0:
-            target_tick = self.current_tick
+    # --- 30 Hz tick thread ---
 
-        target_tick = _clamp_tick(target_tick)
-        if desired_dir == 0:
-            # Inside deadband — hold position rather than drift.
-            return
-        # Jump straight to target; _send_tick step-walks the delta into
-        # firmware-legal 60-tick chunks. At 1-2 Hz vision frames there
-        # is no point spreading the move across N update cycles — the
-        # face may well have moved again by then.
-        self._send_tick(int(round(target_tick)))
+    def _tick_loop(self) -> None:
+        next_tick = time.monotonic()
+        while self._running:
+            next_tick += TICK_INTERVAL_SEC
+            self._do_tick()
+            sleep_for = next_tick - time.monotonic()
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            else:
+                # We fell behind — reset the schedule so drift doesn't
+                # compound into runaway sends.
+                next_tick = time.monotonic()
 
-    def _on_lost_locked(self) -> None:
-        now = time.monotonic()
-        if now - self._last_target_time < LOST_TARGET_TIMEOUT_SEC:
-            return
-        self._reset_tracking_state()
-        if self.current_tick < HEAD_OPTICAL_CENTER_TICK:
-            new_tick = min(
-                self.current_tick + RETURN_TO_CENTER_STEP, HEAD_OPTICAL_CENTER_TICK
+    def _do_tick(self) -> None:
+        with self._lock:
+            if not self._enabled:
+                return
+            if time.monotonic() < self._suspend_until:
+                return
+            delta = self._target_tick - self.current_tick
+            if delta == 0:
+                return
+            dynamic_max_step = min(
+                MAX_STEP_BASE + int(self._error_ratio * MAX_STEP_EXTRA),
+                MAX_STEP_CAP,
             )
-        elif self.current_tick > HEAD_OPTICAL_CENTER_TICK:
-            new_tick = max(
-                self.current_tick - RETURN_TO_CENTER_STEP, HEAD_OPTICAL_CENTER_TICK
-            )
-        else:
-            new_tick = self.current_tick
-        self._send_tick(new_tick)
+            if delta > dynamic_max_step:
+                step = dynamic_max_step
+            elif delta < -dynamic_max_step:
+                step = -dynamic_max_step
+            else:
+                step = int(delta)
+            new_tick = _clamp_tick(self.current_tick + step)
+            actual_step = new_tick - self.current_tick
+            if actual_step == 0:
+                return
+            if (
+                self._last_sent_tick is not None
+                and abs(new_tick - self._last_sent_tick) < MIN_SEND_DELTA
+            ):
+                return
+            # Firmware cap — our step is always ≤ MAX_STEP_CAP ≤ 60,
+            # so this is a safety check, not the common path.
+            if abs(actual_step) > HEAD_MAX_STEP_PER_CMD:
+                actual_step = (
+                    HEAD_MAX_STEP_PER_CMD
+                    if actual_step > 0
+                    else -HEAD_MAX_STEP_PER_CMD
+                )
+                new_tick = _clamp_tick(self.current_tick + actual_step)
+            self.current_tick = new_tick
+            if actual_step > 0:
+                self._last_command_dir = 1
+            elif actual_step < 0:
+                self._last_command_dir = -1
+            self._last_sent_tick = new_tick
+            self._last_send_monotonic = time.monotonic()
+
+        # Serial I/O OUTSIDE the lock — firmware ack is 10-50 ms and we
+        # don't want face-update callers to block on it.
+        try:
+            self._send(f"head step {actual_step}")
+        except Exception:
+            _log.debug("head step send failed", exc_info=True)
 
 
 def _clamp_tick(tick) -> int:
