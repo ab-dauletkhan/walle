@@ -628,11 +628,22 @@ class SpeechRouter(TranscriptEventListener):
         self._echo_suppress_until: float = 0
         self._wake_play_lock = threading.Lock()
         self._last_wake_play_time = 0.0
+        # Time-based cooldown set by the IntentRecognizer handler. When
+        # a direct-action intent ("move forward", "stop moving") fires,
+        # we don't want the same utterance to also reach the LLM — the
+        # text-exact-match `_handled_utterances` set mis-fired in the
+        # field (punctuation/whitespace drift between what the handler
+        # receives and what `on_line_completed` sees), so we pair it
+        # with a short cooldown.
+        self._intent_cooldown_until: float = 0.0
+
+    _INTENT_COOLDOWN = 2.0  # seconds: skip LLM routing after intent fires
 
     # -- Called by IntentRecognizer callback to mark a line as handled --
 
     def mark_handled(self, utterance: str) -> None:
         self._handled_utterances.add(utterance.strip())
+        self._intent_cooldown_until = time.time() + self._INTENT_COOLDOWN
 
     # -- TTS with echo suppression --
     #    Two layers:
@@ -1086,9 +1097,15 @@ class SpeechRouter(TranscriptEventListener):
         print(f"\r  🎙  {text}" + " " * max(0, self._last_text_length - len(text) - 6))
         self._last_text_length = 0
 
-        # Skip lines already handled by IntentRecognizer
+        # Skip lines already handled by IntentRecognizer. Try exact
+        # match first (fast path), then fall back to the time-based
+        # cooldown set by `mark_handled` for cases where punctuation
+        # or whitespace diverged between what the handler received
+        # and what `on_line_completed` sees (observed in the field).
         if text in self._handled_utterances:
             self._handled_utterances.discard(text)
+            return
+        if time.time() < self._intent_cooldown_until:
             return
 
         # --- State machine ---

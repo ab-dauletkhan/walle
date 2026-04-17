@@ -411,16 +411,24 @@ def build_default_robot_registry() -> RobotToolRegistry:
             HeadPanAction(
                 RobotToolSpec(
                     "head_pan",
-                    "Turn just the HEAD horizontally (body stays still). Use "
-                    "for: 'look left/right', 'turn your head', 'face the "
-                    "door', 'look at me'. Do NOT use `drive` for these — "
-                    "that spins the whole robot. position=0 is fully left, "
-                    "50 is centered, 100 is fully right.",
+                    "Turn ONLY the head horizontally. Body stays still. "
+                    "Use for 'look left/right', 'turn your head', 'face X'. "
+                    "Do NOT use `drive` — that spins the whole robot. "
+                    "REQUIRED: pick `position` from this mapping — "
+                    "'look left' → 0, 'look slightly left' → 25, "
+                    "'face forward' → 50, 'look slightly right' → 75, "
+                    "'look right' → 100. "
+                    "DO NOT default to 50 for left/right requests.",
                     {
                         "position": {
                             "type": "integer",
                             "minimum": 0,
                             "maximum": 100,
+                            "description": (
+                                "0 = fully LEFT, 25 = slight left, "
+                                "50 = CENTER/forward, 75 = slight right, "
+                                "100 = fully RIGHT."
+                            ),
                         }
                     },
                     ("position",),
