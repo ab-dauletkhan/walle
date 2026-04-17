@@ -112,12 +112,29 @@ fi
 # ---------- 2. Mimic3 TTS ----------
 echo "=== Checking Mimic3 TTS ==="
 if curl -sf "$MIMIC3_URL" >/dev/null 2>&1; then
-    echo "  Mimic3 TTS is running."
+    echo "  Existing Mimic3 detected — reusing."
 else
-    echo "  Mimic3 TTS not found at $MIMIC3_URL."
-    echo "  Start it manually: mimic3-server --port 59125"
-    echo "  Continuing without TTS (will use console fallback)..."
-    WALLE_ARGS="$WALLE_ARGS --no-tts"
+    if command -v mimic3-server >/dev/null 2>&1; then
+        echo "  Starting mimic3-server on $MIMIC3_URL..."
+        mimic3-server --port 59125 >/tmp/mimic3.log 2>&1 &
+        CHILD_PIDS+=($!)
+        for i in $(seq 1 30); do
+            if curl -sf "$MIMIC3_URL" >/dev/null 2>&1; then
+                echo "  Mimic3 ready."
+                break
+            fi
+            sleep 1
+        done
+        if ! curl -sf "$MIMIC3_URL" >/dev/null 2>&1; then
+            echo "  WARNING: Mimic3 failed to start within 30s. See /tmp/mimic3.log"
+            echo "  Continuing with console TTS fallback..."
+            WALLE_ARGS="$WALLE_ARGS --no-tts"
+        fi
+    else
+        echo "  mimic3-server not installed on PATH. Install it or pass --no-tts."
+        echo "  Continuing with console TTS fallback..."
+        WALLE_ARGS="$WALLE_ARGS --no-tts"
+    fi
 fi
 
 # ---------- 3. Python project environment ----------

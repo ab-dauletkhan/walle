@@ -248,6 +248,10 @@ class BaseTTSEngine(ABC):
     def __init__(self) -> None:
         self._tts_queue: queue.Queue[Optional[str]] = queue.Queue(maxsize=50)
         self._tts_busy = threading.Event()  # set while synthesising or playing
+        # Signalled by drain() so an in-flight _synthesize_and_play() can
+        # short-circuit between the HTTP round-trip and playback. Cleared
+        # on the next successful enqueue so the next turn starts fresh.
+        self._stop_event = threading.Event()
         self._tts_worker = threading.Thread(
             target=self._tts_worker_loop, daemon=True
         )
@@ -277,17 +281,44 @@ class BaseTTSEngine(ABC):
         text = text.strip()
         if not text:
             return
+        # Fresh sentence means the stop-event from a previous drain is stale.
+        self._stop_event.clear()
         self._tts_queue.put(text)
 
-    def wait_until_idle(self) -> None:
-        """Block until the queue is drained AND the last sentence finished playing."""
-        self._tts_queue.join()
-        # Guard against a tiny window where join() returns before busy clears.
-        while self._tts_busy.is_set():
-            time.sleep(0.01)
+    def wait_until_idle(
+        self,
+        poll: float = 0.05,
+        max_wait: float = 20.0,
+        stop_flag: Optional[threading.Event] = None,
+    ) -> None:
+        """Block until the queue is drained AND the last sentence finished playing.
+
+        Polls instead of `queue.join()` so a hung TTS worker (e.g. Mimic3 HTTP
+        stuck) cannot deadlock the LLM thread — the old `join()` waited for
+        `task_done()`, which never fires if the worker is blocked inside
+        `requests.get()`. After `max_wait` we forcibly drain and return.
+
+        `stop_flag` lets the caller bail out early (used by SpeechRouter to
+        honour a mid-TTS "stop" intent).
+        """
+        deadline = time.monotonic() + max_wait
+        while time.monotonic() < deadline:
+            if stop_flag is not None and stop_flag.is_set():
+                self.drain()
+                return
+            if self._tts_queue.empty() and not self._tts_busy.is_set():
+                return
+            time.sleep(poll)
+        print(
+            "  ... TTS wait_until_idle timeout — draining to unblock pipeline",
+            file=sys.stderr,
+        )
+        self.drain()
 
     def drain(self) -> None:
-        """Drop any pending sentences (used on stop-intent)."""
+        """Drop any pending sentences and interrupt in-flight playback."""
+        # Signal the worker to skip playback if it's between HTTP and aplay.
+        self._stop_event.set()
         try:
             while True:
                 self._tts_queue.get_nowait()
@@ -325,11 +356,15 @@ class Mimic3TTSEngine(BaseTTSEngine):
         self._voice = voice
 
     def _synthesize_and_play(self, text: str) -> None:
+        # Early-out if a drain() has already been requested — avoids a slow
+        # HTTP round-trip whose audio we would throw away anyway.
+        if self._stop_event.is_set():
+            return
         try:
             resp = requests.get(
                 f"{self._url}/api/tts",
                 params={"text": text, "voice": self._voice},
-                timeout=30,
+                timeout=8,  # lower than 30s so a hung Mimic3 can't stall the pipeline
             )
             if resp.status_code != 200:
                 print(f"  TTS error: HTTP {resp.status_code}", file=sys.stderr)
@@ -350,6 +385,9 @@ class Mimic3TTSEngine(BaseTTSEngine):
             except Exception as e:
                 print(f"  TTS error: corrupt audio data: {e}", file=sys.stderr)
                 return
+            # Second checkpoint: drain() may have fired while HTTP was in flight.
+            if self._stop_event.is_set():
+                return
             _play_audio_stable(audio, sr)
         except requests.exceptions.ConnectionError:
             print(
@@ -357,6 +395,11 @@ class Mimic3TTSEngine(BaseTTSEngine):
                 file=sys.stderr,
             )
             print(f"  [TTS-fallback] {text}")
+        except requests.exceptions.Timeout:
+            print(
+                f"  TTS error: Mimic3 HTTP timeout at {self._url} — skipping sentence",
+                file=sys.stderr,
+            )
         except Exception as e:
             print(f"  TTS error: {e} — falling back to console", file=sys.stderr)
             print(f"  [TTS-fallback] {text}")
@@ -421,9 +464,20 @@ class SpeechRouter(TranscriptEventListener):
             20  # Rolling window to prevent unbounded memory growth
         )
         self._processing = False
-        self._stop_requested = False
+        # `_stop_requested` is a threading.Event rather than a plain bool so
+        # it can be passed straight into `BaseTTSEngine.wait_until_idle` to
+        # short-circuit the polling loop the instant a "stop" intent fires.
+        self._stop_requested = threading.Event()
         self._speaking = False
         self._last_text_length = 0
+
+        # Unified mic-gate, ported from box/pipeline_mem/g4-e2b-boxy_streaming.py.
+        # `_audio_active` is set for the full LLM+TTS span so callbacks can
+        # drop transcripts in one consistent check. `_mic_gate_until` adds a
+        # post-turn time cooldown that absorbs speaker echo still in the
+        # PortAudio buffer after TTS stops.
+        self._audio_active = threading.Event()
+        self._mic_gate_until: float = 0.0
 
         self._state = self.IDLE
         self._command_text = ""
@@ -461,10 +515,11 @@ class SpeechRouter(TranscriptEventListener):
     #    2) _is_echo() checks word overlap against last spoken text (content-based)
     #    Together they reliably filter self-heard audio on slow STT pipelines.
 
-    _ECHO_COOLDOWN = 0.05  # hard mic-mute after TTS; keep tight so follow-up feels instant
+    _ECHO_COOLDOWN = 0.25  # hard mic-mute after TTS; covers PortAudio buffer flush on Jetson
     _ECHO_WINDOW = (
-        0.8  # seconds after TTS to keep content-based echo filtering
+        1.5  # seconds after TTS to keep content-based echo filtering
     )
+    _POST_TURN_GATE = 0.5  # time-based mic gate after a full LLM+TTS turn ends
     _WAKE_DEBOUNCE_SECONDS = 1.5
 
     _INITIAL_LISTEN_WINDOW = 10.0  # seconds to start speaking after wake / after TTS
@@ -479,8 +534,23 @@ class SpeechRouter(TranscriptEventListener):
         """
         return max(self._INITIAL_LISTEN_WINDOW, self._ECHO_WINDOW + 1)
 
+    def _is_gated(self) -> bool:
+        """Single source of truth for 'should we ignore this mic transcript?'.
+
+        Replaces the old (_processing or _speaking or echo-window) triad so
+        there is no race window where flags are half-set. Mirrors box's
+        `audio_tracker.active.is_set() or time.time() < mic_gate_until`.
+        """
+        return self._audio_active.is_set() or time.time() < self._mic_gate_until
+
     def _pause_mic(self) -> None:
-        """Hard-gate the mic: stop audio capture so TTS can't self-echo."""
+        """Legacy no-op: kept for API compatibility.
+
+        Previously tore down the PortAudio input stream via `self._mic.stop()`.
+        That was heavy, slow, and anything buffered before the stop leaked into
+        the next callback as "user speech". We now gate transcripts via
+        `_is_gated()` instead and leave the stream running.
+        """
         if self._mic_pause_cb is None:
             return
         try:
@@ -723,6 +793,13 @@ class SpeechRouter(TranscriptEventListener):
                 print(f"  ... ignoring filler '{command}'")
                 return
         if command:
+            # Gate the mic BEFORE spawning the thread — otherwise Moonshine's
+            # partial/final callbacks can fire in the scheduling gap between
+            # `Thread.start()` and the thread body setting `_processing=True`,
+            # producing a false second LLM turn on top of the first.
+            self._processing = True
+            self._stop_requested.clear()
+            self._audio_active.set()
             threading.Thread(
                 target=self._handle_llm_query,
                 args=(command,),
@@ -738,7 +815,7 @@ class SpeechRouter(TranscriptEventListener):
     def _request_stop(self) -> None:
         """Signal the active LLM/TTS turn to bail out as soon as possible."""
         print("  ✋ stop heard — interrupting.")
-        self._stop_requested = True
+        self._stop_requested.set()
         try:
             self._tts.drain()
         except Exception:
@@ -750,7 +827,7 @@ class SpeechRouter(TranscriptEventListener):
         self._last_text_length = 0
 
     def on_line_text_changed(self, event):
-        if self._processing or self._speaking or self._is_echo(event.line.text):
+        if self._is_gated() or self._is_echo(event.line.text):
             return
         text = event.line.text
         if self._state == self.LISTENING:
@@ -779,9 +856,10 @@ class SpeechRouter(TranscriptEventListener):
         # Suppress self-heard TTS and any stray transcripts while a turn
         # is in flight (LLM streaming + TTS + cooldown). Intents still fire
         # via IntentRecognizer, which is registered separately.
-        if self._processing or self._speaking or self._is_echo(text):
-            # Allow a literal stop-intent to still interrupt
-            if self._processing and self._is_stop_intent(text):
+        if self._is_gated() or self._is_echo(text):
+            # Allow a literal stop-intent to still interrupt — this is the
+            # only intentional barge-in channel.
+            if self._audio_active.is_set() and self._is_stop_intent(text):
                 self._request_stop()
             return
 
@@ -821,15 +899,12 @@ class SpeechRouter(TranscriptEventListener):
     # -- LLM query on background thread --
 
     def _handle_llm_query(self, text: str) -> None:
-        self._processing = True
-        self._stop_requested = False
+        # `_processing` and `_audio_active` were set by `_on_timeout` before
+        # this thread was spawned, so callbacks are already gated. We just
+        # need to keep them gated through the whole LLM+TTS span and clear
+        # on exit.
         speaking_started = False
         full_response = ""
-        # Gate the mic for the entire LLM+TTS phase, not just once the
-        # first sentence is ready to speak. Ollama and onnxruntime both
-        # saturate the Jetson's CPU during generation; leaving Moonshine
-        # streaming in parallel causes PortAudio ring buffer overflows.
-        self._pause_mic()
         try:
             self._conversation.append({"role": "user", "content": text})
 
@@ -839,7 +914,7 @@ class SpeechRouter(TranscriptEventListener):
             buf = ""
             full_chunks: list[str] = []
             for chunk in self._llm.stream_chat(self._conversation):
-                if self._stop_requested:
+                if self._stop_requested.is_set():
                     break
                 print(chunk, end="", flush=True)
                 full_chunks.append(chunk)
@@ -863,7 +938,7 @@ class SpeechRouter(TranscriptEventListener):
             print()
             # Flush the tail (any trailing text without a final punctuation).
             tail = buf.strip()
-            if tail and not self._stop_requested:
+            if tail and not self._stop_requested.is_set():
                 if not speaking_started:
                     self._begin_speaking()
                     speaking_started = True
@@ -878,21 +953,25 @@ class SpeechRouter(TranscriptEventListener):
                     -self._max_conversation_length :
                 ]
 
-            if self._stop_requested:
+            if self._stop_requested.is_set():
                 self._tts.drain()
             elif speaking_started:
-                self._tts.wait_until_idle()
+                # Pass our stop flag so a mid-sentence "stop" utterance that
+                # fires in the callback while we're waiting is honoured
+                # promptly instead of after the current sentence finishes.
+                self._tts.wait_until_idle(stop_flag=self._stop_requested)
         except Exception as e:
             print(f"\n  ... LLM error: {e}", file=sys.stderr)
         finally:
             if speaking_started:
                 self._end_speaking(full_response)
-            else:
-                # No TTS happened (empty/error response) — still need to
-                # un-gate the mic we paused at the top of this method.
-                self._resume_mic()
+            # Post-turn time cooldown — mirrors box's 500 ms mic_gate_until
+            # after each LLM response. Absorbs any speaker echo still in
+            # PortAudio's buffer after TTS playback stops.
+            self._mic_gate_until = time.time() + self._POST_TURN_GATE
+            self._audio_active.clear()
             self._processing = False
-            self._stop_requested = False
+            self._stop_requested.clear()
             self._state = self.LISTENING
             self._command_text = ""
             self._last_stable_text = ""
@@ -1006,8 +1085,12 @@ class VoiceAssistant:
             listen_timeout_long=listen_timeout_long,
             max_utterance=max_utterance,
             wake_sounds_dir=wake_sounds_dir,
-            mic_pause=self._mic.stop,
-            mic_resume=self._mic.start,
+            # Intentionally NOT passing mic_pause/mic_resume. Previously we
+            # called self._mic.stop()/start() each turn to gate the mic, which
+            # tore down the PortAudio input stream and leaked buffered audio
+            # into the next callback. We now gate transcripts via
+            # SpeechRouter._is_gated() and leave the stream running — same
+            # pattern box uses for its `audio_tracker.active` gate.
         )
 
         # -- Register robot intents --
