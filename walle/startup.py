@@ -352,8 +352,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--mic-blocksize",
         type=int,
-        default=2048,
-        help="PortAudio blocksize in samples (default: 2048)",
+        default=8192,
+        help="PortAudio blocksize in samples (default: 8192 = 512 ms @ 16 kHz)",
     )
     parser.add_argument(
         "--speaker-device",
@@ -390,7 +390,7 @@ def apply_runtime_overrides(args):
         conf.USE_SEMANTIC_SEARCH = True
         conf.VISION_FPS = 1
         if not getattr(args, "_explicit_stt_model", False):
-            args.stt_model = "tiny-streaming"
+            args.stt_model = "small-streaming"
         _log.info(
             "Jetson mode: model=%s, embedding=%s, fps=%s, stt=%s",
             conf.OLLAMA_MODEL,

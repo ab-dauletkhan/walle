@@ -1051,7 +1051,7 @@ class VoiceAssistant:
         wake_sounds_dir: Optional[str] = None,
         mic_device: Optional[int] = None,
         mic_channels: int = 1,
-        mic_blocksize: int = 2048,
+        mic_blocksize: int = 8192,
         system_prompt: str = (
             "You are a helpful voice assistant running on a Jetson-powered robot. "
             "Keep responses to 1-3 sentences — they will be spoken aloud via TTS."
@@ -1079,9 +1079,10 @@ class VoiceAssistant:
 
         mv = _moonshine()
         if stt_model_arch is None:
-            # Tiny is the realtime-safe default on Jetson CPU; medium causes
-            # input-overflow because ONNX inference lags the audio stream.
-            stt_model_arch = mv.ModelArch.TINY_STREAMING
+            # Small-streaming is the accuracy/CPU sweet spot on Jetson once
+            # blocksize is 8192+. Tiny mishears short utterances; medium
+            # still lags the audio stream and causes input-overflow.
+            stt_model_arch = mv.ModelArch.SMALL_STREAMING
 
         # -- STT model --
         print("Loading STT model...", file=sys.stderr)
@@ -1311,9 +1312,10 @@ def parse_args():
     p.add_argument(
         "--mic-blocksize",
         type=int,
-        default=2048,
-        help="PortAudio blocksize in samples (default: 2048 = 128 ms @ 16 kHz). "
-             "Raise to 4096 if you still see 'MicTranscriber: input overflow'.",
+        default=8192,
+        help="PortAudio blocksize in samples (default: 8192 = 512 ms @ 16 kHz). "
+             "Larger blocks reduce callback pressure when LLM+TTS+STT share CPU. "
+             "Drop to 4096 if endpointing feels laggy.",
     )
     p.add_argument(
         "--intent-threshold",
