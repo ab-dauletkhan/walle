@@ -306,10 +306,22 @@ class BaseTTSEngine(ABC):
             if item is None:
                 self._tts_queue.task_done()
                 break
+            t0 = time.monotonic()
             try:
                 self._tts_busy.set()
+                _log.debug("tts: synth+play start %r", item)
                 self._synthesize_and_play(item)
+                _log.info(
+                    "tts: synth+play done in %.2fs (%r)",
+                    time.monotonic() - t0,
+                    item[:60],
+                )
             except Exception as e:  # pragma: no cover - engine-specific
+                _log.exception(
+                    "tts: synth+play failed after %.2fs: %s",
+                    time.monotonic() - t0,
+                    e,
+                )
                 print(f"  TTS worker error: {e}", file=sys.stderr)
             finally:
                 self._tts_busy.clear()
@@ -675,6 +687,10 @@ class SpeechRouter(TranscriptEventListener):
         """
         self._dispatcher_ref = dispatcher
 
+    def attach_mic(self, mic) -> None:
+        """Late-binding hook so the heartbeat can report mic liveness."""
+        self._mic_ref = mic
+
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.wait(self._HEARTBEAT_INTERVAL_SEC):
             try:
@@ -693,14 +709,24 @@ class SpeechRouter(TranscriptEventListener):
         dispatcher = self._dispatcher_ref
         qdepth_hwm = -1
         dropped = 0
+        audio_events = -1
         if dispatcher is not None:
             stats = getattr(dispatcher, "stats", None)
             if stats is not None:
                 qdepth_hwm = getattr(stats, "queue_depth_hwm", -1)
                 dropped = getattr(stats, "dropped_partial", 0)
+                audio_events = getattr(stats, "audio_thread_events", -1)
+        mic_running = "?"
+        mic = getattr(self, "_mic_ref", None)
+        if mic is not None:
+            try:
+                mic_running = str(mic.is_running())
+            except Exception:
+                mic_running = "err"
         _log.info(
             "router heartbeat: state=%s gated=%s processing=%s tts_busy=%s "
-            "last_partial=%s qdepth_hwm=%d dropped_partials=%d",
+            "last_partial=%s qdepth_hwm=%d dropped_partials=%d "
+            "audio_events=%d mic_running=%s",
             self._state,
             self._is_gated(),
             self._processing,
@@ -708,6 +734,8 @@ class SpeechRouter(TranscriptEventListener):
             partial_age,
             qdepth_hwm,
             dropped,
+            audio_events,
+            mic_running,
         )
 
     # -- Called by IntentRecognizer callback to mark a line as handled --
@@ -1515,6 +1543,7 @@ class VoiceAssistant:
             logger=logging.getLogger("walle.voice.dispatcher"),
         )
         self._router.attach_dispatcher(self._dispatcher)
+        self._router.attach_mic(self._mic)
         self._mic.add_listener(self._dispatcher)
 
     def _make_intent_handler(self, action: str):
@@ -1567,18 +1596,35 @@ class VoiceAssistant:
         print(f"{'=' * 60}", file=sys.stderr)
         print("  Press Ctrl+C to stop.\n", file=sys.stderr)
 
-        self._mic.start()
+        # Wrap mic.start() so a silent PortAudio failure (e.g. input
+        # device unavailable while vision is running) surfaces instead
+        # of just leaving the transcript pipeline dead forever.
+        _log.info("mic.start(): opening audio input stream")
+        try:
+            self._mic.start()
+        except Exception as e:
+            _log.exception("mic.start() failed: %s — STT will not work", e)
+        else:
+            running = None
+            try:
+                running = self._mic.is_running()
+            except Exception:
+                pass
+            _log.info("mic.start() returned (is_running=%s)", running)
         # Spoken "ready" cue — the robot runs headless so the operator
         # has no terminal/log to confirm startup finished. Non-fatal if
         # TTS isn't connected (ConsoleTTSEngine just prints it).
         ready_text = "At your command."
+        _log.info("tts.speak(): enqueuing ready announcement %r", ready_text)
         try:
             self._tts.speak(ready_text)
             # PortAudio delivers the speaker tail back to the mic for
             # ~500 ms after `speak()` returns. Arm the router's echo
             # filter so that tail isn't transcribed as a user command.
             self._router.prime_echo_guard(ready_text)
+            _log.info("tts.speak(): ready announcement completed")
         except Exception as e:
+            _log.exception("tts.speak() failed: %s", e)
             print(f"  ... ready announcement skipped: {e}", file=sys.stderr)
         try:
             while True:

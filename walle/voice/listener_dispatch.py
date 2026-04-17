@@ -68,6 +68,10 @@ class DispatcherStats:
         self.queue_depth_hwm = 0
         self.dropped_partial = 0
         self.forced_drop = 0
+        # Total events received on the audio thread. Used by the router
+        # heartbeat to distinguish "mic is silent" (counter stays 0) from
+        # "mic is alive but gated" (counter climbs).
+        self.audio_thread_events = 0
         self._methods: dict[tuple[str, str], _MethodStats] = {}
 
     def observe_depth(self, depth: int) -> None:
@@ -162,7 +166,18 @@ class ListenerDispatcher(TranscriptEventListener):
 
     # -- TranscriptEventListener callbacks (run on moonshine's audio thread) --
 
+    def _note_audio_event(self, kind: str) -> None:
+        self.stats.audio_thread_events += 1
+        if self.stats.audio_thread_events == 1:
+            # First event ever — confirms Moonshine's audio thread is alive.
+            # Logged once; after that the heartbeat shows the counter.
+            self._log.info(
+                "dispatcher: first audio-thread event received (kind=%s)",
+                kind,
+            )
+
     def on_line_started(self, event):
+        self._note_audio_event(_LINE_STARTED)
         self._enqueue(_LINE_STARTED, event)
 
     def on_line_text_changed(self, event):
@@ -178,9 +193,11 @@ class ListenerDispatcher(TranscriptEventListener):
                         self._on_stop_intent()
             except Exception:  # never let the fast lane kill audio
                 self._log.exception("stop-intent fast lane failed")
+        self._note_audio_event(_LINE_TEXT_CHANGED)
         self._enqueue(_LINE_TEXT_CHANGED, event)
 
     def on_line_completed(self, event):
+        self._note_audio_event(_LINE_COMPLETED)
         self._enqueue(_LINE_COMPLETED, event)
 
     # -- Producer side --

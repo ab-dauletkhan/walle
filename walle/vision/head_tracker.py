@@ -348,7 +348,11 @@ class HeadTracker:
         try:
             self._send(f"head tick {new_tick}")
         except Exception:
-            _log.debug("head tick send failed", exc_info=True)
+            # Upgraded from DEBUG to WARNING: "servo not moving" bugs
+            # were silent because individual write failures only logged
+            # at DEBUG and the INFO heartbeat summary ("N sends in last
+            # 5s") counts attempts, not successes.
+            _log.warning("head tick send failed (tick=%d)", new_tick, exc_info=True)
 
 
 def _clamp_tick(tick) -> int:
