@@ -637,6 +637,15 @@ class SpeechRouter(TranscriptEventListener):
         # with a short cooldown.
         self._intent_cooldown_until: float = 0.0
 
+        # Counts consecutive partial transcripts (within one Moonshine
+        # "line") that matched the stop intent. Under TTS load Moonshine
+        # occasionally hallucinates the single word "stop" for one frame
+        # of audio while the LLM's own reply is still streaming — firing
+        # the stop on the very first match self-interrupts the response.
+        # We require two consecutive confirming partials before
+        # signalling `_request_stop`.
+        self._partial_stop_hits: int = 0
+
     _INTENT_COOLDOWN = 2.0  # seconds: skip LLM routing after intent fires
 
     # -- Called by IntentRecognizer callback to mark a line as handled --
@@ -851,6 +860,27 @@ class SpeechRouter(TranscriptEventListener):
 
         threading.Thread(target=_play, daemon=True).start()
 
+    def announce(self, text: str) -> bool:
+        """Speak a short proactive line (e.g. face greeting) without
+        stepping on an in-flight conversation turn.
+
+        Returns True if the utterance was enqueued to TTS, False if a
+        turn is currently in flight and the announcement was skipped.
+
+        Arms the echo guard BEFORE enqueue so a mic callback that fires
+        in the brief gap before `_tts_busy` is set still drops the echo.
+        """
+        if not text or not text.strip():
+            return False
+        if self._is_gated() or self._processing:
+            return False
+        self.prime_echo_guard(text)
+        try:
+            self._tts.enqueue(text)
+        except Exception:
+            return False
+        return True
+
     def prime_echo_guard(self, spoken_text: str) -> None:
         """Seed the echo filter and mic gate for a non-LLM TTS utterance.
 
@@ -879,6 +909,13 @@ class SpeechRouter(TranscriptEventListener):
         window. A >70% word overlap with the last TTS text is a strong
         signal it's self-echo regardless of when it arrives, so we hold
         `_echo_words` until the next turn overwrites it.
+
+        Threshold tightened to 0.8: at 0.7 a drifted Moonshine transcript of
+        a long TTS sentence could share ~75% of its tokens with the echo set
+        (e.g. "Then I dial assist accordingly." matched the LLM's "If it's
+        related to a directional move like before… I'll assist accordingly.").
+        Short legitimate replies (1-3 tokens) rarely overlap the LLM's full
+        reply set at ≥0.8.
         """
         if not self._echo_words:
             return False
@@ -886,7 +923,7 @@ class SpeechRouter(TranscriptEventListener):
         if not words:
             return False
         overlap = len(words & self._echo_words) / len(words)
-        return overlap > 0.7
+        return overlap > 0.8
 
     # -- Wake word detection --
 
@@ -1037,7 +1074,14 @@ class SpeechRouter(TranscriptEventListener):
         return False
 
     def _request_stop(self) -> None:
-        """Signal the active LLM/TTS turn to bail out as soon as possible."""
+        """Signal the active LLM/TTS turn to bail out as soon as possible.
+
+        Idempotent: returns silently if a stop is already in flight. Partial
+        transcripts for the same utterance would otherwise print
+        "✋ stop heard" 2-3 times in a row as Moonshine re-emits refinements.
+        """
+        if self._stop_requested.is_set():
+            return
         print("  ✋ stop heard — interrupting.")
         self._stop_requested.set()
         try:
@@ -1049,6 +1093,7 @@ class SpeechRouter(TranscriptEventListener):
 
     def on_line_started(self, event):
         self._last_text_length = 0
+        self._partial_stop_hits = 0
 
     def on_line_text_changed(self, event):
         text = event.line.text
@@ -1056,9 +1101,19 @@ class SpeechRouter(TranscriptEventListener):
         # Moonshine often doesn't finalize a line while TTS is playing,
         # so `on_line_completed` never fires — the stop intent would
         # only be seen AFTER the response finished, which is too late.
+        #
+        # But require two consecutive partials that match stop-intent
+        # before firing: a single-frame "stop" hallucination while the
+        # LLM is mid-reply otherwise self-interrupts. Two consecutive
+        # partials within one Moonshine line mean the word was stable
+        # across endpointing refinements — a real utterance.
         if self._audio_active.is_set() and self._is_stop_intent(text):
-            self._request_stop()
-            return
+            self._partial_stop_hits += 1
+            if self._partial_stop_hits >= 2:
+                self._request_stop()
+                return
+        else:
+            self._partial_stop_hits = 0
         if self._is_gated() or self._is_echo(text):
             return
         if self._state == self.LISTENING:
@@ -1269,7 +1324,7 @@ class VoiceAssistant:
         wake_sounds_dir: Optional[str] = None,
         mic_device: Optional[int] = None,
         mic_channels: int = 1,
-        mic_blocksize: int = 8192,
+        mic_blocksize: int = 16384,
         system_prompt: str = (
             "You are a helpful voice assistant running on a Jetson-powered robot. "
             "Keep responses to 1-3 sentences — they will be spoken aloud via TTS."
@@ -1298,7 +1353,7 @@ class VoiceAssistant:
         mv = _moonshine()
         if stt_model_arch is None:
             # Small-streaming is the accuracy/CPU sweet spot on Jetson once
-            # blocksize is 8192+. Tiny mishears short utterances; medium
+            # blocksize is 16384. Tiny mishears short utterances; medium
             # still lags the audio stream and causes input-overflow.
             stt_model_arch = mv.ModelArch.SMALL_STREAMING
 
@@ -1548,10 +1603,10 @@ def parse_args():
     p.add_argument(
         "--mic-blocksize",
         type=int,
-        default=8192,
-        help="PortAudio blocksize in samples (default: 8192 = 512 ms @ 16 kHz). "
+        default=16384,
+        help="PortAudio blocksize in samples (default: 16384 = 1024 ms @ 16 kHz). "
              "Larger blocks reduce callback pressure when LLM+TTS+STT share CPU. "
-             "Drop to 4096 if endpointing feels laggy.",
+             "Drop to 8192 if endpointing feels laggy.",
     )
     p.add_argument(
         "--intent-threshold",

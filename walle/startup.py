@@ -385,8 +385,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--mic-blocksize",
         type=int,
-        default=8192,
-        help="PortAudio blocksize in samples (default: 8192 = 512 ms @ 16 kHz)",
+        default=16384,
+        help="PortAudio blocksize in samples (default: 16384 = 1024 ms @ 16 kHz)",
     )
     parser.add_argument(
         "--speaker-device",
@@ -757,6 +757,22 @@ def _run_voice_mode(orchestrator, robot_exec, args, lifecycle: LifecycleManager)
         mic_blocksize=args.mic_blocksize,
         system_prompt="WALL-E voice mode active.",
     )
+
+    # Proactive face greeting: when the vision service recognizes a
+    # known person reappearing, speak a short greeting through the same
+    # TTS + echo-guard path the rest of the voice loop uses. Gated so
+    # it never interrupts a conversation turn.
+    vision = getattr(orchestrator, "vision_service", None)
+    if vision is not None:
+        router = assistant._router
+
+        def _greet_face(name: str) -> None:
+            phrase = f"Hey {name}, I can see you."
+            announced = router.announce(phrase)
+            if announced:
+                _log.info("Vision greeting: %s", phrase)
+
+        vision.set_face_callback(_greet_face)
 
     try:
         assistant.run()

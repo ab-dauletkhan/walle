@@ -11,7 +11,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 from vision.camera_source import open_camera_source
@@ -369,6 +369,16 @@ class VisionService:
     _STALE_FRAME_TIMEOUT_SEC = 5.0
     _FIRST_FRAME_TIMEOUT_SEC = 3.0
 
+    # Face greeter parameters. The vision loop runs at VISION_FPS (1-2 Hz),
+    # so a known face will be reported on consecutive frames. Greeting on
+    # every frame would spam the speaker. Instead:
+    #   - MIN_GREET_INTERVAL: no more than one greeting per ~this-many sec
+    #     across ALL names
+    #   - REAPPEAR_SEC: a specific name only re-greets after it has been
+    #     absent for this long (the person stepped out of frame, returned)
+    _FACE_MIN_GREET_INTERVAL_SEC = 12.0
+    _FACE_REAPPEAR_SEC = 45.0
+
     def __init__(
         self, context_manager: ContextManager, camera_index: int = 0, fps: int = 2
     ):
@@ -388,8 +398,23 @@ class VisionService:
         self._last_error: Optional[str] = None
         self._last_frame_at: Optional[datetime] = None
 
+        # Face greeter state (wired by set_face_callback()).
+        self._on_known_face: Optional[Callable[[str], None]] = None
+        self._face_last_seen: Dict[str, float] = {}
+        self._face_last_greeted: Dict[str, float] = {}
+        self._greeter_last_fire: float = 0.0
+
         # Auto-detect backend
         self._backend = self._create_backend()
+
+    def set_face_callback(self, callback: Optional[Callable[[str], None]]) -> None:
+        """Register a callback fired once per known face reappearance.
+
+        The callback receives the recognized person's name and is invoked
+        from the vision thread. Implementations must return quickly
+        (enqueue the greeting to TTS rather than block on synthesis).
+        """
+        self._on_known_face = callback
 
     @property
     def is_active(self) -> bool:
@@ -513,6 +538,56 @@ class VisionService:
     _BACKOFF_BASE = 0.5  # seconds, doubles each consecutive error
     _BACKOFF_MAX = 30.0  # cap
 
+    def _maybe_greet(self, faces: List[Dict]) -> None:
+        """Fire the face-greet callback for any known face that just reappeared.
+
+        Rules:
+          1. Ignore Unknown / missing-name entries.
+          2. A specific name is greetable only if it has been absent for
+             at least `_FACE_REAPPEAR_SEC` — prevents re-greeting the same
+             person every frame while they stand in front of the camera.
+          3. Across all names, enforce `_FACE_MIN_GREET_INTERVAL_SEC` so
+             a crowd of known faces in one frame doesn't turn into a wall
+             of greetings.
+        All state updates are done under no lock — the vision thread is
+        the single writer.
+        """
+        if self._on_known_face is None or not faces:
+            return
+        now = time.time()
+        for face in faces:
+            name = (face or {}).get("name")
+            if not name or name == "Unknown":
+                continue
+            last_seen = self._face_last_seen.get(name, 0.0)
+            last_greeted = self._face_last_greeted.get(name, 0.0)
+            # Update "last seen" so a person standing in front of the
+            # camera continuously resets the absence timer — we only
+            # re-greet once they've gone away and come back.
+            gap_since_seen = now - last_seen
+            self._face_last_seen[name] = now
+
+            # First time ever? Or absent long enough to count as a
+            # fresh appearance?
+            fresh_appearance = (
+                last_greeted == 0.0
+                or gap_since_seen >= self._FACE_REAPPEAR_SEC
+            )
+            if not fresh_appearance:
+                continue
+            if now - self._greeter_last_fire < self._FACE_MIN_GREET_INTERVAL_SEC:
+                continue
+
+            self._face_last_greeted[name] = now
+            self._greeter_last_fire = now
+            try:
+                self._on_known_face(name)
+            except Exception:
+                _log.exception("Face greeter callback failed for %s", name)
+            # Fire at most one greeting per frame — keeps output sane
+            # when multiple known faces are in view.
+            return
+
     def _loop(self) -> None:
         """Background loop: capture frame -> detect faces -> update context."""
         consecutive_errors = 0
@@ -545,6 +620,7 @@ class VisionService:
                     timestamp=datetime.now(),
                 )
                 self._context_manager.update_visual(visual)
+                self._maybe_greet(faces)
                 consecutive_errors = 0  # reset on success
             except Exception as e:
                 consecutive_errors += 1
