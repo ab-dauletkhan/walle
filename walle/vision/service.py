@@ -151,6 +151,8 @@ class SubprocessCoralVisionBackend(VisionBackend):
     def __init__(self):
         self._worker = CoralWorkerClient(timeout_ms=conf.VISION_CORAL_WORKER_TIMEOUT_MS)
         self._restarts = 0
+        self._detector_input_w: Optional[int] = None
+        self._detector_input_h: Optional[int] = None
         try:
             self._health_check()
         except Exception as exc:
@@ -181,6 +183,29 @@ class SubprocessCoralVisionBackend(VisionBackend):
         self._worker.close()
         self._worker = CoralWorkerClient(timeout_ms=conf.VISION_CORAL_WORKER_TIMEOUT_MS)
         self._restarts += 1
+        # input-size cache invalidated on restart; detect_only callers
+        # will re-fetch via detector_input_size() on next use.
+        self._detector_input_w = None
+        self._detector_input_h = None
+
+    @property
+    def worker(self) -> CoralWorkerClient:
+        """Shared Coral worker client. FastFaceTracker sends its
+        detect_only ops through this same client so the Edge TPU stays
+        single-owner (the TPU rejects concurrent processes)."""
+        return self._worker
+
+    def detector_input_size(self) -> tuple[int, int]:
+        """Query and cache the worker's detector input size (W, H)."""
+        if (
+            self._detector_input_w is not None
+            and self._detector_input_h is not None
+        ):
+            return self._detector_input_w, self._detector_input_h
+        resp = self._worker.request({"op": "info"})
+        self._detector_input_w = int(resp["input_w"])
+        self._detector_input_h = int(resp["input_h"])
+        return self._detector_input_w, self._detector_input_h
 
     def process_frame(self, frame: np.ndarray) -> List[Dict]:
         import cv2
@@ -460,6 +485,10 @@ class VisionService:
             return False
         age = (datetime.now() - self._last_frame_at).total_seconds()
         return age < max(self._STALE_FRAME_TIMEOUT_SEC, self._target_interval * 4)
+
+    @property
+    def backend(self) -> Optional[VisionBackend]:
+        return self._backend
 
     @property
     def backend_name(self) -> str:

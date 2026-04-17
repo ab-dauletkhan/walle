@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -74,6 +75,12 @@ class CoralWorkerClient:
             )
 
         self._timeout = timeout_ms / 1000.0
+        # The Edge TPU is a single-process resource, so only ONE worker
+        # runs. Recognition (SubprocessCoralVisionBackend) and fast face
+        # tracking (FastFaceTracker) both send ops through this client,
+        # on different threads — the lock serializes their requests so
+        # stdin/stdout framing doesn't interleave.
+        self._lock = threading.Lock()
         self._proc = subprocess.Popen(
             [coral_python, "-m", "vision.face_recognition.coral_worker", "serve"],
             cwd=str(REPO_ROOT),
@@ -86,32 +93,33 @@ class CoralWorkerClient:
         )
 
     def request(self, payload: dict) -> dict:
-        if self._proc.stdin is None or self._proc.stdout is None:
-            raise RuntimeError("Coral worker pipes are unavailable.")
-        if self._proc.poll() is not None:
-            stderr = ""
-            if self._proc.stderr is not None:
-                stderr = self._proc.stderr.read().strip()
-            raise RuntimeError(
-                f"Coral worker exited with code {self._proc.returncode}. {stderr}".strip()
-            )
+        with self._lock:
+            if self._proc.stdin is None or self._proc.stdout is None:
+                raise RuntimeError("Coral worker pipes are unavailable.")
+            if self._proc.poll() is not None:
+                stderr = ""
+                if self._proc.stderr is not None:
+                    stderr = self._proc.stderr.read().strip()
+                raise RuntimeError(
+                    f"Coral worker exited with code {self._proc.returncode}. {stderr}".strip()
+                )
 
-        self._proc.stdin.write(json.dumps(payload) + "\n")
-        self._proc.stdin.flush()
+            self._proc.stdin.write(json.dumps(payload) + "\n")
+            self._proc.stdin.flush()
 
-        line = self._proc.stdout.readline()
-        if not line:
-            stderr = ""
-            if self._proc.stderr is not None:
-                stderr = self._proc.stderr.read().strip()
-            raise RuntimeError(
-                f"Coral worker stopped without responding. {stderr}".strip()
-            )
+            line = self._proc.stdout.readline()
+            if not line:
+                stderr = ""
+                if self._proc.stderr is not None:
+                    stderr = self._proc.stderr.read().strip()
+                raise RuntimeError(
+                    f"Coral worker stopped without responding. {stderr}".strip()
+                )
 
-        response = json.loads(line)
-        if not response.get("ok", False):
-            raise RuntimeError(response.get("error", "Unknown Coral worker error"))
-        return response
+            response = json.loads(line)
+            if not response.get("ok", False):
+                raise RuntimeError(response.get("error", "Unknown Coral worker error"))
+            return response
 
     def close(self) -> None:
         if self._proc.poll() is not None:

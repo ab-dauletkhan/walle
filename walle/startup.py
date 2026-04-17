@@ -39,6 +39,7 @@ from walle.vision.fast_tracker import FastFaceTracker
 from walle.vision.head_tracker import HeadTracker
 from walle.vision.service import (
     CaptureImageExecutor,
+    SubprocessCoralVisionBackend,
     VisionService,
     get_capture_image_tools,
 )
@@ -204,12 +205,18 @@ def attach_vision(
     vision.start()
     lifecycle.register("vision", vision.stop)
 
-    # Start the dedicated 30 FPS detect-only face tracker so the head
-    # servo follows at standalone-script speed. The recognition path in
-    # VisionService stays at its slower rate for context/greeter.
-    if tracker is not None:
+    # Start the dedicated 30 FPS detect-only face tracker on the SAME
+    # Coral worker that VisionService already uses — the Edge TPU is a
+    # single-process resource, so we multiplex detect_only and
+    # detect_recognize ops through one subprocess (the worker client's
+    # lock serializes them).
+    backend = vision.backend
+    if tracker is not None and isinstance(backend, SubprocessCoralVisionBackend):
         try:
-            fast_tracker = FastFaceTracker(vision, tracker)
+            input_w, input_h = backend.detector_input_size()
+            fast_tracker = FastFaceTracker(
+                vision, tracker, backend.worker, input_w, input_h
+            )
             fast_tracker.start()
             lifecycle.register("fast-face-tracker", fast_tracker.stop)
             _log.info("FastFaceTracker attached (30 FPS detection path)")
@@ -218,6 +225,12 @@ def attach_vision(
                 "Failed to start FastFaceTracker; head tracking falls back to "
                 "the recognition-path rate"
             )
+    elif tracker is not None:
+        _log.info(
+            "FastFaceTracker not applicable for backend %s; head tracking "
+            "uses the recognition-path rate",
+            type(backend).__name__ if backend is not None else "none",
+        )
     return vision
 
 
