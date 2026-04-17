@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import threading
 import time
 from typing import Optional
 
@@ -54,16 +53,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--list-devices", action="store_true",
                    help="Print PortAudio device table and exit")
     p.add_argument("--probe-level", action="store_true",
-                   help="Also open a raw sounddevice stream on the same device "
-                        "and print peak RMS every 0.5s so you can confirm audio "
-                        "frames are actually flowing")
+                   help="Before starting Moonshine, open a raw sounddevice "
+                        "stream on the same device for a few seconds and "
+                        "print peak RMS, to confirm audio frames are flowing. "
+                        "Runs sequentially (not in parallel) because USB Audio "
+                        "Class devices reject concurrent opens.")
+    p.add_argument("--probe-seconds", type=float, default=3.0,
+                   help="How long --probe-level samples audio before closing "
+                        "and handing the device to Moonshine.")
     return p
 
 
-def _start_level_probe(device: Optional[int], channels: int, rate: int,
-                       stop_event: threading.Event, start_ts: float) -> threading.Thread:
-    """Parallel RMS meter. Tells us if PortAudio is delivering audio at all,
-    independent of whether Moonshine parses it into text."""
+def _run_level_probe(device: Optional[int], channels: int, rate: int,
+                     duration_s: float, start_ts: float) -> None:
+    """Sequential RMS meter. Must run BEFORE MicTranscriber — USB Audio
+    Class devices only permit one open at a time, so a parallel probe
+    would collide with Moonshine and fail with PortAudioError -9985.
+    """
     import numpy as np  # noqa: PLC0415
     import sounddevice as sd  # noqa: PLC0415
 
@@ -72,30 +78,37 @@ def _start_level_probe(device: Optional[int], channels: int, rate: int,
     def cb(indata, frames, time_info, status):  # noqa: ARG001
         if status:
             _log(start_ts, f"[level-probe] status: {status}")
-        mono = np.mean(indata.astype(np.float32), axis=1) if indata.ndim > 1 else indata.astype(np.float32)
+        mono = (
+            np.mean(indata.astype(np.float32), axis=1)
+            if indata.ndim > 1
+            else indata.astype(np.float32)
+        )
         peak = float(np.max(np.abs(mono))) if mono.size else 0.0
         rms = float(np.sqrt(np.mean(np.square(mono)))) if mono.size else 0.0
         stats["peak"] = max(stats["peak"], peak)
         stats["rms"] = max(stats["rms"], rms)
         stats["blocks"] += 1
 
-    def run():
-        try:
-            with sd.InputStream(samplerate=rate, channels=channels, device=device,
-                                blocksize=2048, dtype="float32", callback=cb):
-                while not stop_event.is_set():
-                    stop_event.wait(0.5)
-                    _log(start_ts,
-                         f"[level-probe] blocks={stats['blocks']} "
-                         f"peak={stats['peak']:.3f} rms={stats['rms']:.3f}")
-                    stats["peak"] = 0.0
-                    stats["rms"] = 0.0
-        except Exception as e:
-            _log(start_ts, f"[level-probe] FAILED: {e!r}")
-
-    t = threading.Thread(target=run, name="level-probe", daemon=True)
-    t.start()
-    return t
+    _log(start_ts, f"[level-probe] opening device (rate={rate}, ch={channels}) …")
+    try:
+        with sd.InputStream(samplerate=rate, channels=channels, device=device,
+                            blocksize=2048, dtype="float32", callback=cb):
+            deadline = time.monotonic() + duration_s
+            while time.monotonic() < deadline:
+                time.sleep(0.5)
+                _log(start_ts,
+                     f"[level-probe] blocks={stats['blocks']} "
+                     f"peak={stats['peak']:.3f} rms={stats['rms']:.3f}")
+    except Exception as e:
+        _log(start_ts, f"[level-probe] FAILED to open device: {e!r}")
+        return
+    _log(start_ts,
+         f"[level-probe] done. max peak={stats['peak']:.3f} max rms={stats['rms']:.3f}")
+    if stats["peak"] < 0.01:
+        _log(start_ts,
+             "[level-probe] ⚠ near-silent input — "
+             "PortAudio is probably routed to a dead source. "
+             "Try a different --device.")
 
 
 def _log(start_ts: float, msg: str) -> None:
@@ -164,15 +177,15 @@ def main() -> int:
     mic.add_listener(EchoListener())
     print("Listener attached.", flush=True)
 
-    stop_event = threading.Event()
-    level_thread = None
     if args.probe_level:
-        level_thread = _start_level_probe(
-            mic_device, args.channels, 16000, stop_event, start_ts
-        )
+        print(f"\n--- pre-probe ({args.probe_seconds:.1f}s, speak now) ---",
+              flush=True)
+        _run_level_probe(mic_device, args.channels, 16000,
+                         args.probe_seconds, start_ts)
 
     print(f"\n{'=' * 60}", flush=True)
-    print(f"Speak now. Listening for {args.seconds:.0f} s.", flush=True)
+    print(f"Speak now. Listening for {args.seconds:.0f} s via Moonshine.",
+          flush=True)
     print(f"{'=' * 60}\n", flush=True)
 
     _log(start_ts, "calling mic.start() …")
@@ -191,13 +204,10 @@ def main() -> int:
              f"completed={counters['completed']}")
 
     _log(start_ts, "stopping …")
-    stop_event.set()
     try:
         mic.stop()
     except Exception as e:
         _log(start_ts, f"mic.stop() raised: {e!r}")
-    if level_thread is not None:
-        level_thread.join(timeout=2.0)
 
     print(f"\n{'=' * 60}", flush=True)
     print(f"Summary: started={counters['started']} partials={counters['changed']} "
