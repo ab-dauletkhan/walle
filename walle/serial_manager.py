@@ -93,6 +93,32 @@ class SerialManager:
             results.append(self._send_line(line))
         return "; ".join(results)
 
+    def send_write_only(self, cmd: str) -> None:
+        """Write one line without waiting for any firmware reply.
+
+        Used by high-frequency callers like the vision head tracker
+        (30 Hz): waiting for the ack round-trip (10-50 ms each) would
+        cap the effective send rate at ~15 Hz and make the servo feel
+        sluggish. The firmware still processes the command — we just
+        don't block the caller for the response.
+
+        Returns silently in simulation mode. Thread-safe.
+        """
+        line = cmd.strip()
+        if not line:
+            return
+        with self._lock:
+            if self._simulation:
+                _log.debug("SIM (wo) >> %s", line)
+                return
+            if not (self._conn and self._conn.is_open):
+                return
+            try:
+                self._conn.write(f"{line}\n".encode())
+                self._conn.flush()
+            except Exception as exc:
+                _log.debug("send_write_only '%s' failed: %s", line, exc)
+
     def send_raw(self, cmd: str, timeout: Optional[float] = None) -> List[str]:
         """Send one command and return the full reply as a list of lines.
 

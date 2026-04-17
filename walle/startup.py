@@ -189,7 +189,11 @@ def attach_vision(
         and not getattr(serial_manager, "simulation", True)
     ):
         try:
-            tracker = HeadTracker(send_command=serial_manager.send_command)
+            # Bind the tracker to the write-only serial path. The 30 Hz
+            # tick loop must not block on firmware ack round-trips —
+            # doing so caps effective send rate and makes the servo
+            # visibly lag behind the face.
+            tracker = HeadTracker(send_command=serial_manager.send_write_only)
             vision.set_head_tracker(tracker)
             _log.info("Head tracker attached to vision service")
         except Exception:
