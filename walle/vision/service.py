@@ -7,11 +7,14 @@ Supports two backends: Google Coral TPU (preferred) and CPU (YOLOv8 + InsightFac
 import base64
 import logging
 import os
+import re
 import threading
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
+
+_LOC_RE = re.compile(r"\((-?\d+),\s*(-?\d+)\)-\((-?\d+),\s*(-?\d+)\)")
 
 import numpy as np
 from vision.camera_source import open_camera_source
@@ -404,6 +407,13 @@ class VisionService:
         self._face_last_greeted: Dict[str, float] = {}
         self._greeter_last_fire: float = 0.0
 
+        # Head tracker: optional HeadTracker instance driven by face
+        # bounding boxes (wired by set_head_tracker()).
+        self._head_tracker = None
+        # Frame width is needed to feed the tracker — captured from the
+        # most recent camera frame.
+        self._last_frame_width: int = 0
+
         # Diagnostic log throttling — at VISION_FPS we'd otherwise emit
         # one line per frame (60-120 log lines/min). Throttle the
         # per-frame summary so operators can still see what the camera
@@ -413,6 +423,15 @@ class VisionService:
 
         # Auto-detect backend
         self._backend = self._create_backend()
+
+    def set_head_tracker(self, head_tracker) -> None:
+        """Attach a HeadTracker; its update_from_face/on_no_face methods
+        are called from the vision thread on each processed frame."""
+        self._head_tracker = head_tracker
+
+    @property
+    def head_tracker(self):
+        return self._head_tracker
 
     def set_face_callback(self, callback: Optional[Callable[[str], None]]) -> None:
         """Register a callback fired once per known face reappearance.
@@ -527,6 +546,11 @@ class VisionService:
             self._camera_source = None
         if self._backend is not None:
             self._backend.close()
+        if self._head_tracker is not None:
+            try:
+                self._head_tracker.close()
+            except Exception:
+                _log.debug("head_tracker.close failed", exc_info=True)
         self._ready = False
         _log.info("Stopped")
 
@@ -539,6 +563,11 @@ class VisionService:
         with self._frame_lock:
             self._latest_frame = frame.copy()
         self._last_frame_at = datetime.now()
+        # frame.shape is (h, w, c); capture width for the head tracker.
+        try:
+            self._last_frame_width = int(frame.shape[1])
+        except Exception:
+            pass
 
     # Error backoff parameters
     _MAX_CONSECUTIVE_ERRORS = 5
@@ -578,6 +607,40 @@ class VisionService:
         if now - self._last_frame_log_at >= 10.0:
             _log.debug("faces (still): %s", signature)
             self._last_frame_log_at = now
+
+    def _drive_head_tracker(self, faces: List[Dict]) -> None:
+        """Feed the strongest detected face into the head tracker so the
+        neck servo follows it.  When no face is present, call on_no_face()
+        so the tracker can drift back to center.
+        """
+        tracker = self._head_tracker
+        if tracker is None:
+            return
+        frame_width = self._last_frame_width
+        if frame_width <= 0:
+            return
+
+        best_center: Optional[float] = None
+        best_conf = -1.0
+        for face in faces or []:
+            conf = float(face.get("confidence") or 0.0)
+            if conf <= best_conf:
+                continue
+            loc = face.get("location") or ""
+            m = _LOC_RE.search(loc)
+            if not m:
+                continue
+            x1, y1, x2, y2 = (int(v) for v in m.groups())
+            best_center = (x1 + x2) / 2.0
+            best_conf = conf
+
+        try:
+            if best_center is None:
+                tracker.on_no_face()
+            else:
+                tracker.update_from_face(best_center, frame_width)
+        except Exception:
+            _log.exception("head tracker update failed")
 
     def _maybe_greet(self, faces: List[Dict]) -> None:
         """Fire the face-greet callback for any known face that just reappeared.
@@ -670,6 +733,7 @@ class VisionService:
                 self._context_manager.update_visual(visual)
                 self._log_frame_faces(faces)
                 self._maybe_greet(faces)
+                self._drive_head_tracker(faces)
                 consecutive_errors = 0  # reset on success
             except Exception as e:
                 consecutive_errors += 1

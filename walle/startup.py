@@ -35,6 +35,7 @@ from walle.tools.registry import (
     ToolSuiteFacade,
 )
 from walle.tools.robot.executor import RobotControlExecutor, get_robot_control_tools
+from walle.vision.head_tracker import HeadTracker
 from walle.vision.service import (
     CaptureImageExecutor,
     VisionService,
@@ -162,8 +163,16 @@ def build_app(args) -> tuple:
     return orchestrator, lifecycle, context_manager, serial_mgr, robot_exec
 
 
-def attach_vision(orchestrator, context_manager, lifecycle, args, vision_fps: int = 2):
-    """Optionally create and attach VisionService."""
+def attach_vision(
+    orchestrator,
+    context_manager,
+    lifecycle,
+    args,
+    vision_fps: int = 2,
+    serial_manager=None,
+):
+    """Optionally create and attach VisionService, plus a HeadTracker when
+    a SerialManager is available so the neck servo can follow the face."""
     if args.no_vision:
         return None
     vision = VisionService(context_manager, camera_index=args.camera, fps=vision_fps)
@@ -174,6 +183,17 @@ def attach_vision(orchestrator, context_manager, lifecycle, args, vision_fps: in
             get_capture_image_tools, capture_exec, request_heartbeat_after=True
         )
     )
+    if (
+        serial_manager is not None
+        and getattr(args, "head_tracking", True)
+        and not getattr(serial_manager, "simulation", True)
+    ):
+        try:
+            tracker = HeadTracker(send_command=serial_manager.send_command)
+            vision.set_head_tracker(tracker)
+            _log.info("Head tracker attached to vision service")
+        except Exception:
+            _log.exception("Failed to initialise HeadTracker; continuing without it")
     vision.start()
     lifecycle.register("vision", vision.stop)
     return vision
@@ -278,6 +298,13 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--no-vision", action="store_true", help="Disable vision processing"
+    )
+    parser.add_argument(
+        "--no-head-tracking",
+        dest="head_tracking",
+        action="store_false",
+        default=True,
+        help="Disable vision-driven head servo tracking (greeter still fires).",
     )
     parser.add_argument(
         "--camera", type=int, default=0, help="Camera index (default 0)"
@@ -496,7 +523,12 @@ def main():
     # Vision
     _log.info("[3/7] Setting up vision...")
     vision = attach_vision(
-        orchestrator, context_manager, lifecycle, args, conf.VISION_FPS
+        orchestrator,
+        context_manager,
+        lifecycle,
+        args,
+        conf.VISION_FPS,
+        serial_manager=serial_mgr,
     )
     if vision is not None:
         status_lines.append(
