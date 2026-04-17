@@ -669,8 +669,15 @@ class SpeechRouter(TranscriptEventListener):
         Replaces the old (_processing or _speaking or echo-window) triad so
         there is no race window where flags are half-set. Mirrors box's
         `audio_tracker.active.is_set() or time.time() < mic_gate_until`.
+
+        Also checks TTS `_tts_busy` so non-LLM TTS (startup "At your
+        command." announcement, wake sounds) can't be echoed back into
+        the transcript pipeline and fire intents.
         """
-        return self._audio_active.is_set() or time.time() < self._mic_gate_until
+        if self._audio_active.is_set() or time.time() < self._mic_gate_until:
+            return True
+        tts_busy = getattr(getattr(self._tts, "_tts_busy", None), "is_set", None)
+        return bool(tts_busy and tts_busy())
 
     def _pause_mic(self) -> None:
         """Legacy no-op: kept for API compatibility.
@@ -1187,11 +1194,16 @@ class SpeechRouter(TranscriptEventListener):
 # Layer 4: Voice Assistant (Orchestrator)
 # ─────────────────────────────────────────────────────────────
 
+# Wake-word-free direct-action intents. Kept intentionally small: any
+# entry here must be semantically distinct from phrases the LLM will
+# handle differently. "turn left/right" was removed because it semantic-
+# matched "look left/right" — which is a head pan, not a body spin —
+# and fired drive(left) instead of routing through the LLM's head_pan
+# tool. For body rotation the user can still say "hey, turn left" and
+# the LLM will pick the right tool.
 ROBOT_INTENTS = {
     "move forward": "forward",
     "move backward": "backward",
-    "turn left": "left",
-    "turn right": "right",
     "stop moving": "stop",
 }
 
@@ -1311,11 +1323,17 @@ class VoiceAssistant:
     def _make_intent_handler(self, action: str):
         """Create a closure that handles a matched intent.
 
+        Drops the match when the router is gated (TTS busy or post-turn
+        cooldown) — otherwise Piper's output echoes back, gets semantic-
+        matched to an intent, and the robot executes its own speech.
+
         If the utterance is actually the wake word, let the SpeechRouter
         handle it instead of executing a robot command.
         """
 
         def handler(trigger: str, utterance: str, similarity: float):
+            if self._router._is_gated():
+                return
             if self._router._detect_wake(utterance) is not None:
                 return
             self._router.mark_handled(utterance)
