@@ -745,6 +745,32 @@ class SpeechRouter(TranscriptEventListener):
         "ah", "er", "eh", "yeah", "yep", "the", "a",
     }
 
+    def _play_ready_beep(self) -> None:
+        """Short sine-wave chime signalling 'mic is open, your turn'.
+
+        Played at the end of a turn (including after a 'stop' interrupt)
+        before the follow-up LISTENING window opens. Without this cue the
+        user has no way to tell whether WALL-E is genuinely waiting or has
+        gone deaf — especially painful after 'stop', where the abrupt
+        silence is otherwise ambiguous.
+
+        Fires while `_mic_gate_until` is still active, so the chime itself
+        cannot self-echo into the next transcript.
+        """
+        try:
+            sr = 22050
+            duration_s = 0.12
+            n = int(sr * duration_s)
+            t = np.arange(n, dtype=np.float32) / sr
+            tone = (0.25 * np.sin(2 * np.pi * 660 * t)).astype(np.float32)
+            fade = min(int(sr * 0.01), n // 2)
+            if fade:
+                tone[:fade] *= np.linspace(0.0, 1.0, fade, dtype=np.float32)
+                tone[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+            _play_audio_stable(tone, sr, blocking=False)
+        except Exception as e:  # pragma: no cover — cosmetic cue only
+            print(f"  ... ready beep skipped: {e}", file=sys.stderr)
+
     def _play_wake_sound(self, initial_command: str = "") -> None:
         """Play a random WAV from wake_sounds_dir (non-blocking).
 
@@ -1094,6 +1120,9 @@ class SpeechRouter(TranscriptEventListener):
             # after each LLM response. Absorbs any speaker echo still in
             # PortAudio's buffer after TTS playback stops.
             self._mic_gate_until = time.time() + self._POST_TURN_GATE
+            # Audible cue that the follow-up window is open. Fires inside
+            # the gate so it can't self-echo into the next transcript.
+            self._play_ready_beep()
             self._audio_active.clear()
             self._processing = False
             self._stop_requested.clear()
