@@ -862,10 +862,18 @@ class SpeechRouter(TranscriptEventListener):
 
     def announce(self, text: str) -> bool:
         """Speak a short proactive line (e.g. face greeting) without
-        stepping on an in-flight conversation turn.
+        stepping on an in-flight conversation turn OR on the user's
+        listen window.
 
-        Returns True if the utterance was enqueued to TTS, False if a
-        turn is currently in flight and the announcement was skipped.
+        Returns True if the utterance was enqueued to TTS, False when
+        skipped.
+
+        Skipped when:
+          - a turn is already being processed (LLM+TTS span active),
+          - TTS is busy / mic is gated,
+          - the state machine is LISTENING (user was asked "Yes, how
+            can I help you?" and is mid-utterance). Barging in there
+            corrupts the user's command with the greeting's echo.
 
         Arms the echo guard BEFORE enqueue so a mic callback that fires
         in the brief gap before `_tts_busy` is set still drops the echo.
@@ -873,6 +881,8 @@ class SpeechRouter(TranscriptEventListener):
         if not text or not text.strip():
             return False
         if self._is_gated() or self._processing:
+            return False
+        if self._state != self.IDLE:
             return False
         self.prime_echo_guard(text)
         try:

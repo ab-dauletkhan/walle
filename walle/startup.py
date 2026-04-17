@@ -812,6 +812,12 @@ def _run_voice_mode(orchestrator, robot_exec, args, lifecycle: LifecycleManager)
                     reason_parts.append("turn in flight")
                 elif router._is_gated():
                     reason_parts.append("mic gated / TTS busy")
+                elif getattr(router, "_state", None) != getattr(
+                    router, "IDLE", "idle"
+                ):
+                    reason_parts.append(
+                        f"user mid-command (state={router._state})"
+                    )
                 else:
                     reason_parts.append("unknown skip")
                 _log.info(
