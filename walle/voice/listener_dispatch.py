@@ -132,6 +132,7 @@ class ListenerDispatcher(TranscriptEventListener):
         stop_intent_fn: Optional[Callable[[str], bool]] = None,
         stop_active_fn: Optional[Callable[[], bool]] = None,
         on_stop_intent: Optional[Callable[[], None]] = None,
+        should_dispatch_fn: Optional[Callable[[object, str, object], bool]] = None,
         logger: Optional[logging.Logger] = None,
     ):
         super().__init__()
@@ -140,6 +141,14 @@ class ListenerDispatcher(TranscriptEventListener):
         self._stop_intent_fn = stop_intent_fn
         self._stop_active_fn = stop_active_fn
         self._on_stop_intent = on_stop_intent
+        # Optional pre-dispatch filter. Called per (listener, event.kind,
+        # payload); return False to skip that listener for that event.
+        # Used to avoid running the embedder-backed IntentRecognizer on
+        # TTS echo / mid-turn noise — the cheap string-equality gate is
+        # orders of magnitude faster than the 500-2900 ms similarity
+        # search, which was starving Moonshine's audio thread and
+        # producing PortAudio input-overflows.
+        self._should_dispatch_fn = should_dispatch_fn
         self._log = logger or logging.getLogger("walle.voice.dispatcher")
 
         self._deque: deque[_Event] = deque()
@@ -265,6 +274,14 @@ class ListenerDispatcher(TranscriptEventListener):
                 method = getattr(listener, f"on_{event.kind}", None)
                 if method is None:
                     continue
+                if self._should_dispatch_fn is not None:
+                    try:
+                        if not self._should_dispatch_fn(
+                            listener, event.kind, event.payload
+                        ):
+                            continue
+                    except Exception:
+                        self._log.exception("should_dispatch_fn raised; delivering anyway")
                 listener_name = type(listener).__name__
                 t0 = time.perf_counter()
                 try:

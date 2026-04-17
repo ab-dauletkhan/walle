@@ -1549,12 +1549,31 @@ class VoiceAssistant:
         # `_handled_utterances` depends on.
         from walle.voice.listener_dispatch import ListenerDispatcher
 
+        intent_recognizer_ref = self._intent_recognizer
+        router_ref = self._router
+
+        def _should_dispatch(listener, kind, _payload) -> bool:
+            # The embedding-backed intent matcher takes 500-2900 ms per
+            # completed line on Jetson. Running it while a turn is in
+            # flight (LLM streaming + TTS playback + echo cooldown) only
+            # matches TTS bleed — which is then discarded by the
+            # handler's own `_is_gated()` check — but the CPU cost
+            # starves Moonshine's audio thread and causes PortAudio
+            # input-overflow. Short-circuit here so the consumer stays
+            # responsive. SpeechRouter still gets every event because
+            # its handlers are cheap.
+            if listener is intent_recognizer_ref and kind == "line_completed":
+                if router_ref._is_gated() or router_ref._processing:
+                    return False
+            return True
+
         self._dispatcher = ListenerDispatcher(
             listeners=[self._intent_recognizer, self._router],
             queue_size=32,
             stop_intent_fn=self._router._is_stop_intent,
             stop_active_fn=self._router._audio_active.is_set,
             on_stop_intent=self._router._request_stop,
+            should_dispatch_fn=_should_dispatch,
             logger=logging.getLogger("walle.voice.dispatcher"),
         )
         self._router.attach_dispatcher(self._dispatcher)
