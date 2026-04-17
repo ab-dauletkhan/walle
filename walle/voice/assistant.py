@@ -696,6 +696,11 @@ class SpeechRouter(TranscriptEventListener):
             print(f"  ... mic resume error: {e}", file=sys.stderr)
 
     _SENTENCE_ENDS = ".?!\n"
+    # Clause-break streaming: once the LLM has buffered this many chars
+    # without a sentence-ender, flush at the first comma/semicolon past
+    # `_MIN_CHUNK_CHARS` so the user hears audio sooner.
+    _CLAUSE_FLUSH_CHARS = 80
+    _MIN_CHUNK_CHARS = 40
 
     def _begin_speaking(self) -> None:
         """Enter speaking state: gate mic so TTS can't self-echo."""
@@ -964,8 +969,26 @@ class SpeechRouter(TranscriptEventListener):
             print("  ... no command heard, going back to sleep.")
 
     def _is_stop_intent(self, text: str) -> bool:
+        """Match any stop phrase anywhere in the utterance.
+
+        Exact-match was too strict — Moonshine often transcribes the
+        stop word with extras ("stop please", "wall-e stop now",
+        "okay stop"), which slipped past `normalized in _stop_phrases`
+        and let long TTS responses continue uninterrupted.
+        """
         normalized = self._strip_punctuation(text).lower().strip()
-        return normalized in self._stop_phrases
+        if not normalized:
+            return False
+        if normalized in self._stop_phrases:
+            return True
+        tokens = normalized.split()
+        # Leading-word match: "stop please", "cancel that", "quiet now"
+        if tokens and tokens[0] in {"stop", "cancel", "quiet"}:
+            return True
+        # Substring match for multi-word phrases like "wall-e stop".
+        return any(
+            phrase in normalized for phrase in self._stop_phrases if " " in phrase
+        )
 
     def _request_stop(self) -> None:
         """Signal the active LLM/TTS turn to bail out as soon as possible."""
@@ -982,9 +1005,16 @@ class SpeechRouter(TranscriptEventListener):
         self._last_text_length = 0
 
     def on_line_text_changed(self, event):
-        if self._is_gated() or self._is_echo(event.line.text):
-            return
         text = event.line.text
+        # Barge-in on partial transcripts too. Under heavy CPU load
+        # Moonshine often doesn't finalize a line while TTS is playing,
+        # so `on_line_completed` never fires — the stop intent would
+        # only be seen AFTER the response finished, which is too late.
+        if self._audio_active.is_set() and self._is_stop_intent(text):
+            self._request_stop()
+            return
+        if self._is_gated() or self._is_echo(text):
+            return
         if self._state == self.LISTENING:
             # Only reset the silence timer when the transcript actually GREW
             # with new content. Moonshine re-emits partial refinements even
@@ -1076,12 +1106,21 @@ class SpeechRouter(TranscriptEventListener):
                 buf += chunk
                 # Flush every completed sentence to the TTS worker so
                 # playback of sentence N overlaps with generation of N+1.
+                # For long clauses without a sentence-ender, also flush
+                # at the first comma/semicolon past ~40 chars — keeps
+                # time-to-first-audio low and avoids a ~500 ms synth
+                # stall at the start of a 150-char sentence.
                 while True:
                     idx = -1
                     for ender in self._SENTENCE_ENDS:
                         pos = buf.find(ender)
                         if pos != -1 and (idx == -1 or pos < idx):
                             idx = pos
+                    if idx < 0 and len(buf) >= self._CLAUSE_FLUSH_CHARS:
+                        for i in range(self._MIN_CHUNK_CHARS, len(buf)):
+                            if buf[i] in ",;:":
+                                idx = i
+                                break
                     if idx < 0:
                         break
                     sentence, buf = buf[: idx + 1].strip(), buf[idx + 1 :]
