@@ -206,6 +206,21 @@ class ListenerDispatcher(TranscriptEventListener):
         self._enqueue(_LINE_TEXT_CHANGED, event)
 
     def on_line_completed(self, event):
+        # Belt-and-suspenders stop fast lane. Primary path is the
+        # on_line_text_changed fast lane above, but under heavy CPU
+        # load (TTS + embedding + ONNX STT) PortAudio may drop every
+        # partial for a given line — Moonshine then only ships a
+        # single `on_line_completed`. Without this arm, "stop" said
+        # mid-TTS would silently miss its barge-in window and the user
+        # would have to wait for the whole response to finish.
+        if self._stop_intent_fn is not None and self._stop_active_fn is not None:
+            try:
+                text = getattr(getattr(event, "line", None), "text", "") or ""
+                if text and self._stop_active_fn() and self._stop_intent_fn(text):
+                    if self._on_stop_intent is not None:
+                        self._on_stop_intent()
+            except Exception:
+                self._log.exception("stop-intent fast lane (completed) failed")
         self._note_audio_event(_LINE_COMPLETED)
         self._enqueue(_LINE_COMPLETED, event)
 

@@ -1134,6 +1134,25 @@ class SpeechRouter(TranscriptEventListener):
         if self._processing:
             # Previous turn is still running; drop whatever accumulated.
             return
+        # If IntentRecognizer just fired a handler for this same
+        # utterance, skip the LLM entirely. `on_line_completed` already
+        # honours this gate, but the partial-fallback path above
+        # (`_last_partial_raw`) bypassed it — produced a phantom second
+        # tool call ("move forward" → drive handler → then LLM sees
+        # "Move forward." via the partial and calls drive a second time).
+        if command:
+            normalized = self._strip_punctuation(command).lower().strip()
+            normalized_handled = {
+                self._strip_punctuation(h).lower().strip()
+                for h in self._handled_utterances
+            }
+            if (
+                normalized in normalized_handled
+                or time.time() < self._intent_cooldown_until
+            ):
+                print(f"  ... '{command}' handled as intent — skipping LLM")
+                self._handled_utterances.clear()
+                return
         # Filter out Moonshine's filler-word hallucinations on silence/noise
         # without rejecting legitimate short follow-ups like "what?", "why?",
         # "okay", "stop", "yes", "no".
