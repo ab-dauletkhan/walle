@@ -10,14 +10,103 @@ cd "$PROJECT_ROOT"
 # ---------- Configuration ----------
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-qwen2.5:3b}"
+# Vision-describer model used by the `capture_image` LLM tool. Small and
+# fast on Jetson; pulled alongside the chat model so the capture_image
+# path doesn't silently 404 when the LLM decides to use it.
+OLLAMA_VISION_MODEL="${OLLAMA_VISION_MODEL:-moondream}"
 MIMIC3_URL="${MIMIC3_URL:-http://localhost:59125}"
 UV_EXTRAS="${UV_EXTRAS:---extra jetson}"
-WALLE_ARGS="${WALLE_ARGS:-}"
+# Use an array so device names containing spaces (e.g. "ReSpeaker 4 Mic
+# Array") survive expansion into the final `uv run walle ...` command.
+# Back-compat: if a caller passed WALLE_ARGS as a string, re-split it
+# with the shell's normal word rules.
+if [[ -n "${WALLE_ARGS:-}" ]]; then
+    # shellcheck disable=SC2206  # we want word-splitting here
+    WALLE_ARGS_LIST=( $WALLE_ARGS )
+else
+    WALLE_ARGS_LIST=()
+fi
 CORAL39_PY="${WALLE_CORAL_PYTHON39:-$PROJECT_ROOT/.venv-coral39/bin/python}"
+
+# Hardware defaults for this deployment — the physical WALL-E Jetson setup.
+# Each is overridable by exporting the env var or passing the flag
+# explicitly; we only inject the default when the user didn't. This is
+# what turns `bash scripts/start.sh` into the working voice pipeline
+# without forcing operators to remember the long incantation every time.
+DEFAULT_SERIAL_PORT="${WALLE_SERIAL_PORT:-/dev/ttyCH341USB0}"
+DEFAULT_MIC_DEVICE="${WALLE_MIC_DEVICE:-ReSpeaker 4 Mic Array}"
+DEFAULT_SPEAKER_DEVICE="${WALLE_SPEAKER_DEVICE:-UACDemoV1.0}"
+DEFAULT_SPEAKER_RATE="${WALLE_SPEAKER_RATE:-48000}"
+DEFAULT_SPEAKER_CHANNELS="${WALLE_SPEAKER_CHANNELS:-2}"
+
 # Quick mode: ./scripts/start.sh --llm-only  →  text REPL, no vision/tts
 if [[ " $* " == *" --llm-only "* ]]; then
-    WALLE_ARGS="$WALLE_ARGS --text-mode --no-vision --no-tts"
-    set -- $(echo "$@" | sed 's/--llm-only//')
+    WALLE_ARGS_LIST+=(--text-mode --no-vision --no-tts)
+    # Strip --llm-only from positional args without breaking quoting.
+    new_args=()
+    for a in "$@"; do
+        [[ "$a" == "--llm-only" ]] || new_args+=("$a")
+    done
+    set -- "${new_args[@]}"
+fi
+
+# The `--extra jetson` uv install implies this is a Jetson deployment;
+# pass --jetson to walle so the runtime overrides (model pin, FPS cap,
+# STT model, embedding device) actually apply. Skip if the operator is
+# already passing --jetson or opted into --no-jetson.
+_needs_jetson=1
+_needs_serial=1
+_needs_mic=1
+_needs_speaker=1
+_needs_speaker_rate=1
+_needs_speaker_channels=1
+_text_mode=0
+for a in "$@"; do
+    case "$a" in
+        --jetson|--jetson=*) _needs_jetson=0 ;;
+        --no-jetson) _needs_jetson=0 ;;
+        --serial-port|--serial-port=*) _needs_serial=0 ;;
+        --mic-device|--mic-device=*) _needs_mic=0 ;;
+        --speaker-device|--speaker-device=*) _needs_speaker=0 ;;
+        --speaker-rate|--speaker-rate=*) _needs_speaker_rate=0 ;;
+        --speaker-channels|--speaker-channels=*) _needs_speaker_channels=0 ;;
+        --text-mode) _text_mode=1 ;;
+    esac
+done
+# WALLE_ARGS_LIST entries count for flag-detection too.
+for a in "${WALLE_ARGS_LIST[@]}"; do
+    case "$a" in
+        --jetson|--jetson=*|--no-jetson) _needs_jetson=0 ;;
+        --serial-port|--serial-port=*) _needs_serial=0 ;;
+        --mic-device|--mic-device=*) _needs_mic=0 ;;
+        --speaker-device|--speaker-device=*) _needs_speaker=0 ;;
+        --speaker-rate|--speaker-rate=*) _needs_speaker_rate=0 ;;
+        --speaker-channels|--speaker-channels=*) _needs_speaker_channels=0 ;;
+        --text-mode) _text_mode=1 ;;
+    esac
+done
+
+if [[ "$_needs_jetson" == "1" ]]; then
+    WALLE_ARGS_LIST+=(--jetson)
+fi
+if [[ "$_text_mode" == "0" ]]; then
+    # Audio + serial defaults only apply to voice mode. Text mode has no
+    # mic/speaker and may be running on a workstation with no Arduino.
+    if [[ "$_needs_serial" == "1" && -e "$DEFAULT_SERIAL_PORT" ]]; then
+        WALLE_ARGS_LIST+=(--serial-port "$DEFAULT_SERIAL_PORT")
+    fi
+    if [[ "$_needs_mic" == "1" ]]; then
+        WALLE_ARGS_LIST+=(--mic-device "$DEFAULT_MIC_DEVICE")
+    fi
+    if [[ "$_needs_speaker" == "1" ]]; then
+        WALLE_ARGS_LIST+=(--speaker-device "$DEFAULT_SPEAKER_DEVICE")
+    fi
+    if [[ "$_needs_speaker_rate" == "1" ]]; then
+        WALLE_ARGS_LIST+=(--speaker-rate "$DEFAULT_SPEAKER_RATE")
+    fi
+    if [[ "$_needs_speaker_channels" == "1" ]]; then
+        WALLE_ARGS_LIST+=(--speaker-channels "$DEFAULT_SPEAKER_CHANNELS")
+    fi
 fi
 
 
@@ -84,12 +173,25 @@ if ! curl -sf "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
     exit 1
 fi
 
-# Check if model is pulled
+# Check if chat model is pulled
 if ollama list 2>/dev/null | grep -q "$OLLAMA_MODEL"; then
     echo "  Model '$OLLAMA_MODEL' available."
 else
     echo "  Model '$OLLAMA_MODEL' not found. Pulling..."
     ollama pull "$OLLAMA_MODEL"
+fi
+
+# Vision model for the capture_image tool. Pre-pull so the first time the
+# LLM decides to use capture_image it doesn't 404 against an unpulled
+# model and come back with "there was an issue capturing the image".
+if [[ -n "$OLLAMA_VISION_MODEL" ]]; then
+    if ollama list 2>/dev/null | grep -q "$OLLAMA_VISION_MODEL"; then
+        echo "  Vision model '$OLLAMA_VISION_MODEL' available."
+    else
+        echo "  Vision model '$OLLAMA_VISION_MODEL' not found. Pulling..."
+        ollama pull "$OLLAMA_VISION_MODEL" \
+            || echo "  WARNING: vision model pull failed — capture_image will degrade to face-recognition summary."
+    fi
 fi
 
 # Preload model onto GPU BEFORE walle's Python stack grabs RAM.
@@ -184,7 +286,8 @@ fi
 # ---------- 4. Launch WALL-E ----------
 echo ""
 echo "=== Launching WALL-E ==="
-echo "  Args: $WALLE_ARGS $*"
+echo "  Args:" "${WALLE_ARGS_LIST[@]}" "$@"
 echo ""
 
-uv run $UV_EXTRAS walle $WALLE_ARGS "$@"
+# shellcheck disable=SC2086  # UV_EXTRAS is intentionally word-split
+uv run $UV_EXTRAS walle "${WALLE_ARGS_LIST[@]}" "$@"

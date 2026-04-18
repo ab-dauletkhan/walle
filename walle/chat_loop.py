@@ -148,7 +148,14 @@ class LLMStreamer:
         Streams the response in real time, prints content as it arrives,
         and logs TTFT + tokens/sec in debug mode.
         """
-        debug = _log.isEnabledFor(logging.DEBUG)
+        # Voice mode runs setup_logging("test"), which keeps the root logger
+        # at DEBUG (so the file handler gets everything) but sets the console
+        # handler to INFO. _log.isEnabledFor(DEBUG) therefore returns True
+        # even in voice mode, and the raw `print(delta.content)` below would
+        # flood the operator's terminal with the same tokens the SpeechRouter
+        # is about to print word-by-word — the "duplicated output" that TTS
+        # never speaks. Gate on the explicit run mode instead.
+        debug = conf.RUN_MODE == "debug"
 
         if _DUMP_PROMPT:
             _dump_messages_debug(messages, tools)

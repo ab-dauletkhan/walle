@@ -881,7 +881,14 @@ def get_capture_image_tools() -> list:
 
 
 class CaptureImageExecutor:
-    """Handles the capture_image tool call: grabs a frame and describes it via a vision LLM."""
+    """Handles the capture_image tool call: grabs a frame and describes it via a vision LLM.
+
+    When the configured vision model isn't pulled (common failure mode on
+    Jetson if `ollama pull moondream` was skipped), we fall back to a
+    description synthesized from the already-running face-recognition
+    pipeline instead of returning an error string that the chat LLM
+    then paraphrases as "there was an issue capturing the image".
+    """
 
     def __init__(
         self,
@@ -892,6 +899,10 @@ class CaptureImageExecutor:
         self._vision_service = vision_service
         self._ollama_url = ollama_base_url
         self._vision_model = vision_model
+        # Tri-state: None = untested, True = present, False = confirmed missing.
+        # We cache a confirmed-missing result so repeated capture_image calls
+        # don't each round-trip Ollama just to rediscover the 404.
+        self._vision_model_available: Optional[bool] = None
 
     def execute(self, fn_name: str, args: dict) -> str:
         if fn_name != "capture_image":
@@ -910,10 +921,71 @@ class CaptureImageExecutor:
         }
         prompt = prompts.get(detail, prompts["general"])
 
+        if self._vision_model_available is False:
+            return self._fallback_description(detail)
+
         try:
             return self._describe_frame(frame, prompt)
         except Exception as e:
-            return f"Image capture failed: {e}"
+            # 404 / connection failure → cache and degrade for subsequent calls.
+            _log.warning(
+                "capture_image: vision LLM '%s' failed (%s); "
+                "falling back to face-recognition summary",
+                self._vision_model,
+                e,
+            )
+            self._vision_model_available = False
+            return self._fallback_description(detail)
+
+    def _fallback_description(self, detail: str) -> str:
+        """Describe the frame using face-recognition results only.
+
+        The VisionService is continuously populating ContextManager with
+        the latest detection set, so we already know how many people are
+        in frame and who they are (when matched). This is usually the
+        question the user was asking when they triggered capture_image
+        on a voice robot — "can you see me?", "who's here?" — so the
+        fallback is often just as useful as the moondream description.
+        """
+        visual = getattr(self._vision_service._context_manager, "visual", None)
+        faces: List[Dict] = []
+        if visual is not None:
+            faces = getattr(visual, "faces_detected", None) or []
+
+        if not faces:
+            return "I can see the camera feed, but there are no faces in view right now."
+
+        known = [f for f in faces if (f.get("name") or "Unknown") != "Unknown"]
+        unknown = [f for f in faces if (f.get("name") or "Unknown") == "Unknown"]
+
+        if detail == "objects":
+            # We don't run an object detector — be honest.
+            return (
+                "I only have a face-recognition model running, so I can't "
+                "list generic objects. "
+                + self._describe_people(known, unknown)
+            )
+
+        return self._describe_people(known, unknown)
+
+    @staticmethod
+    def _describe_people(known: List[Dict], unknown: List[Dict]) -> str:
+        parts: List[str] = []
+        if known:
+            names = sorted({(f.get("name") or "").strip() for f in known if f.get("name")})
+            if len(names) == 1:
+                parts.append(f"I can see {names[0]}.")
+            else:
+                parts.append("I can see " + ", ".join(names[:-1]) + f", and {names[-1]}.")
+        if unknown:
+            n = len(unknown)
+            if known:
+                parts.append(f"Plus {n} person I don't recognize." if n == 1
+                             else f"Plus {n} people I don't recognize.")
+            else:
+                parts.append(f"I can see {n} person I don't recognize." if n == 1
+                             else f"I can see {n} people, but I don't recognize any of them.")
+        return " ".join(parts) if parts else "I don't see anyone clearly right now."
 
     def _describe_frame(self, frame: np.ndarray, prompt: str) -> str:
         """Send frame to Ollama vision model for description."""
@@ -936,4 +1008,5 @@ class CaptureImageExecutor:
             timeout=30,
         )
         resp.raise_for_status()
+        self._vision_model_available = True
         return resp.json().get("response", "Could not describe the image.")

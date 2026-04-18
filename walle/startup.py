@@ -392,7 +392,24 @@ def parse_args(argv=None):
     )
 
     # Voice / STT
-    parser.add_argument("--wake-word", default="hey", help="Wake word phrase")
+    parser.add_argument(
+        "--wake-word",
+        default=(
+            "hey,hi,hello,okay,"
+            "walle,wall e,wall-e,wally,"
+            "robot,"
+            "whats up,what's up,sup,"
+            "yo"
+        ),
+        help=(
+            "Comma-separated wake phrases. Moonshine frequently substitutes "
+            "short single-phoneme wakes — it hears 'hey' as 'okay' / 'hi' / "
+            "'hello' on a substantial fraction of real utterances — so the "
+            "default accepts the common STT variants and a few casual "
+            "openers instead of gating on one fragile phrase. Pass a single "
+            "phrase (e.g. 'hey rocket') to override."
+        ),
+    )
     parser.add_argument(
         "--listen-timeout", type=float, default=3.0, help="Silence timeout (seconds)"
     )
@@ -407,6 +424,23 @@ def parse_args(argv=None):
         type=float,
         default=15.0,
         help="Hard upper bound on a single listen window in seconds",
+    )
+    parser.add_argument(
+        "--follow-up",
+        action="store_true",
+        default=False,
+        help=(
+            "After answering, keep listening for a short follow-up without "
+            "requiring the wake word again. Default: off. On a noisy robot "
+            "this reliably triggers phantom LLM turns on Moonshine "
+            "hallucinations — leave off unless you're in a quiet room."
+        ),
+    )
+    parser.add_argument(
+        "--follow-up-timeout",
+        type=float,
+        default=3.0,
+        help="Follow-up window in seconds when --follow-up is set (default 3.0).",
     )
     parser.add_argument("--language", default="en", help="STT language")
     parser.add_argument(
@@ -829,6 +863,8 @@ def _run_voice_mode(orchestrator, robot_exec, args, lifecycle: LifecycleManager)
         mic_device=args.mic_device,
         mic_channels=args.mic_channels,
         mic_blocksize=args.mic_blocksize,
+        follow_up=args.follow_up,
+        follow_up_timeout=args.follow_up_timeout,
         system_prompt="WALL-E voice mode active.",
     )
 
@@ -841,7 +877,12 @@ def _run_voice_mode(orchestrator, robot_exec, args, lifecycle: LifecycleManager)
         router = assistant._router
 
         def _greet_face(name: str) -> None:
-            phrase = f"Hey {name}, I can see you."
+            # Don't prefix with "Hey" / "Hi" / "Hello" — those are now wake
+            # phrases, and even with the echo filter at 0.8 overlap, a
+            # drifted Moonshine transcript of the greeting can false-wake
+            # the router ("Hi Dauletkhan can you see me" drifts to 67%
+            # overlap — below the filter — but starts with a wake word).
+            phrase = f"{name}, I see you."
             announced = router.announce(phrase)
             if announced:
                 _log.info("Vision greeting: %s", phrase)

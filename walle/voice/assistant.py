@@ -581,18 +581,41 @@ class SpeechRouter(TranscriptEventListener):
         wake_sounds_dir: Optional[str] = None,
         mic_pause: Optional[Callable[[], None]] = None,
         mic_resume: Optional[Callable[[], None]] = None,
+        follow_up: bool = False,
+        follow_up_timeout: float = 3.0,
     ):
         self._llm = llm
         self._tts = tts
         self._mic_pause_cb = mic_pause
         self._mic_resume_cb = mic_resume
         self._system_prompt = system_prompt
-        self._wake_word = wake_word.strip()
-        self._wake_tokens = set(re.sub(r"[^\w\s]", "", wake_word).lower().split())
+        # Accept a comma-separated list of wake phrases. Moonshine reliably
+        # substitutes short single-phoneme wakes — "hey" gets transcribed as
+        # "okay", "hi", "hello" on a substantial fraction of real utterances
+        # — so a single-phrase wake word blocks most of the user's attempts
+        # to talk to the robot. The whole list is tried in order; the first
+        # match wins and `_detect_wake` returns the text after that phrase.
+        self._wake_phrases: list[str] = [
+            phrase.strip() for phrase in wake_word.split(",") if phrase.strip()
+        ] or [wake_word.strip()]
+        # `_wake_word` kept as a user-facing string (banners, error text) —
+        # first alternative is the canonical phrase.
+        self._wake_word = self._wake_phrases[0]
+        self._wake_tokens = set(
+            re.sub(r"[^\w\s]", "", self._wake_word).lower().split()
+        )
         self._listen_timeout = listen_timeout
         self._listen_timeout_long = listen_timeout_long
         self._max_utterance = max_utterance
         self._wake_sounds_dir = wake_sounds_dir
+        # Follow-up policy. Off by default: a physical robot in a noisy room
+        # reliably self-triggers on background speech / TTS tail / Moonshine
+        # hallucinations when it keeps listening without the wake word. When
+        # enabled, we still commit follow-ups through a stricter quality
+        # filter (_is_plausible_followup) and use a shorter window than the
+        # original --post-speak-timeout.
+        self._follow_up_enabled = bool(follow_up)
+        self._follow_up_timeout = float(follow_up_timeout)
 
         self._last_stable_text: str = ""
         self._last_partial_raw: str = ""
@@ -886,6 +909,44 @@ class SpeechRouter(TranscriptEventListener):
         "ah", "er", "eh", "yeah", "yep", "the", "a",
     }
 
+    # Small, high-signal second-person tokens that almost always indicate
+    # the user is actually addressing WALL-E. Two-word follow-ups are
+    # allowed only if they contain one of these — a pure-noun fragment
+    # like "Tutland," or "asthma set" is rejected.
+    _FOLLOWUP_SIGNAL_TOKENS = frozenset(
+        {
+            "you", "your", "walle", "wall-e", "walley", "robot",
+            "please", "can", "could", "would", "what", "why", "how",
+            "when", "where", "who", "is", "are", "do", "does", "did",
+            "tell", "say", "show", "look", "see", "yes", "no", "ok",
+            "okay", "stop", "wait", "help", "thanks", "thank", "hi",
+            "hello", "move", "turn", "go", "stop", "drive",
+        }
+    )
+
+    def _is_plausible_followup(self, text: str) -> bool:
+        """Quality gate for follow-up-mode commits.
+
+        Moonshine's background hallucinations during a follow-up window
+        are almost always short proper-noun fragments with no second-
+        person addressing (e.g. "Tutland,", "The asthma was set from.").
+        Require at least one second-person signal token, or ≥4 tokens
+        of actual English (long enough that the user is clearly talking
+        *to* the robot, not just near it).
+        """
+        normalized = self._strip_punctuation(text).lower().strip()
+        if not normalized:
+            return False
+        tokens = [t for t in normalized.split() if t]
+        if not tokens:
+            return False
+        # Any clearly-addressed utterance passes.
+        if any(t in self._FOLLOWUP_SIGNAL_TOKENS for t in tokens):
+            return True
+        # Long utterances also pass — if the user speaks 4+ real words
+        # it's extremely unlikely to be pure noise.
+        return len(tokens) >= 4
+
     def _play_ready_beep(self) -> None:
         """Short sine-wave chime signalling 'mic is open, your turn'.
 
@@ -1047,31 +1108,33 @@ class SpeechRouter(TranscriptEventListener):
         return re.sub(r"[^\w\s]", "", text)
 
     def _detect_wake(self, text: str) -> Optional[str]:
-        """Check for wake word and return the text AFTER it, or None.
+        """Check for any configured wake phrase and return the text AFTER it.
 
-        Strips punctuation and lowercases both sides so that
-        "Hey, rocket!" matches wake word "hey rocket" or "hey, rocket".
+        Strips punctuation and lowercases both sides so "Hey, rocket!"
+        matches a wake phrase of "hey rocket" or "hey, rocket". Uses
+        word-boundary-aware matching so "rocket launcher" doesn't trigger
+        a bare "rocket" wake.
 
-        Uses word-boundary-aware matching to avoid false positives
-        (e.g. "rocket launcher" won't trigger on wake word "rocket").
+        Tries each alternate in `_wake_phrases`. Returns the tail after
+        the first matching alternate so common STT substitutions ("okay"
+        for "hey", "wall e" for "walle") don't make the robot unreachable.
         """
-        clean = self._strip_punctuation(text).lower()
-        wake_clean = self._strip_punctuation(self._wake_word).lower()
+        text_tokens = self._strip_punctuation(text).lower().split()
+        if not text_tokens:
+            return None
 
-        # Word-boundary-aware token match: wake tokens must appear as
-        # whole words in sequence within the text tokens
-        wake_token_list = wake_clean.split()
-        text_tokens = clean.split()
-        wi = 0
-        last_match_idx = -1
-        for ti, token in enumerate(text_tokens):
-            if wi < len(wake_token_list) and token == wake_token_list[wi]:
-                wi += 1
-                last_match_idx = ti
-        if wi == len(wake_token_list):
-            # Return text after the last matched wake token
-            remaining_tokens = text_tokens[last_match_idx + 1 :]
-            return " ".join(remaining_tokens)
+        for wake_phrase in self._wake_phrases:
+            wake_tokens = self._strip_punctuation(wake_phrase).lower().split()
+            if not wake_tokens:
+                continue
+            wi = 0
+            last_match_idx = -1
+            for ti, token in enumerate(text_tokens):
+                if wi < len(wake_tokens) and token == wake_tokens[wi]:
+                    wi += 1
+                    last_match_idx = ti
+            if wi == len(wake_tokens):
+                return " ".join(text_tokens[last_match_idx + 1 :])
         return None
 
     # -- Silence timeout management --
@@ -1164,6 +1227,19 @@ class SpeechRouter(TranscriptEventListener):
             ):
                 print(f"  ... ignoring filler '{command}'")
                 return
+
+        # Follow-up-specific hallucination filter. In follow-up mode the mic
+        # is open without the user doing anything to announce intent, so
+        # Moonshine's noise transcripts ("Tutland,", "The asthma was set
+        # from.") land here. The wake-word path already had an explicit
+        # user action in front of it — the filter is less important there.
+        if (
+            self._follow_up_enabled
+            and command
+            and not self._is_plausible_followup(command)
+        ):
+            print(f"  ... ignoring implausible follow-up '{command}'")
+            return
         if command:
             # Gate the mic BEFORE spawning the thread — otherwise Moonshine's
             # partial/final callbacks can fire in the scheduling gap between
@@ -1421,13 +1497,27 @@ class SpeechRouter(TranscriptEventListener):
             self._audio_active.clear()
             self._processing = False
             self._stop_requested.clear()
-            self._state = self.LISTENING
             self._command_text = ""
             self._last_stable_text = ""
             self._last_partial_raw = ""
-            self._listen_started_monotonic = time.monotonic()
-            self._start_timeout(self._post_speak_timeout)
-            print("  👂 Listening for follow-up... (or stay silent to end)")
+            if self._follow_up_enabled:
+                # Opt-in: keep listening for a short follow-up, but gate the
+                # commit path on _is_plausible_followup so Moonshine's noise
+                # hallucinations can't open a phantom LLM turn.
+                self._state = self.LISTENING
+                self._listen_started_monotonic = time.monotonic()
+                self._start_timeout(self._follow_up_timeout)
+                print(
+                    f"  👂 Listening for follow-up ({self._follow_up_timeout:.0f}s)..."
+                )
+            else:
+                # Default: go back to wake-word-gated IDLE. On a noisy robot,
+                # the alternative reliably fires bogus LLM turns on garbage
+                # transcripts like "Tutland," or "The asthma was set from."
+                self._state = self.IDLE
+                self._listen_started_monotonic = 0.0
+                self._cancel_timeout()
+                print(f'  💤 Back to wake word — say "{self._wake_word}" to speak again.')
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1446,6 +1536,58 @@ ROBOT_INTENTS = {
     "move backward": "backward",
     "stop moving": "stop",
 }
+
+
+class LiteralIntentRecognizer:
+    """Deterministic substring matcher — drop-in for moonshine_voice's
+    embedding-backed ``IntentRecognizer``.
+
+    On Jetson the embedding matcher takes 186-1069 ms per completed line
+    to decide whether any of three hard-coded phrases matched. That CPU
+    cost starved Moonshine's audio thread and contributed to PortAudio
+    input-overflow events under concurrent vision + TTS load. Substring
+    matching is sub-millisecond, so the matcher can run inline on the
+    dispatcher consumer thread without the cross-gating workarounds that
+    the embedding path required.
+
+    Exposes exactly the subset of IntentRecognizer used by VoiceAssistant:
+    ``register_intent(phrase, handler)``, ``on_line_completed(event)``,
+    ``close()``. The handler signature matches: (trigger, utterance,
+    similarity). Similarity is always 1.0 for a substring hit.
+    """
+
+    def __init__(self) -> None:
+        self._intents: list[tuple[str, str, Callable[[str, str, float], None]]] = []
+
+    def register_intent(
+        self,
+        phrase: str,
+        handler: Callable[[str, str, float], None],
+    ) -> None:
+        normalized = re.sub(r"[^\w\s]", "", phrase).lower().strip()
+        if normalized:
+            self._intents.append((phrase, normalized, handler))
+
+    def on_line_completed(self, event) -> None:
+        text = getattr(getattr(event, "line", None), "text", "") or ""
+        if not text:
+            return
+        normalized = re.sub(r"[^\w\s]", "", text).lower().strip()
+        if not normalized:
+            return
+        for original_phrase, needle, handler in self._intents:
+            if needle in normalized:
+                try:
+                    handler(original_phrase, text.strip(), 1.0)
+                except Exception:
+                    _log.exception(
+                        "LiteralIntentRecognizer handler '%s' raised",
+                        original_phrase,
+                    )
+                return
+
+    def close(self) -> None:
+        self._intents.clear()
 
 
 class VoiceAssistant:
@@ -1470,6 +1612,8 @@ class VoiceAssistant:
         mic_device: Optional[int] = None,
         mic_channels: int = 1,
         mic_blocksize: int = 16384,
+        follow_up: bool = False,
+        follow_up_timeout: float = 3.0,
         system_prompt: str = (
             "You are a helpful voice assistant running on a Jetson-powered robot. "
             "Keep responses to 1-3 sentences — they will be spoken aloud via TTS."
@@ -1519,16 +1663,14 @@ class VoiceAssistant:
         self._mic = mv.MicTranscriber(**mic_kwargs)
 
         # -- Intent recognizer --
-        print("Loading embedding model for intent recognition...", file=sys.stderr)
-        emb_path, emb_arch = mv.get_embedding_model(
-            embedding_model, embedding_quantization
-        )
-        self._intent_recognizer = mv.IntentRecognizer(
-            model_path=emb_path,
-            model_arch=emb_arch,
-            model_variant=embedding_quantization,
-            threshold=intent_threshold,
-        )
+        # Literal substring matcher. The previous embedding-based
+        # IntentRecognizer spent 186-1069 ms per completed line on Jetson
+        # to decide whether one of three hard-coded phrases had been said.
+        # With a fixed phrase set we get identical semantics from a plain
+        # substring check at ~10 μs, and the embedding model is still
+        # warmed up at startup for FAISS-backed memory search.
+        del embedding_model, embedding_quantization, intent_threshold  # noqa: F841
+        self._intent_recognizer = LiteralIntentRecognizer()
 
         # -- Speech router (wake-word-gated LLM fallback) --
         # No mic_pause/mic_resume callbacks: stopping the PortAudio stream
@@ -1546,6 +1688,8 @@ class VoiceAssistant:
             listen_timeout_long=listen_timeout_long,
             max_utterance=max_utterance,
             wake_sounds_dir=wake_sounds_dir,
+            follow_up=follow_up,
+            follow_up_timeout=follow_up_timeout,
         )
 
         # -- Register robot intents --
