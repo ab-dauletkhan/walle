@@ -1,0 +1,51 @@
+[Unit]
+Description=WALL-E robot runtime (walle-hwc + walle voice pipeline)
+# Ensure sound, network (for Piper voice download on first run), and
+# user-level services are up before we try. The Arduino serial device
+# comes up via udev independently of this unit.
+After=multi-user.target sound.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# CHANGE THESE TWO before enabling — they are the user account that
+# owns the venv, voices, models, and FAISS data. Running as root
+# would re-download Piper into /root and confuse the robot.
+User=c504
+Group=c504
+WorkingDirectory=/home/c504/Desktop/walle/walle
+
+# HOME is needed because Piper / Ollama / uv caches live under ~.
+# Without this systemd defaults HOME=/ and nothing finds its files.
+Environment=HOME=/home/c504
+Environment=PATH=/home/c504/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Let Ollama see GPU on Jetson (same as an interactive shell).
+Environment=OLLAMA_KEEP_ALIVE=24h
+
+# start.sh orchestrates Ollama + walle-hwc + the tracker subprocess +
+# walle itself, with a cleanup trap that kills them on exit. Calling
+# it here gives us the exact same behavior as the interactive run,
+# just unattended.
+ExecStart=/bin/bash /home/c504/Desktop/walle/walle/scripts/start.sh
+
+# Restart on transient failures (e.g. Ollama hiccup), but give up if
+# the unit keeps dying — usually means a config problem that'll just
+# consume CPU in a loop otherwise.
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=3
+StartLimitIntervalSec=120
+
+# Stream everything to the journal so you can see it with
+# `journalctl -u walle -f`.
+StandardOutput=journal
+StandardError=journal
+
+# Kill the whole process tree on stop — start.sh's trap does the
+# same but this is our backstop if it crashes.
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

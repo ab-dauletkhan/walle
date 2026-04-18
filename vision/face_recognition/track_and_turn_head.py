@@ -62,8 +62,74 @@ BODY_TURN_45_SEC = 0.28
 BODY_TURN_90_SEC = 0.56
 
 
+class _HwcSocketShim:
+    """Mimics the pyserial ``.write()/.flush()/.close()`` surface but sends
+    bytes over a Unix socket connection to walle-hwc instead of a tty.
+
+    The tracker never reads replies (the hardware controller suppresses
+    them for ``IDENT tracker`` clients on purpose — at 30 Hz a fire-hose
+    of ``OK`` lines would just refill the host-side buffer). So this shim
+    is write-only. Exceptions are logged and the socket is reset; the
+    next tick will reconnect on its own.
+    """
+
+    def __init__(self, socket_path: str):
+        import socket as _socket  # local import; optional dependency-free path
+
+        self._socket_mod = _socket
+        self._path = socket_path
+        self._sock = None
+        self._connect()
+
+    def _connect(self):
+        sock = self._socket_mod.socket(
+            self._socket_mod.AF_UNIX, self._socket_mod.SOCK_STREAM
+        )
+        sock.connect(self._path)
+        sock.sendall(b"IDENT tracker\n")
+        # No READY handshake for trackers; HWC suppresses replies for
+        # this identity. Keep the write side non-blocking-ish.
+        self._sock = sock
+
+    def write(self, data):
+        if self._sock is None:
+            try:
+                self._connect()
+            except Exception as exc:  # pragma: no cover - environmental
+                print(
+                    f"WARNING: head-command socket reconnect failed: {exc}",
+                    flush=True,
+                )
+                return 0
+        try:
+            self._sock.sendall(data)
+            return len(data)
+        except Exception as exc:  # pragma: no cover - environmental
+            print(
+                f"WARNING: head-command socket write failed: {exc}",
+                flush=True,
+            )
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+            return 0
+
+    def flush(self):  # noqa: D401 - mirror pyserial API
+        return None
+
+    def close(self):
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+
+
 class HeadController:
-    def __init__(self, port: str, baud: int, np_module):
+    def __init__(self, port: str, baud: int, np_module, *, head_command_socket=None):
         self.enabled = False
         self.ser = None
         self.np = np_module
@@ -85,20 +151,35 @@ class HeadController:
         self.edge_hold_started_at = 0.0
         self.edge_hold_dir = 0
 
-        try:
-            import serial
+        if head_command_socket:
+            # Route head commands through walle-hwc over a Unix socket.
+            # The controller owns the physical serial port and arbitrates
+            # between this tracker, STT, and LLM sources. Keep the rest of
+            # HeadController unchanged so the well-tested tracking logic
+            # stays identical between the standalone and integrated modes.
+            try:
+                self.ser = _HwcSocketShim(head_command_socket)
+                self.enabled = True
+                print(f"Head controller: connected to walle-hwc at {head_command_socket}")
+                self.send_tick(self.current_tick, force=True)
+            except Exception as exc:
+                print(f"WARNING: could not connect to walle-hwc at {head_command_socket}: {exc}")
+                print("Head control disabled; vision still runs.")
+        else:
+            try:
+                import serial
 
-            self.ser = serial.Serial(port, baud, timeout=1)
-            time.sleep(SERIAL_STARTUP_WAIT_SEC)
-            self.enabled = True
-            print(f"Serial connected: {port} @ {baud}")
-            self.send_tick(self.current_tick, force=True)
-        except ImportError as exc:
-            print(f"WARNING: pyserial is not installed: {exc}")
-            print("Head control disabled; vision still runs.")
-        except Exception as exc:
-            print(f"WARNING: serial not available: {exc}")
-            print("Head control disabled; vision still runs.")
+                self.ser = serial.Serial(port, baud, timeout=1)
+                time.sleep(SERIAL_STARTUP_WAIT_SEC)
+                self.enabled = True
+                print(f"Serial connected: {port} @ {baud}")
+                self.send_tick(self.current_tick, force=True)
+            except ImportError as exc:
+                print(f"WARNING: pyserial is not installed: {exc}")
+                print("Head control disabled; vision still runs.")
+            except Exception as exc:
+                print(f"WARNING: serial not available: {exc}")
+                print("Head control disabled; vision still runs.")
 
     def clamp_tick(self, tick):
         return max(HEAD_MIN_TICK, min(HEAD_MAX_TICK, int(round(tick))))
@@ -460,6 +541,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--serial-port", default=DEFAULT_SERIAL_PORT)
     parser.add_argument("--serial-baud", type=int, default=DEFAULT_SERIAL_BAUD)
+    parser.add_argument(
+        "--head-command-socket",
+        default=None,
+        help=(
+            "Optional Unix-domain-socket path for the walle hardware "
+            "controller. When set, head-tick / spin / raw commands are "
+            "sent over this socket (IDENT tracker handshake) instead of "
+            "opening --serial-port directly. Lets the tracker run as a "
+            "supervised child of walle-hwc without owning the serial "
+            "port."
+        ),
+    )
     parser.add_argument("--camera-width", type=int, default=DEFAULT_CAMERA_WIDTH)
     parser.add_argument("--camera-height", type=int, default=DEFAULT_CAMERA_HEIGHT)
     parser.add_argument("--fps", type=int, default=DEFAULT_CAMERA_FPS)
@@ -597,7 +690,12 @@ def run(args: argparse.Namespace) -> None:
     camera = opened.source
     pending_frame = opened.first_frame
 
-    head = HeadController(args.serial_port, args.serial_baud, np)
+    head = HeadController(
+        args.serial_port,
+        args.serial_baud,
+        np,
+        head_command_socket=args.head_command_socket,
+    )
     print(
         "Runtime: "
         f"detector={'Edge TPU' if detector_edge_tpu else 'CPU'}, "

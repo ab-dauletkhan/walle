@@ -444,7 +444,12 @@ def build_default_robot_registry() -> RobotToolRegistry:
             ScanSurroundingsAction(
                 RobotToolSpec(
                     "scan_surroundings",
-                    "Sweep the head left-center-right-center to look around.",
+                    "Mechanical head-sweep demo: pan left → right → center. "
+                    "Use ONLY when the user explicitly says 'scan', 'sweep', "
+                    "or 'move your head around'. DO NOT use this for visual "
+                    "questions like 'what do you see?' or 'who is there?' — "
+                    "this tool only moves the servo and returns no image "
+                    "description. For visual questions, use capture_image.",
                     {
                         "speed": {
                             "type": "string",

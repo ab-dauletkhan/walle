@@ -10,10 +10,12 @@ cd "$PROJECT_ROOT"
 # ---------- Configuration ----------
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-qwen2.5:3b}"
-# Vision-describer model used by the `capture_image` LLM tool. Small and
-# fast on Jetson; pulled alongside the chat model so the capture_image
-# path doesn't silently 404 when the LLM decides to use it.
-OLLAMA_VISION_MODEL="${OLLAMA_VISION_MODEL:-moondream}"
+# Vision model retired in the HWC v1 build — capture_image tool is
+# gone (moved to v2 once the tracker subprocess gains face + frame
+# events over the HWC socket). Leaving moondream on disk wastes ~2 GB
+# and, if Ollama keep_alive kicks in, can fragment UMA memory against
+# the chat model. Set to "moondream" explicitly to re-enable.
+OLLAMA_VISION_MODEL="${OLLAMA_VISION_MODEL:-}"
 MIMIC3_URL="${MIMIC3_URL:-http://localhost:59125}"
 UV_EXTRAS="${UV_EXTRAS:---extra jetson}"
 # Use an array so device names containing spaces (e.g. "ReSpeaker 4 Mic
@@ -33,7 +35,23 @@ CORAL39_PY="${WALLE_CORAL_PYTHON39:-$PROJECT_ROOT/.venv-coral39/bin/python}"
 # explicitly; we only inject the default when the user didn't. This is
 # what turns `bash scripts/start.sh` into the working voice pipeline
 # without forcing operators to remember the long incantation every time.
-DEFAULT_SERIAL_PORT="${WALLE_SERIAL_PORT:-/dev/ttyCH341USB0}"
+
+# Pick the first CH341USB* device that actually exists so we survive
+# USB re-enumeration (USB0 → USB1 when the Arduino was unplugged +
+# replugged while the old node was still held open). Fall back to USB0
+# literal as a last resort so the error message in walle-hwc is clear.
+if [[ -n "${WALLE_SERIAL_PORT:-}" ]]; then
+    DEFAULT_SERIAL_PORT="$WALLE_SERIAL_PORT"
+else
+    DEFAULT_SERIAL_PORT=""
+    for p in /dev/ttyCH341USB* /dev/ttyUSB* /dev/ttyACM*; do
+        if [[ -e "$p" ]]; then
+            DEFAULT_SERIAL_PORT="$p"
+            break
+        fi
+    done
+    DEFAULT_SERIAL_PORT="${DEFAULT_SERIAL_PORT:-/dev/ttyCH341USB0}"
+fi
 DEFAULT_MIC_DEVICE="${WALLE_MIC_DEVICE:-ReSpeaker 4 Mic Array}"
 DEFAULT_SPEAKER_DEVICE="${WALLE_SPEAKER_DEVICE:-UACDemoV1.0}"
 DEFAULT_SPEAKER_RATE="${WALLE_SPEAKER_RATE:-48000}"
@@ -112,10 +130,19 @@ fi
 
 # Jetson UMA: keep model pinned on GPU and shrink KV cache so cudaMalloc
 # doesn't fragment once walle's Python stack loads alongside it.
+# Context dropped from 2048 → 1024 after OOM on real runs — Orin Nano
+# 8 GB UMA can't fit qwen2.5:3b KV@2048 alongside Moonshine-medium,
+# Piper, Coral worker, camera buffers, and the HWC + tracker python
+# processes. 1024 comfortably holds a multi-turn dialogue and frees
+# ~375 MB of GPU that was going to the unused tail of the KV cache.
 export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:-24h}"
-export OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-2048}"
+export OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-1024}"
 export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-1}"
 export OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-1}"
+# Flash attention on the KV cache trims another ~100 MB and is a
+# pure win on Turing / Ampere / Orin cuDNN paths. If this breaks on
+# any future Ollama release, set it back to 0.
+export OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-1}"
 
 # Free reclaimable page cache before Ollama tries to allocate on UMA.
 # Non-fatal if sudo is not available (running outside Jetson).
@@ -181,16 +208,16 @@ else
     ollama pull "$OLLAMA_MODEL"
 fi
 
-# Vision model for the capture_image tool. Pre-pull so the first time the
-# LLM decides to use capture_image it doesn't 404 against an unpulled
-# model and come back with "there was an issue capturing the image".
+# Vision model pull is opt-in (OLLAMA_VISION_MODEL=moondream). Default
+# is empty — the HWC v1 build doesn't use capture_image, so pre-pulling
+# moondream just burned ~2 GB of disk + fragmented UMA memory.
 if [[ -n "$OLLAMA_VISION_MODEL" ]]; then
     if ollama list 2>/dev/null | grep -q "$OLLAMA_VISION_MODEL"; then
         echo "  Vision model '$OLLAMA_VISION_MODEL' available."
     else
         echo "  Vision model '$OLLAMA_VISION_MODEL' not found. Pulling..."
         ollama pull "$OLLAMA_VISION_MODEL" \
-            || echo "  WARNING: vision model pull failed — capture_image will degrade to face-recognition summary."
+            || echo "  WARNING: vision model pull failed."
     fi
 fi
 
@@ -283,7 +310,61 @@ if [[ -x "$CORAL39_PY" ]]; then
     echo "  Coral worker: $WALLE_CORAL_PYTHON39"
 fi
 
-# ---------- 4. Launch WALL-E ----------
+# ---------- 4. Launch walle-hwc ----------
+# The hardware controller owns /dev/ttyCH341USB0 and supervises the
+# track_and_turn_head.py subprocess. We spawn it first, wait for the
+# UDS file to appear (meaning the server is listening), then launch
+# walle which connects as an `llm` / `stt` client.
+HWC_SOCKET="${WALLE_HW_SOCK:-/tmp/walle_hw.sock}"
+HWC_SERIAL_PORT="${WALLE_SERIAL_PORT:-$DEFAULT_SERIAL_PORT}"
+
+# Remove stale socket from a previous crashed run so our readiness
+# poll doesn't false-positive before walle-hwc has bound.
+rm -f "$HWC_SOCKET" 2>/dev/null || true
+
+echo "=== Launching walle-hwc ==="
+echo "  socket=$HWC_SOCKET  serial=$HWC_SERIAL_PORT"
+
+# Propagate WALLE_HW_ALLOW_SIM=1 so the operator can deliberately run
+# without hardware (CI, protocol debugging, bench test of voice stack
+# only). By default HWC aborts when the serial port isn't openable —
+# that's what turned "drive 200 1500 → OK but no motion" from an
+# invisible sim-mode trap into a loud failure at startup.
+HWC_EXTRA_ARGS=()
+if [[ "${WALLE_HW_ALLOW_SIM:-0}" == "1" ]]; then
+    HWC_EXTRA_ARGS+=(--allow-simulation)
+    echo "  (WALLE_HW_ALLOW_SIM=1 set — running in simulation mode)"
+fi
+
+# shellcheck disable=SC2086
+uv run $UV_EXTRAS walle-hwc \
+    --socket-path "$HWC_SOCKET" \
+    --serial-port "$HWC_SERIAL_PORT" \
+    "${HWC_EXTRA_ARGS[@]}" \
+    &
+HWC_PID=$!
+CHILD_PIDS+=($HWC_PID)
+
+# Wait up to 15 s for the socket file to appear. If walle-hwc crashed
+# immediately, bail early so start.sh doesn't wedge forever.
+for i in $(seq 1 30); do
+    if [[ -S "$HWC_SOCKET" ]]; then
+        echo "  walle-hwc ready (socket $HWC_SOCKET, ${i} x 0.5s)"
+        break
+    fi
+    if ! kill -0 "$HWC_PID" 2>/dev/null; then
+        echo "  ERROR: walle-hwc exited before creating the socket. See logs above."
+        exit 1
+    fi
+    sleep 0.5
+done
+if [[ ! -S "$HWC_SOCKET" ]]; then
+    echo "  ERROR: walle-hwc did not create $HWC_SOCKET within 15s."
+    exit 1
+fi
+export WALLE_HW_SOCK="$HWC_SOCKET"
+
+# ---------- 5. Launch WALL-E ----------
 echo ""
 echo "=== Launching WALL-E ==="
 echo "  Args:" "${WALLE_ARGS_LIST[@]}" "$@"

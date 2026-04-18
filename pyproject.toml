@@ -94,6 +94,7 @@ jetson = [
 
 [project.scripts]
 walle = "walle.startup:main"
+walle-hwc = "walle.hw_controller:main"
 walle-face-scan = "vision.face_recognition.scan_people:main"
 walle-face-embeddings = "vision.face_recognition.create_embeddings:main"
 walle-face-recognize = "vision.face_recognition.recognize_face:main"

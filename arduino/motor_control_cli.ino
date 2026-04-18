@@ -98,13 +98,12 @@ bool applyServoTick(ServoAxis& axis, int targetTick) {
     return false;
   }
 
-  if (abs(targetTick - axis.currentTick) > axis.maxDeltaPerCommand) {
-    Serial.print(F("Rejected: "));
-    Serial.print(axis.name);
-    Serial.print(F(" jump too large. Max delta is "));
-    Serial.println(axis.maxDeltaPerCommand);
-    return false;
-  }
+  // Delta cap intentionally removed — the physical servo handles any
+  // jump inside [minTick, maxTick] without damage on this chassis, and
+  // the previous 60-tick-per-command cap turned legitimate "look left"
+  // commands into "Rejected: head pan jump too large" after the face
+  // tracker had walked the servo away from its startup center.
+  // Boundary check above still catches out-of-range targets.
 
   axis.currentTick = targetTick;
   pwm.setPWM(axis.channel, 0, targetTick);
@@ -358,11 +357,8 @@ void handleHeadCommand(char* args) {
   }
 
   if (strcmp(subcommand, "step") == 0) {
-    if (abs((int)rawValue) > headPan.maxDeltaPerCommand) {
-      Serial.print(F("Rejected: head step exceeds max delta of "));
-      Serial.println(headPan.maxDeltaPerCommand);
-      return;
-    }
+    // Per-step cap removed alongside the applyServoTick cap. Boundary
+    // check in applyServoTick still enforces minTick..maxTick.
     applyServoTick(headPan, headPan.currentTick + (int)rawValue);
     return;
   }

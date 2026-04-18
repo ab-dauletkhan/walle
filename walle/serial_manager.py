@@ -132,7 +132,12 @@ class SerialManager:
                 self._conn.write(f"{line}\n".encode())
                 self._conn.flush()
             except Exception as exc:
-                _log.debug("send_write_only '%s' failed: %s", line, exc)
+                # Upgraded from DEBUG → WARNING. A silent write-only failure
+                # is the classic "head tracker keeps logging sends but the
+                # servo never moves" symptom. With this visible, a dead
+                # integrated tracker surfaces as a run of warnings instead
+                # of an invisible regression against the standalone.
+                _log.warning("send_write_only '%s' failed: %s", line, exc)
 
     def send_raw(self, cmd: str, timeout: Optional[float] = None) -> List[str]:
         """Send one command and return the full reply as a list of lines.

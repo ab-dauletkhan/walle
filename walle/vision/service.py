@@ -863,7 +863,15 @@ def get_capture_image_tools() -> list:
             "type": "function",
             "function": {
                 "name": "capture_image",
-                "description": "Capture a photo from the robot's camera and get a description of what is visible. Use when the user asks what you can see or you need visual information.",
+                "description": (
+                    "ALWAYS call this when the user asks about what is "
+                    "visible — e.g. 'what do you see?', 'can you see me?', "
+                    "'who's there?', 'what's in front of you?', 'describe "
+                    "the room', 'is anyone here?'. Returns a sentence "
+                    "describing the current camera view. Do NOT call "
+                    "scan_surroundings for a visual question — that only "
+                    "moves the head and does not return any description."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {

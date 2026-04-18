@@ -37,29 +37,31 @@ def _strip_tool_prefix(text: str) -> str:
 
 
 class WallEOrchestrator:
-    """Thin facade: accepts injected dependencies, delegates to ChatLoop.
+    """Thin facade over ChatLoop with a streaming API for non-voice callers.
 
-    Implements stream_chat() (duck-typed LLMClient) for the voice pipeline
-    and chat() for the API server and text REPL.
+    The voice path invokes ChatLoop.run directly with SAY/DO callbacks
+    and doesn't go through this class. The API server and text REPL use
+    ``chat`` / ``stream_chat`` — those rebuild the accumulated SAY text
+    back into word-by-word yields for display, keeping the old contract
+    so nothing external has to change.
     """
 
     def __init__(
         self,
         chat_loop,
-        comm_exec,
         recall_mem,
         context_manager,
-        vision_service,
-        serial_manager,
-        tool_suite,
+        serial_manager=None,
+        vision_service=None,
     ):
         self._chat_loop = chat_loop
-        self._comm_exec = comm_exec
         self.recall_mem = recall_mem
         self.context_manager = context_manager
         self.vision_service = vision_service
+        # Kept on the attribute surface so callers that want to reach the
+        # hardware (e.g. API server) can still do so; None is fine in the
+        # post-HWC world because walle itself no longer opens the port.
         self.serial_manager = serial_manager
-        self.tool_suite = tool_suite
 
     def set_vision_service(self, vision_service):
         self.vision_service = vision_service

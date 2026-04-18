@@ -571,9 +571,11 @@ class SpeechRouter(TranscriptEventListener):
 
     def __init__(
         self,
-        llm: LLMClient,
         tts: BaseTTSEngine,
         system_prompt: str,
+        chat_loop=None,
+        do_dispatcher=None,
+        llm: Optional["LLMClient"] = None,
         wake_word: str = "hey",
         listen_timeout: float = 0.5,
         listen_timeout_long: float = 1.0,
@@ -584,6 +586,14 @@ class SpeechRouter(TranscriptEventListener):
         follow_up: bool = False,
         follow_up_timeout: float = 3.0,
     ):
+        # The voice pipeline now drives the LLM through ChatLoop directly
+        # (streams SAY/DO callbacks), not through an LLMClient.stream_chat
+        # generator. `llm` is kept for backward compatibility with the
+        # standalone assistant.py entrypoint that still constructs an
+        # OllamaLLMClient for ad-hoc testing; integrated walle passes
+        # `chat_loop` instead.
+        self._chat_loop = chat_loop
+        self._do_dispatcher = do_dispatcher
         self._llm = llm
         self._tts = tts
         self._mic_pause_cb = mic_pause
@@ -1416,72 +1426,71 @@ class SpeechRouter(TranscriptEventListener):
         # this thread was spawned, so callbacks are already gated. We just
         # need to keep them gated through the whole LLM+TTS span and clear
         # on exit.
+        #
+        # The chat loop streams SAY: / DO: lines and calls on_say / on_do
+        # as each line completes. Because the model emits one sentence per
+        # SAY line, we can enqueue each directly to TTS without a local
+        # sentence-splitter — the sentence-level pipelining happens because
+        # the LLM pauses at newlines. DO lines go to the hardware controller
+        # as Arduino CLI; volume commands go to the host-side executor.
         speaking_started = False
+        stop = self._stop_requested
+        say_accum: list[str] = []
+
+        def on_say(sentence: str) -> None:
+            nonlocal speaking_started
+            if stop.is_set() or not sentence:
+                return
+            say_accum.append(sentence)
+            print(f"  🤖 {sentence}")
+            if not speaking_started:
+                self._begin_speaking()
+                speaking_started = True
+            self._tts.enqueue(sentence)
+
+        def on_do(cli: str) -> None:
+            if stop.is_set() or not cli:
+                return
+            if self._do_dispatcher is None:
+                print(f"  🤖 DO (dropped — no dispatcher): {cli}")
+                return
+            reply = self._do_dispatcher.dispatch(cli)
+            if reply.startswith("ERR"):
+                print(f"  🤖 DO: {cli}  ⚠ {reply}")
+            else:
+                print(f"  🤖 DO: {cli}  → {reply}")
+
         full_response = ""
         try:
-            self._conversation.append({"role": "user", "content": text})
-
             print(f"  🗣  You: {text}")
-            print("  🤖 ", end="", flush=True)
-
-            buf = ""
-            full_chunks: list[str] = []
-            for chunk in self._llm.stream_chat(self._conversation):
-                if self._stop_requested.is_set():
-                    break
-                print(chunk, end="", flush=True)
-                full_chunks.append(chunk)
-                buf += chunk
-                # Flush every completed sentence to the TTS worker so
-                # playback of sentence N overlaps with generation of N+1.
-                # For long clauses without a sentence-ender, also flush
-                # at the first comma/semicolon past ~40 chars — keeps
-                # time-to-first-audio low and avoids a ~500 ms synth
-                # stall at the start of a 150-char sentence.
-                while True:
-                    idx = -1
-                    for ender in self._SENTENCE_ENDS:
-                        pos = buf.find(ender)
-                        if pos != -1 and (idx == -1 or pos < idx):
-                            idx = pos
-                    if idx < 0 and len(buf) >= self._CLAUSE_FLUSH_CHARS:
-                        for i in range(self._MIN_CHUNK_CHARS, len(buf)):
-                            if buf[i] in ",;:":
-                                idx = i
-                                break
-                    if idx < 0:
+            if self._chat_loop is not None:
+                self._chat_loop.run(text, on_say=on_say, on_do=on_do)
+            elif self._llm is not None:
+                # Backward-compat fallback for the standalone assistant.py
+                # main(). The LLM emits plain text; route it all to TTS.
+                buf = ""
+                for chunk in self._llm.stream_chat(
+                    [{"role": "user", "content": text}]
+                ):
+                    if stop.is_set():
                         break
-                    sentence, buf = buf[: idx + 1].strip(), buf[idx + 1 :]
-                    if sentence:
-                        if not speaking_started:
-                            self._begin_speaking()
-                            speaking_started = True
-                        self._tts.enqueue(sentence)
-            print()
-            # Flush the tail (any trailing text without a final punctuation).
-            tail = buf.strip()
-            if tail and not self._stop_requested.is_set():
-                if not speaking_started:
-                    self._begin_speaking()
-                    speaking_started = True
-                self._tts.enqueue(tail)
+                    buf += chunk
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        on_say(line.strip())
+                on_say(buf.strip())
+            else:
+                on_say("No LLM is wired up. Please pass --use-ollama or start walle-hwc.")
 
-            full_response = "".join(full_chunks)
-            self._conversation.append({"role": "assistant", "content": full_response})
+            full_response = " ".join(say_accum).strip()
 
-            # Trim conversation to rolling window to prevent unbounded memory growth
-            if len(self._conversation) > self._max_conversation_length:
-                self._conversation = self._conversation[
-                    -self._max_conversation_length :
-                ]
-
-            if self._stop_requested.is_set():
+            if stop.is_set():
                 self._tts.drain()
             elif speaking_started:
-                # Pass our stop flag so a mid-sentence "stop" utterance that
-                # fires in the callback while we're waiting is honoured
-                # promptly instead of after the current sentence finishes.
-                self._tts.wait_until_idle(stop_flag=self._stop_requested)
+                # Pass our stop flag so a mid-sentence "stop" utterance
+                # fires a prompt barge-in instead of waiting for the
+                # current sentence to finish playing.
+                self._tts.wait_until_idle(stop_flag=stop)
         except Exception as e:
             print(f"\n  ... LLM error: {e}", file=sys.stderr)
         finally:
@@ -1535,6 +1544,92 @@ ROBOT_INTENTS = {
     "move forward": "forward",
     "move backward": "backward",
     "stop moving": "stop",
+}
+
+# STT-direct map: phrase → Arduino CLI (or host command) sent directly to
+# the hardware controller. These bypass the LLM entirely — a spoken
+# "move forward" fires drive 100 2000 without waiting for a tool-call
+# round-trip. SpeechRouter.mark_handled + the 2 s intent cooldown
+# prevents the same utterance from also opening an LLM turn.
+#
+# The dispatcher routes by the first verb: 'drive', 'spin', 'head',
+# 'scan', 'stop' go to HWC; 'volume', 'mute', 'unmute' go to the host
+# VolumeToolExecutor. So the strings below look like verbatim CLI
+# because — to the dispatcher — they are.
+STT_DIRECT_CLI: dict[str, str] = {
+    # DC motors on this chassis don't overcome static friction below
+    # roughly 80% PWM — so all wheel commands use the firmware cap
+    # (SPEED=200). Under 200 the motors audibly hum but the robot
+    # doesn't move. Duration is short enough to stay safe indoors
+    # (~1.5 s forward, ~0.6 s spin ≈ 45° pivot).
+    #
+    # ORDER MATTERS. The matcher iterates in insertion order and
+    # returns the FIRST substring hit. Multi-word specific phrases
+    # must come BEFORE their bare-word generic variants — e.g.
+    # "face forward" before "forward", otherwise the bare "forward"
+    # would swallow "face forward" and fire drive instead of head.
+    # Python dicts preserve insertion order since 3.7, so this is
+    # stable in practice.
+
+    # ---- specific: scans (contain "look"/"around", different verb) ----
+    "scan around":      "scan",
+    "look around":      "scan",
+
+    # ---- specific: head positions (multi-word) ------------------------
+    "look left":        "head pos 0",
+    "face left":        "head pos 0",
+    "head left":        "head pos 0",
+    "look right":       "head pos 100",
+    "face right":       "head pos 100",
+    "head right":       "head pos 100",
+    "look center":      "head pos 50",
+    "look straight":    "head pos 50",
+    "face forward":     "head pos 50",
+    "head center":      "head pos 50",
+    "center head":      "head pos 50",
+
+    # ---- specific: body rotation (multi-word) -------------------------
+    "turn left":        "spin 200 600",
+    "spin left":        "spin 200 600",
+    "rotate left":      "spin 200 600",
+    "turn right":       "spin -200 600",
+    "spin right":       "spin -200 600",
+    "rotate right":     "spin -200 600",
+
+    # ---- specific: drive (multi-word) ---------------------------------
+    "move forward":     "drive 200 1500",
+    "drive forward":    "drive 200 1500",
+    "go forward":       "drive 200 1500",
+    "move backward":    "drive -200 1500",
+    "move back":        "drive -200 1500",
+    "drive backward":   "drive -200 1500",
+    "drive back":       "drive -200 1500",
+    "go backward":      "drive -200 1500",
+    "go back":          "drive -200 1500",
+
+    # ---- volume (multi-word) ------------------------------------------
+    "volume up":        "volume up",
+    "volume down":      "volume down",
+    "turn it up":       "volume up",
+    "turn it down":     "volume down",
+
+    # ---- stop ---------------------------------------------------------
+    "stop moving":      "stop",
+    "stop":             "stop",
+    "halt":             "stop",
+    "freeze":           "stop",
+
+    # ---- generic single-word fallbacks (MUST come last) ---------------
+    "forward":          "drive 200 1500",
+    "ahead":            "drive 200 1500",
+    "backward":         "drive -200 1500",
+    "backwards":        "drive -200 1500",
+    "reverse":          "drive -200 1500",
+    "back":             "drive -200 1500",
+    "louder":           "volume up",
+    "quieter":          "volume down",
+    "mute":             "mute",
+    "unmute":           "unmute",
 }
 
 
@@ -1595,9 +1690,11 @@ class VoiceAssistant:
 
     def __init__(
         self,
-        llm: LLMClient,
-        robot: BaseRobotController,
         tts: BaseTTSEngine,
+        chat_loop=None,
+        do_dispatcher=None,
+        llm: Optional[LLMClient] = None,
+        robot: Optional[BaseRobotController] = None,
         language: str = "en",
         stt_model_arch=None,
         embedding_model: str = "embeddinggemma-300m",
@@ -1619,7 +1716,15 @@ class VoiceAssistant:
             "Keep responses to 1-3 sentences — they will be spoken aloud via TTS."
         ),
     ):
+        # In the post-HWC architecture, STT-direct phrases and LLM DO:
+        # lines both go through `do_dispatcher`, which routes Arduino CLI
+        # to the hardware controller and volume commands to the local
+        # executor. `chat_loop` is the new LLM driver (streams SAY/DO).
+        # The legacy `llm` + `robot` args are kept so the standalone
+        # assistant.py main() can still run without the integrated stack.
         self._robot = robot
+        self._chat_loop = chat_loop
+        self._do_dispatcher = do_dispatcher
         self._tts = tts
 
         # Report which PortAudio device we're about to hand to Moonshine.
@@ -1680,9 +1785,11 @@ class VoiceAssistant:
         # check + content-based `_is_echo()` filter (echo window widened
         # to 2.5 s to cover Piper's cleaner voice re-triggering STT).
         self._router = SpeechRouter(
-            llm=llm,
             tts=tts,
             system_prompt=system_prompt,
+            chat_loop=chat_loop,
+            do_dispatcher=do_dispatcher,
+            llm=llm,
             wake_word=wake_word,
             listen_timeout=listen_timeout,
             listen_timeout_long=listen_timeout_long,
@@ -1692,13 +1799,28 @@ class VoiceAssistant:
             follow_up_timeout=follow_up_timeout,
         )
 
-        # -- Register robot intents --
-        self._intents = intents or ROBOT_INTENTS
-        for phrase, action in self._intents.items():
-            self._intent_recognizer.register_intent(
-                phrase,
-                self._make_intent_handler(action),
-            )
+        # -- Register STT-direct phrases --
+        #
+        # Two paths:
+        #   1. do_dispatcher wired (integrated walle): phrases map to
+        #      Arduino CLI lines that go straight to HWC or volume exec.
+        #      No LLM call, no TTS echo.
+        #   2. robot fallback (standalone assistant.py main): phrases map
+        #      to action names the legacy SerialRobotController understands.
+        if do_dispatcher is not None:
+            self._intents = intents or STT_DIRECT_CLI
+            for phrase, cli in self._intents.items():
+                self._intent_recognizer.register_intent(
+                    phrase, self._make_cli_handler(cli)
+                )
+        elif robot is not None:
+            self._intents = intents or ROBOT_INTENTS
+            for phrase, action in self._intents.items():
+                self._intent_recognizer.register_intent(
+                    phrase, self._make_intent_handler(action)
+                )
+        else:
+            self._intents = {}
 
         # Decouple listener callbacks from moonshine's audio thread. Both
         # the IntentRecognizer (embedding similarity, ~20-100 ms on Jetson)
@@ -1742,6 +1864,40 @@ class VoiceAssistant:
         self._router.attach_dispatcher(self._dispatcher)
         self._router.attach_mic(self._mic)
         self._mic.add_listener(self._dispatcher)
+
+    def _make_cli_handler(self, cli: str):
+        """STT-direct handler that ships one Arduino CLI (or volume)
+        line through the DoDispatcher, skipping the LLM entirely.
+
+        Guarantees:
+          * does nothing while the router is gated (TTS busy / post-turn
+            cooldown), so our own TTS output can't self-match a phrase
+            and re-fire the command.
+          * declines the line if it actually starts with the wake word —
+            that case is for the LLM, not a direct-action match.
+          * calls ``mark_handled`` + arms the 2 s intent cooldown so
+            SpeechRouter.on_line_completed skips the same utterance
+            instead of spawning a phantom LLM turn on the delayed
+            finalization.
+        """
+        dispatcher = self._do_dispatcher
+
+        def handler(trigger: str, utterance: str, similarity: float):
+            if self._router._is_gated():
+                return
+            if self._router._detect_wake(utterance) is not None:
+                return
+            self._router.mark_handled(utterance)
+            # Fire-and-forget. The dispatcher's HWC call has a ~5 ms
+            # round-trip locally; doing it on a daemon thread keeps the
+            # dispatcher consumer thread free for the next event.
+            threading.Thread(
+                target=lambda: dispatcher.dispatch(cli),
+                daemon=True,
+                name=f"stt-direct-{trigger[:12]}",
+            ).start()
+
+        return handler
 
     def _make_intent_handler(self, action: str):
         """Create a closure that handles a matched intent.
