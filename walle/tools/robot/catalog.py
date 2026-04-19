@@ -188,13 +188,19 @@ class StopMovementAction(RobotAction):
 
 class HomeAction(RobotAction):
     def execute(self, runtime: RobotRuntime, args: dict) -> str:
+        global _head_tick_cache
         self._send_checked(runtime, "home")
+        _head_tick_cache = HEAD_TICK_CENTER
         return "Head centered"
 
 
 class StopAllAction(RobotAction):
     def execute(self, runtime: RobotRuntime, args: dict) -> str:
+        global _head_tick_cache
         self._send_checked(runtime, "stopall")
+        # `stopall` disables head PWM; next move will start from
+        # wherever the servo physically rested, so drop the cache.
+        _head_tick_cache = None
         return "Motors stopped, head servo off"
 
 
@@ -203,17 +209,66 @@ class StopAllAction(RobotAction):
 # ---------------------------------------------------------------------------
 
 
+def _percent_to_tick(percent: int) -> int:
+    """Convert 'percent left-to-right' to a PCA9685 tick.
+
+    The servo is mounted such that tick=150 is the robot's physical
+    right and tick=550 is its physical left. Users think in terms of
+    the robot's own left/right (position=0 → look left), so invert
+    here instead of rewiring.
+    """
+    percent = _clamp(percent, 0, 100)
+    span = HEAD_TICK_MAX - HEAD_TICK_MIN
+    return HEAD_TICK_MAX - int(round(span * percent / 100))
+
+
+# Module-level cache of the last commanded head tick. The firmware's
+# 60-tick-per-command delta is the real source of truth for what's
+# valid, so tracking it here lets us split a big absolute move into
+# multiple `head step` calls without a serial round-trip to query.
+# `None` means "we haven't commanded it yet"; fall back to center.
+_head_tick_cache: Optional[int] = None
+
+
+def _walk_head_to_tick(action: "RobotAction", runtime: RobotRuntime, target: int) -> int:
+    """Drive the head from the cached position to `target` via ±60 steps.
+
+    Returns the final tick (== target on success). Mutates the module
+    cache so subsequent calls know where the servo is.
+    """
+    global _head_tick_cache
+    target = max(HEAD_TICK_MIN, min(HEAD_TICK_MAX, target))
+    current = (
+        _head_tick_cache
+        if _head_tick_cache is not None
+        else HEAD_TICK_CENTER
+    )
+    delta = target - current
+    while abs(delta) > HEAD_MAX_DELTA:
+        step = HEAD_MAX_DELTA if delta > 0 else -HEAD_MAX_DELTA
+        action._send_checked(runtime, f"head step {step}")
+        current += step
+        delta = target - current
+    if delta != 0:
+        action._send_checked(runtime, f"head step {delta}")
+        current += delta
+    _head_tick_cache = current
+    return current
+
+
 class HeadPanAction(RobotAction):
     """Absolute head position as a percentage, 0=left, 50=center, 100=right.
 
-    The firmware enforces max 60 ticks of jump per command, so large swings
-    are split into a short sequence of `head step` commands. This keeps the
-    mechanical head from lurching even when the LLM asks for a big move.
+    The firmware enforces max 60 ticks of jump per command. We emit a
+    short sequence of `head step ±60` calls to walk the servo to the
+    target, then a final step for the remainder. This matches the
+    docstring promise that large swings don't require the LLM to
+    micro-step.
     """
 
     def execute(self, runtime: RobotRuntime, args: dict) -> str:
         percent = _clamp(args.get("position", 50), 0, 100)
-        self._send_checked(runtime, f"head pos {percent}")
+        _walk_head_to_tick(self, runtime, _percent_to_tick(percent))
         return f"Head pan -> {percent}%"
 
 
@@ -221,10 +276,17 @@ class HeadStepAction(RobotAction):
     """Relative head move by raw ticks, capped to firmware's ±60 safety."""
 
     def execute(self, runtime: RobotRuntime, args: dict) -> str:
+        global _head_tick_cache
         delta = _clamp(args.get("delta", 0), -HEAD_MAX_DELTA, HEAD_MAX_DELTA)
         if delta == 0:
             return "Head step 0 (no-op)"
         self._send_checked(runtime, f"head step {delta}")
+        base = (
+            _head_tick_cache
+            if _head_tick_cache is not None
+            else HEAD_TICK_CENTER
+        )
+        _head_tick_cache = max(HEAD_TICK_MIN, min(HEAD_TICK_MAX, base + delta))
         return f"Head step {delta:+d}"
 
 
@@ -234,10 +296,13 @@ class ScanSurroundingsAction(RobotAction):
     def execute(self, runtime: RobotRuntime, args: dict) -> str:
         speed = str(args.get("speed", "normal"))
         delay = self._DELAYS.get(speed, self._DELAYS["normal"])
-        sequence = ("head pos 20", "head pos 50", "head pos 80", "head pos 50")
-        for index, cmd in enumerate(sequence):
-            self._send_checked(runtime, cmd)
-            if index < len(sequence) - 1:
+        # Go 20% → 50% → 80% → 50%, walking each leg through the
+        # firmware's 60-tick delta using the shared helper so no leg
+        # gets rejected mid-scan.
+        targets = (20, 50, 80, 50)
+        for index, pct in enumerate(targets):
+            _walk_head_to_tick(self, runtime, _percent_to_tick(pct))
+            if index < len(targets) - 1:
                 runtime.sleep(delay)
         return f"Scanned surroundings ({speed})"
 
@@ -312,11 +377,15 @@ def build_default_robot_registry() -> RobotToolRegistry:
             DriveAction(
                 RobotToolSpec(
                     "drive",
-                    "Move the robot. direction=forward/backward/left/right. "
-                    "speed is 0-100 (percent of max). duration_ms is optional, "
-                    "max 5000; omit or set 0 for continuous motion that keeps "
-                    "running until `stop_movement` is called or the firmware "
-                    "watchdog fires after 3s.",
+                    "Drive the robot's WHEELS to move the whole body. Use for: "
+                    "'move forward/backward', 'go forward', 'turn left/right' "
+                    "(left/right spin the body in place). DO NOT use for "
+                    "'look left/right' — that is a head motion, use head_pan "
+                    "instead. direction=forward/backward/left/right. speed is "
+                    "0-100 (percent of max). duration_ms is optional, max 5000; "
+                    "omit or set 0 for continuous motion that keeps running "
+                    "until `stop_movement` is called or the firmware watchdog "
+                    "fires after 3s.",
                     {
                         "direction": {
                             "type": "string",
@@ -342,13 +411,24 @@ def build_default_robot_registry() -> RobotToolRegistry:
             HeadPanAction(
                 RobotToolSpec(
                     "head_pan",
-                    "Turn the head to an absolute horizontal position. "
-                    "position=0 is fully left, 50 is centered, 100 is fully right.",
+                    "Turn ONLY the head horizontally. Body stays still. "
+                    "Use for 'look left/right', 'turn your head', 'face X'. "
+                    "Do NOT use `drive` — that spins the whole robot. "
+                    "REQUIRED: pick `position` from this mapping — "
+                    "'look left' → 0, 'look slightly left' → 25, "
+                    "'face forward' → 50, 'look slightly right' → 75, "
+                    "'look right' → 100. "
+                    "DO NOT default to 50 for left/right requests.",
                     {
                         "position": {
                             "type": "integer",
                             "minimum": 0,
                             "maximum": 100,
+                            "description": (
+                                "0 = fully LEFT, 25 = slight left, "
+                                "50 = CENTER/forward, 75 = slight right, "
+                                "100 = fully RIGHT."
+                            ),
                         }
                     },
                     ("position",),
@@ -364,7 +444,12 @@ def build_default_robot_registry() -> RobotToolRegistry:
             ScanSurroundingsAction(
                 RobotToolSpec(
                     "scan_surroundings",
-                    "Sweep the head left-center-right-center to look around.",
+                    "Mechanical head-sweep demo: pan left → right → center. "
+                    "Use ONLY when the user explicitly says 'scan', 'sweep', "
+                    "or 'move your head around'. DO NOT use this for visual "
+                    "questions like 'what do you see?' or 'who is there?' — "
+                    "this tool only moves the servo and returns no image "
+                    "description. For visual questions, use capture_image.",
                     {
                         "speed": {
                             "type": "string",

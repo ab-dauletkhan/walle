@@ -17,6 +17,7 @@ python3 -m stt_tts.main --wake-word "hey, rocket" --listen-timeout 3.0
 
 import argparse
 import io
+import logging
 import os
 import queue
 import random
@@ -42,6 +43,8 @@ except ImportError:  # pragma: no cover - exercised on voice-less hosts
 
 
 from walle.voice.llm_client import LLMClient, MockLLMClient
+
+_log = logging.getLogger("walle.voice.assistant")
 
 
 # sounddevice and moonshine_voice are voice-only deps. Importing them
@@ -125,6 +128,20 @@ def _to_float32_audio(audio: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(audio)
 
 
+def _resample_mono(
+    audio: np.ndarray, src_rate: int, dst_rate: int
+) -> np.ndarray:
+    if src_rate == dst_rate:
+        return audio
+    from scipy.signal import resample_poly  # noqa: PLC0415
+    from math import gcd  # noqa: PLC0415
+
+    g = gcd(int(dst_rate), int(src_rate))
+    up = int(dst_rate) // g
+    down = int(src_rate) // g
+    return resample_poly(audio, up, down).astype(np.float32)
+
+
 def _play_audio_stable(
     audio: np.ndarray, sample_rate: int, blocking: bool = True
 ) -> None:
@@ -136,13 +153,7 @@ def _play_audio_stable(
     # paInvalidSampleRate. Doing it here keeps every caller unaware.
     target_rate = OUTPUT_RATE if OUTPUT_RATE is not None else sample_rate
     if target_rate != sample_rate:
-        from scipy.signal import resample_poly  # noqa: PLC0415
-        from math import gcd  # noqa: PLC0415
-
-        g = gcd(int(target_rate), int(sample_rate))
-        up = int(target_rate) // g
-        down = int(sample_rate) // g
-        audio = resample_poly(audio, up, down).astype(np.float32)
+        audio = _resample_mono(audio, sample_rate, target_rate)
         sample_rate = target_rate
 
     if OUTPUT_CHANNELS is not None and audio.ndim == 1 and OUTPUT_CHANNELS >= 2:
@@ -159,7 +170,35 @@ def _play_audio_stable(
     )
     if OUTPUT_DEVICE is not None:
         kwargs["device"] = OUTPUT_DEVICE
-    _sd().play(audio, **kwargs)
+    try:
+        _sd().play(audio, **kwargs)
+    except Exception as primary_err:
+        # The default ALSA output on Jetson frequently rejects Mimic3's
+        # native rate (22050 Hz) with paErrorCode -9999. Fall back once to
+        # 48000 Hz stereo — the near-universal rate for USB DACs and HDMI.
+        # If the user passed --speaker-rate/--speaker-device we respect
+        # their choice and don't retry.
+        if OUTPUT_RATE is not None:
+            raise
+        print(
+            f"  TTS playback retry: default output rejected {sample_rate} Hz "
+            f"({primary_err}); resampling to 48000 Hz stereo.",
+            file=sys.stderr,
+        )
+        mono_1d = audio if audio.ndim == 1 else audio[:, 0]
+        retry_audio = _resample_mono(mono_1d, sample_rate, 48000)
+        retry_audio = np.ascontiguousarray(
+            np.repeat(retry_audio[:, None], 2, axis=1)
+        )
+        retry_kwargs = dict(
+            samplerate=48000,
+            blocking=blocking,
+            latency=AUDIO_LATENCY,
+            blocksize=AUDIO_BLOCKSIZE,
+        )
+        if OUTPUT_DEVICE is not None:
+            retry_kwargs["device"] = OUTPUT_DEVICE
+        _sd().play(retry_audio, **retry_kwargs)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -248,6 +287,10 @@ class BaseTTSEngine(ABC):
     def __init__(self) -> None:
         self._tts_queue: queue.Queue[Optional[str]] = queue.Queue(maxsize=50)
         self._tts_busy = threading.Event()  # set while synthesising or playing
+        # Signalled by drain() so an in-flight _synthesize_and_play() can
+        # short-circuit between the HTTP round-trip and playback. Cleared
+        # on the next successful enqueue so the next turn starts fresh.
+        self._stop_event = threading.Event()
         self._tts_worker = threading.Thread(
             target=self._tts_worker_loop, daemon=True
         )
@@ -263,10 +306,22 @@ class BaseTTSEngine(ABC):
             if item is None:
                 self._tts_queue.task_done()
                 break
+            t0 = time.monotonic()
             try:
                 self._tts_busy.set()
+                _log.debug("tts: synth+play start %r", item)
                 self._synthesize_and_play(item)
+                _log.info(
+                    "tts: synth+play done in %.2fs (%r)",
+                    time.monotonic() - t0,
+                    item[:60],
+                )
             except Exception as e:  # pragma: no cover - engine-specific
+                _log.exception(
+                    "tts: synth+play failed after %.2fs: %s",
+                    time.monotonic() - t0,
+                    e,
+                )
                 print(f"  TTS worker error: {e}", file=sys.stderr)
             finally:
                 self._tts_busy.clear()
@@ -277,17 +332,44 @@ class BaseTTSEngine(ABC):
         text = text.strip()
         if not text:
             return
+        # Fresh sentence means the stop-event from a previous drain is stale.
+        self._stop_event.clear()
         self._tts_queue.put(text)
 
-    def wait_until_idle(self) -> None:
-        """Block until the queue is drained AND the last sentence finished playing."""
-        self._tts_queue.join()
-        # Guard against a tiny window where join() returns before busy clears.
-        while self._tts_busy.is_set():
-            time.sleep(0.01)
+    def wait_until_idle(
+        self,
+        poll: float = 0.05,
+        max_wait: float = 20.0,
+        stop_flag: Optional[threading.Event] = None,
+    ) -> None:
+        """Block until the queue is drained AND the last sentence finished playing.
+
+        Polls instead of `queue.join()` so a hung TTS worker (e.g. Mimic3 HTTP
+        stuck) cannot deadlock the LLM thread — the old `join()` waited for
+        `task_done()`, which never fires if the worker is blocked inside
+        `requests.get()`. After `max_wait` we forcibly drain and return.
+
+        `stop_flag` lets the caller bail out early (used by SpeechRouter to
+        honour a mid-TTS "stop" intent).
+        """
+        deadline = time.monotonic() + max_wait
+        while time.monotonic() < deadline:
+            if stop_flag is not None and stop_flag.is_set():
+                self.drain()
+                return
+            if self._tts_queue.empty() and not self._tts_busy.is_set():
+                return
+            time.sleep(poll)
+        print(
+            "  ... TTS wait_until_idle timeout — draining to unblock pipeline",
+            file=sys.stderr,
+        )
+        self.drain()
 
     def drain(self) -> None:
-        """Drop any pending sentences (used on stop-intent)."""
+        """Drop any pending sentences and interrupt in-flight playback."""
+        # Signal the worker to skip playback if it's between HTTP and aplay.
+        self._stop_event.set()
         try:
             while True:
                 self._tts_queue.get_nowait()
@@ -325,11 +407,15 @@ class Mimic3TTSEngine(BaseTTSEngine):
         self._voice = voice
 
     def _synthesize_and_play(self, text: str) -> None:
+        # Early-out if a drain() has already been requested — avoids a slow
+        # HTTP round-trip whose audio we would throw away anyway.
+        if self._stop_event.is_set():
+            return
         try:
             resp = requests.get(
                 f"{self._url}/api/tts",
                 params={"text": text, "voice": self._voice},
-                timeout=30,
+                timeout=8,  # lower than 30s so a hung Mimic3 can't stall the pipeline
             )
             if resp.status_code != 200:
                 print(f"  TTS error: HTTP {resp.status_code}", file=sys.stderr)
@@ -350,6 +436,9 @@ class Mimic3TTSEngine(BaseTTSEngine):
             except Exception as e:
                 print(f"  TTS error: corrupt audio data: {e}", file=sys.stderr)
                 return
+            # Second checkpoint: drain() may have fired while HTTP was in flight.
+            if self._stop_event.is_set():
+                return
             _play_audio_stable(audio, sr)
         except requests.exceptions.ConnectionError:
             print(
@@ -357,8 +446,102 @@ class Mimic3TTSEngine(BaseTTSEngine):
                 file=sys.stderr,
             )
             print(f"  [TTS-fallback] {text}")
+        except requests.exceptions.Timeout:
+            print(
+                f"  TTS error: Mimic3 HTTP timeout at {self._url} — skipping sentence",
+                file=sys.stderr,
+            )
         except Exception as e:
             print(f"  TTS error: {e} — falling back to console", file=sys.stderr)
+            print(f"  [TTS-fallback] {text}")
+
+
+class PiperTTSEngine(BaseTTSEngine):
+    """In-process Piper TTS — faster and more natural than Mimic3.
+
+    Piper runs an ONNX voice model directly in this process. No HTTP
+    server, no network hop: per-sentence synthesis is ~100 ms on
+    Jetson vs ~500 ms for Mimic3. Combined with the existing
+    sentence-level LLM→TTS pipelining this feels like streaming
+    speech. For each sentence we collect the yielded int16 chunks
+    and hand the concatenated buffer to `_play_audio_stable`, which
+    already handles the UACDemoV1.0 48 kHz stereo quirks.
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        speaker_id: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"Piper voice model not found: {model_path}. "
+                "Download one from "
+                "https://huggingface.co/rhasspy/piper-voices "
+                "(both the .onnx and .onnx.json)."
+            )
+        config_path = model_path + ".json"
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(
+                f"Piper voice config not found: {config_path}. "
+                "Each .onnx model needs a matching .onnx.json beside it."
+            )
+        from piper import PiperVoice  # noqa: PLC0415
+
+        self._voice = PiperVoice.load(model_path, config_path=config_path)
+        self._speaker_id = speaker_id
+        # piper-tts >=1.3 yields AudioChunk objects from `synthesize(text)`.
+        # Older builds expose `synthesize_stream_raw(text)` which yields raw
+        # int16 bytes. Detect once so the hot path stays branch-free.
+        self._has_chunk_api = hasattr(
+            self._voice, "synthesize"
+        ) and not hasattr(self._voice, "synthesize_stream_raw")
+        self._fallback_rate = getattr(
+            getattr(self._voice, "config", None), "sample_rate", 22050
+        )
+
+    def _iter_int16_chunks(self, text: str):
+        """Yield (int16 numpy array, sample_rate) for each synthesis chunk."""
+        if self._has_chunk_api:
+            kwargs = {}
+            if self._speaker_id is not None:
+                kwargs["speaker_id"] = self._speaker_id
+            for chunk in self._voice.synthesize(text, **kwargs):
+                arr = getattr(chunk, "audio_int16_array", None)
+                if arr is None:
+                    raw = getattr(chunk, "audio_int16_bytes", None)
+                    if raw is None:
+                        continue
+                    arr = np.frombuffer(raw, dtype=np.int16)
+                sr = getattr(chunk, "sample_rate", self._fallback_rate)
+                yield arr, sr
+        else:
+            kwargs = {}
+            if self._speaker_id is not None:
+                kwargs["speaker_id"] = self._speaker_id
+            for raw in self._voice.synthesize_stream_raw(text, **kwargs):
+                yield np.frombuffer(raw, dtype=np.int16), self._fallback_rate
+
+    def _synthesize_and_play(self, text: str) -> None:
+        if self._stop_event.is_set():
+            return
+        try:
+            chunks = []
+            sample_rate = self._fallback_rate
+            for arr, sr in self._iter_int16_chunks(text):
+                if self._stop_event.is_set():
+                    return
+                chunks.append(arr)
+                sample_rate = sr
+            if not chunks:
+                return
+            if self._stop_event.is_set():
+                return
+            audio = np.concatenate(chunks)
+            _play_audio_stable(audio, sample_rate)
+        except Exception as e:
+            print(f"  Piper TTS error: {e} — falling back to console", file=sys.stderr)
             print(f"  [TTS-fallback] {text}")
 
 
@@ -388,9 +571,11 @@ class SpeechRouter(TranscriptEventListener):
 
     def __init__(
         self,
-        llm: LLMClient,
         tts: BaseTTSEngine,
         system_prompt: str,
+        chat_loop=None,
+        do_dispatcher=None,
+        llm: Optional["LLMClient"] = None,
         wake_word: str = "hey",
         listen_timeout: float = 0.5,
         listen_timeout_long: float = 1.0,
@@ -398,18 +583,49 @@ class SpeechRouter(TranscriptEventListener):
         wake_sounds_dir: Optional[str] = None,
         mic_pause: Optional[Callable[[], None]] = None,
         mic_resume: Optional[Callable[[], None]] = None,
+        follow_up: bool = False,
+        follow_up_timeout: float = 3.0,
     ):
+        # The voice pipeline now drives the LLM through ChatLoop directly
+        # (streams SAY/DO callbacks), not through an LLMClient.stream_chat
+        # generator. `llm` is kept for backward compatibility with the
+        # standalone assistant.py entrypoint that still constructs an
+        # OllamaLLMClient for ad-hoc testing; integrated walle passes
+        # `chat_loop` instead.
+        self._chat_loop = chat_loop
+        self._do_dispatcher = do_dispatcher
         self._llm = llm
         self._tts = tts
         self._mic_pause_cb = mic_pause
         self._mic_resume_cb = mic_resume
         self._system_prompt = system_prompt
-        self._wake_word = wake_word.strip()
-        self._wake_tokens = set(re.sub(r"[^\w\s]", "", wake_word).lower().split())
+        # Accept a comma-separated list of wake phrases. Moonshine reliably
+        # substitutes short single-phoneme wakes — "hey" gets transcribed as
+        # "okay", "hi", "hello" on a substantial fraction of real utterances
+        # — so a single-phrase wake word blocks most of the user's attempts
+        # to talk to the robot. The whole list is tried in order; the first
+        # match wins and `_detect_wake` returns the text after that phrase.
+        self._wake_phrases: list[str] = [
+            phrase.strip() for phrase in wake_word.split(",") if phrase.strip()
+        ] or [wake_word.strip()]
+        # `_wake_word` kept as a user-facing string (banners, error text) —
+        # first alternative is the canonical phrase.
+        self._wake_word = self._wake_phrases[0]
+        self._wake_tokens = set(
+            re.sub(r"[^\w\s]", "", self._wake_word).lower().split()
+        )
         self._listen_timeout = listen_timeout
         self._listen_timeout_long = listen_timeout_long
         self._max_utterance = max_utterance
         self._wake_sounds_dir = wake_sounds_dir
+        # Follow-up policy. Off by default: a physical robot in a noisy room
+        # reliably self-triggers on background speech / TTS tail / Moonshine
+        # hallucinations when it keeps listening without the wake word. When
+        # enabled, we still commit follow-ups through a stricter quality
+        # filter (_is_plausible_followup) and use a shorter window than the
+        # original --post-speak-timeout.
+        self._follow_up_enabled = bool(follow_up)
+        self._follow_up_timeout = float(follow_up_timeout)
 
         self._last_stable_text: str = ""
         self._last_partial_raw: str = ""
@@ -421,9 +637,20 @@ class SpeechRouter(TranscriptEventListener):
             20  # Rolling window to prevent unbounded memory growth
         )
         self._processing = False
-        self._stop_requested = False
+        # `_stop_requested` is a threading.Event rather than a plain bool so
+        # it can be passed straight into `BaseTTSEngine.wait_until_idle` to
+        # short-circuit the polling loop the instant a "stop" intent fires.
+        self._stop_requested = threading.Event()
         self._speaking = False
         self._last_text_length = 0
+
+        # Unified mic-gate, ported from box/pipeline_mem/g4-e2b-boxy_streaming.py.
+        # `_audio_active` is set for the full LLM+TTS span so callbacks can
+        # drop transcripts in one consistent check. `_mic_gate_until` adds a
+        # post-turn time cooldown that absorbs speaker echo still in the
+        # PortAudio buffer after TTS stops.
+        self._audio_active = threading.Event()
+        self._mic_gate_until: float = 0.0
 
         self._state = self.IDLE
         self._command_text = ""
@@ -449,11 +676,121 @@ class SpeechRouter(TranscriptEventListener):
         self._echo_suppress_until: float = 0
         self._wake_play_lock = threading.Lock()
         self._last_wake_play_time = 0.0
+        # Time-based cooldown set by the IntentRecognizer handler. When
+        # a direct-action intent ("move forward", "stop moving") fires,
+        # we don't want the same utterance to also reach the LLM — the
+        # text-exact-match `_handled_utterances` set mis-fired in the
+        # field (punctuation/whitespace drift between what the handler
+        # receives and what `on_line_completed` sees), so we pair it
+        # with a short cooldown.
+        self._intent_cooldown_until: float = 0.0
+
+        # Counts consecutive partial transcripts (within one Moonshine
+        # "line") that matched the stop intent. Under TTS load Moonshine
+        # occasionally hallucinates the single word "stop" for one frame
+        # of audio while the LLM's own reply is still streaming — firing
+        # the stop on the very first match self-interrupts the response.
+        # We require two consecutive confirming partials before
+        # signalling `_request_stop`.
+        self._partial_stop_hits: int = 0
+
+        # Diagnostic heartbeat. Logs one line every 5 s with gate state +
+        # dispatcher stats + last-partial age so freezes (e.g. STT stops
+        # firing while vision is running) can be diagnosed without
+        # sprinkling ad-hoc prints.
+        self._last_partial_ts: float = 0.0
+        self._dispatcher_ref = None  # attached post-init by VoiceAssistant
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name="router-heartbeat",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+
+    _INTENT_COOLDOWN = 2.0  # seconds: skip LLM routing after intent fires
+    _HEARTBEAT_INTERVAL_SEC = 5.0
+
+    def attach_dispatcher(self, dispatcher) -> None:
+        """Late-binding hook so the heartbeat can report dispatcher stats.
+
+        Router is built before the dispatcher (dispatcher needs router as
+        a listener), so this wire-up happens post-construction from
+        VoiceAssistant.
+        """
+        self._dispatcher_ref = dispatcher
+
+    def attach_mic(self, mic) -> None:
+        """Late-binding hook so the heartbeat can report mic liveness."""
+        self._mic_ref = mic
+
+    def _heartbeat_loop(self) -> None:
+        while not self._heartbeat_stop.wait(self._HEARTBEAT_INTERVAL_SEC):
+            try:
+                self._emit_heartbeat()
+            except Exception:
+                _log.exception("router heartbeat failed")
+
+    def _emit_heartbeat(self) -> None:
+        now = time.time()
+        if self._last_partial_ts:
+            partial_age = f"{now - self._last_partial_ts:.1f}s"
+        else:
+            partial_age = "never"
+        tts_busy_ev = getattr(self._tts, "_tts_busy", None)
+        tts_busy = bool(tts_busy_ev and tts_busy_ev.is_set())
+        dispatcher = self._dispatcher_ref
+        qdepth_hwm = -1
+        dropped = 0
+        audio_events = -1
+        if dispatcher is not None:
+            stats = getattr(dispatcher, "stats", None)
+            if stats is not None:
+                qdepth_hwm = getattr(stats, "queue_depth_hwm", -1)
+                dropped = getattr(stats, "dropped_partial", 0)
+                audio_events = getattr(stats, "audio_thread_events", -1)
+        # Several MicTranscriber versions don't expose is_running();
+        # fall back to the presence of a live stream/thread attribute so
+        # we don't spam "err" every 5 s.
+        mic_running = "?"
+        mic = getattr(self, "_mic_ref", None)
+        if mic is not None:
+            for attr in ("is_running", "running", "is_active", "active"):
+                if hasattr(mic, attr):
+                    val = getattr(mic, attr)
+                    try:
+                        mic_running = str(val() if callable(val) else val)
+                    except Exception:
+                        mic_running = "err"
+                    break
+            else:
+                # Best-effort: if there's a `_stream` or `_thread` attr,
+                # infer liveness from that.
+                stream = getattr(mic, "_stream", None) or getattr(mic, "stream", None)
+                if stream is not None:
+                    mic_running = f"stream={type(stream).__name__}"
+                else:
+                    mic_running = "unknown"
+        _log.info(
+            "router heartbeat: state=%s gated=%s processing=%s tts_busy=%s "
+            "last_partial=%s qdepth_hwm=%d dropped_partials=%d "
+            "audio_events=%d mic_running=%s",
+            self._state,
+            self._is_gated(),
+            self._processing,
+            tts_busy,
+            partial_age,
+            qdepth_hwm,
+            dropped,
+            audio_events,
+            mic_running,
+        )
 
     # -- Called by IntentRecognizer callback to mark a line as handled --
 
     def mark_handled(self, utterance: str) -> None:
         self._handled_utterances.add(utterance.strip())
+        self._intent_cooldown_until = time.time() + self._INTENT_COOLDOWN
 
     # -- TTS with echo suppression --
     #    Two layers:
@@ -461,10 +798,15 @@ class SpeechRouter(TranscriptEventListener):
     #    2) _is_echo() checks word overlap against last spoken text (content-based)
     #    Together they reliably filter self-heard audio on slow STT pipelines.
 
-    _ECHO_COOLDOWN = 0.05  # hard mic-mute after TTS; keep tight so follow-up feels instant
-    _ECHO_WINDOW = (
-        0.8  # seconds after TTS to keep content-based echo filtering
-    )
+    # Widened after moving to Piper TTS + hybrid mic-pause. mic.start()
+    # itself takes ~200-500 ms to deliver its first clean callback, and
+    # Piper's natural voice is easier for Moonshine to transcribe back
+    # as "user" text than Mimic3's robotic output was — so the windows
+    # need to absorb both the restart transient and any tail audio that
+    # leaked into PortAudio's buffer during playback.
+    _ECHO_COOLDOWN = 0.3
+    _ECHO_WINDOW = 2.5
+    _POST_TURN_GATE = 1.0
     _WAKE_DEBOUNCE_SECONDS = 1.5
 
     _INITIAL_LISTEN_WINDOW = 10.0  # seconds to start speaking after wake / after TTS
@@ -479,8 +821,30 @@ class SpeechRouter(TranscriptEventListener):
         """
         return max(self._INITIAL_LISTEN_WINDOW, self._ECHO_WINDOW + 1)
 
+    def _is_gated(self) -> bool:
+        """Single source of truth for 'should we ignore this mic transcript?'.
+
+        Replaces the old (_processing or _speaking or echo-window) triad so
+        there is no race window where flags are half-set. Mirrors box's
+        `audio_tracker.active.is_set() or time.time() < mic_gate_until`.
+
+        Also checks TTS `_tts_busy` so non-LLM TTS (startup "At your
+        command." announcement, wake sounds) can't be echoed back into
+        the transcript pipeline and fire intents.
+        """
+        if self._audio_active.is_set() or time.time() < self._mic_gate_until:
+            return True
+        tts_busy = getattr(getattr(self._tts, "_tts_busy", None), "is_set", None)
+        return bool(tts_busy and tts_busy())
+
     def _pause_mic(self) -> None:
-        """Hard-gate the mic: stop audio capture so TTS can't self-echo."""
+        """Legacy no-op: kept for API compatibility.
+
+        Previously tore down the PortAudio input stream via `self._mic.stop()`.
+        That was heavy, slow, and anything buffered before the stop leaked into
+        the next callback as "user speech". We now gate transcripts via
+        `_is_gated()` instead and leave the stream running.
+        """
         if self._mic_pause_cb is None:
             return
         try:
@@ -497,6 +861,11 @@ class SpeechRouter(TranscriptEventListener):
             print(f"  ... mic resume error: {e}", file=sys.stderr)
 
     _SENTENCE_ENDS = ".?!\n"
+    # Clause-break streaming: once the LLM has buffered this many chars
+    # without a sentence-ender, flush at the first comma/semicolon past
+    # `_MIN_CHUNK_CHARS` so the user hears audio sooner.
+    _CLAUSE_FLUSH_CHARS = 80
+    _MIN_CHUNK_CHARS = 40
 
     def _begin_speaking(self) -> None:
         """Enter speaking state: gate mic so TTS can't self-echo."""
@@ -550,6 +919,70 @@ class SpeechRouter(TranscriptEventListener):
         "ah", "er", "eh", "yeah", "yep", "the", "a",
     }
 
+    # Small, high-signal second-person tokens that almost always indicate
+    # the user is actually addressing WALL-E. Two-word follow-ups are
+    # allowed only if they contain one of these — a pure-noun fragment
+    # like "Tutland," or "asthma set" is rejected.
+    _FOLLOWUP_SIGNAL_TOKENS = frozenset(
+        {
+            "you", "your", "walle", "wall-e", "walley", "robot",
+            "please", "can", "could", "would", "what", "why", "how",
+            "when", "where", "who", "is", "are", "do", "does", "did",
+            "tell", "say", "show", "look", "see", "yes", "no", "ok",
+            "okay", "stop", "wait", "help", "thanks", "thank", "hi",
+            "hello", "move", "turn", "go", "stop", "drive",
+        }
+    )
+
+    def _is_plausible_followup(self, text: str) -> bool:
+        """Quality gate for follow-up-mode commits.
+
+        Moonshine's background hallucinations during a follow-up window
+        are almost always short proper-noun fragments with no second-
+        person addressing (e.g. "Tutland,", "The asthma was set from.").
+        Require at least one second-person signal token, or ≥4 tokens
+        of actual English (long enough that the user is clearly talking
+        *to* the robot, not just near it).
+        """
+        normalized = self._strip_punctuation(text).lower().strip()
+        if not normalized:
+            return False
+        tokens = [t for t in normalized.split() if t]
+        if not tokens:
+            return False
+        # Any clearly-addressed utterance passes.
+        if any(t in self._FOLLOWUP_SIGNAL_TOKENS for t in tokens):
+            return True
+        # Long utterances also pass — if the user speaks 4+ real words
+        # it's extremely unlikely to be pure noise.
+        return len(tokens) >= 4
+
+    def _play_ready_beep(self) -> None:
+        """Short sine-wave chime signalling 'mic is open, your turn'.
+
+        Played at the end of a turn (including after a 'stop' interrupt)
+        before the follow-up LISTENING window opens. Without this cue the
+        user has no way to tell whether WALL-E is genuinely waiting or has
+        gone deaf — especially painful after 'stop', where the abrupt
+        silence is otherwise ambiguous.
+
+        Fires while `_mic_gate_until` is still active, so the chime itself
+        cannot self-echo into the next transcript.
+        """
+        try:
+            sr = 22050
+            duration_s = 0.12
+            n = int(sr * duration_s)
+            t = np.arange(n, dtype=np.float32) / sr
+            tone = (0.25 * np.sin(2 * np.pi * 660 * t)).astype(np.float32)
+            fade = min(int(sr * 0.01), n // 2)
+            if fade:
+                tone[:fade] *= np.linspace(0.0, 1.0, fade, dtype=np.float32)
+                tone[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+            _play_audio_stable(tone, sr, blocking=False)
+        except Exception as e:  # pragma: no cover — cosmetic cue only
+            print(f"  ... ready beep skipped: {e}", file=sys.stderr)
+
     def _play_wake_sound(self, initial_command: str = "") -> None:
         """Play a random WAV from wake_sounds_dir (non-blocking).
 
@@ -583,14 +1016,17 @@ class SpeechRouter(TranscriptEventListener):
         self._last_wake_play_time = now
         self._pause_mic()
 
+        chosen_wav = random.choice(wavs)
+        print(f"  🔊 wake sound: {os.path.basename(chosen_wav)}", flush=True)
+
         def _play():
             try:
                 with self._wake_play_lock:
-                    sr, audio = _wavfile().read(random.choice(wavs))
+                    sr, audio = _wavfile().read(chosen_wav)
                     _play_audio_stable(audio, sr)
                     time.sleep(self._ECHO_COOLDOWN)
             except Exception as e:
-                print(f"  Wake sound error: {e}", file=sys.stderr)
+                print(f"  Wake sound error: {e}", file=sys.stderr, flush=True)
             finally:
                 self._resume_mic()
                 self._speaking = False
@@ -603,19 +1039,80 @@ class SpeechRouter(TranscriptEventListener):
 
         threading.Thread(target=_play, daemon=True).start()
 
-    def _is_echo(self, text: str) -> bool:
-        """Content-based check: is this text just the mic hearing our own TTS?"""
-        if time.time() > self._echo_suppress_until:
+    def announce(self, text: str) -> bool:
+        """Speak a short proactive line (e.g. face greeting) without
+        stepping on an in-flight conversation turn OR on the user's
+        listen window.
+
+        Returns True if the utterance was enqueued to TTS, False when
+        skipped.
+
+        Skipped when:
+          - a turn is already being processed (LLM+TTS span active),
+          - TTS is busy / mic is gated,
+          - the state machine is LISTENING (user was asked "Yes, how
+            can I help you?" and is mid-utterance). Barging in there
+            corrupts the user's command with the greeting's echo.
+
+        Arms the echo guard BEFORE enqueue so a mic callback that fires
+        in the brief gap before `_tts_busy` is set still drops the echo.
+        """
+        if not text or not text.strip():
             return False
+        if self._is_gated() or self._processing:
+            return False
+        if self._state != self.IDLE:
+            return False
+        self.prime_echo_guard(text)
+        try:
+            self._tts.enqueue(text)
+        except Exception:
+            return False
+        return True
+
+    def prime_echo_guard(self, spoken_text: str) -> None:
+        """Seed the echo filter and mic gate for a non-LLM TTS utterance.
+
+        Call this after any `tts.speak(...)` that happens outside the
+        normal `_handle_llm_query` flow — e.g. the startup "At your
+        command." announcement. Without it, PortAudio's buffer tail
+        delivers the speaker output back to the mic after the TTS
+        `_tts_busy` flag has already cleared, so `_is_gated()` returns
+        False and `_is_echo()` has no `_echo_words` to match against.
+        """
+        cleaned = self._strip_punctuation(spoken_text).lower().split()
+        if cleaned:
+            self._echo_words = set(cleaned)
+        now = time.time()
+        self._mic_gate_until = max(self._mic_gate_until, now + self._POST_TURN_GATE)
+        self._echo_suppress_until = max(
+            self._echo_suppress_until, now + self._ECHO_WINDOW
+        )
+
+    def _is_echo(self, text: str) -> bool:
+        """Content-based check: is this text just the mic hearing our own TTS?
+
+        Intentionally NOT time-gated anymore. Under Jetson load Moonshine
+        often finalizes the echoed transcript several seconds after Piper
+        finished speaking — past any reasonable `_echo_suppress_until`
+        window. A >70% word overlap with the last TTS text is a strong
+        signal it's self-echo regardless of when it arrives, so we hold
+        `_echo_words` until the next turn overwrites it.
+
+        Threshold tightened to 0.8: at 0.7 a drifted Moonshine transcript of
+        a long TTS sentence could share ~75% of its tokens with the echo set
+        (e.g. "Then I dial assist accordingly." matched the LLM's "If it's
+        related to a directional move like before… I'll assist accordingly.").
+        Short legitimate replies (1-3 tokens) rarely overlap the LLM's full
+        reply set at ≥0.8.
+        """
         if not self._echo_words:
             return False
         words = set(self._strip_punctuation(text).lower().split())
         if not words:
             return False
         overlap = len(words & self._echo_words) / len(words)
-        return (
-            overlap > 0.6
-        )  # Raised from 0.4 to reduce false positives on short phrases
+        return overlap > 0.8
 
     # -- Wake word detection --
 
@@ -624,31 +1121,33 @@ class SpeechRouter(TranscriptEventListener):
         return re.sub(r"[^\w\s]", "", text)
 
     def _detect_wake(self, text: str) -> Optional[str]:
-        """Check for wake word and return the text AFTER it, or None.
+        """Check for any configured wake phrase and return the text AFTER it.
 
-        Strips punctuation and lowercases both sides so that
-        "Hey, rocket!" matches wake word "hey rocket" or "hey, rocket".
+        Strips punctuation and lowercases both sides so "Hey, rocket!"
+        matches a wake phrase of "hey rocket" or "hey, rocket". Uses
+        word-boundary-aware matching so "rocket launcher" doesn't trigger
+        a bare "rocket" wake.
 
-        Uses word-boundary-aware matching to avoid false positives
-        (e.g. "rocket launcher" won't trigger on wake word "rocket").
+        Tries each alternate in `_wake_phrases`. Returns the tail after
+        the first matching alternate so common STT substitutions ("okay"
+        for "hey", "wall e" for "walle") don't make the robot unreachable.
         """
-        clean = self._strip_punctuation(text).lower()
-        wake_clean = self._strip_punctuation(self._wake_word).lower()
+        text_tokens = self._strip_punctuation(text).lower().split()
+        if not text_tokens:
+            return None
 
-        # Word-boundary-aware token match: wake tokens must appear as
-        # whole words in sequence within the text tokens
-        wake_token_list = wake_clean.split()
-        text_tokens = clean.split()
-        wi = 0
-        last_match_idx = -1
-        for ti, token in enumerate(text_tokens):
-            if wi < len(wake_token_list) and token == wake_token_list[wi]:
-                wi += 1
-                last_match_idx = ti
-        if wi == len(wake_token_list):
-            # Return text after the last matched wake token
-            remaining_tokens = text_tokens[last_match_idx + 1 :]
-            return " ".join(remaining_tokens)
+        for wake_phrase in self._wake_phrases:
+            wake_tokens = self._strip_punctuation(wake_phrase).lower().split()
+            if not wake_tokens:
+                continue
+            wi = 0
+            last_match_idx = -1
+            for ti, token in enumerate(text_tokens):
+                if wi < len(wake_tokens) and token == wake_tokens[wi]:
+                    wi += 1
+                    last_match_idx = ti
+            if wi == len(wake_tokens):
+                return " ".join(text_tokens[last_match_idx + 1 :])
         return None
 
     # -- Silence timeout management --
@@ -711,6 +1210,25 @@ class SpeechRouter(TranscriptEventListener):
         if self._processing:
             # Previous turn is still running; drop whatever accumulated.
             return
+        # If IntentRecognizer just fired a handler for this same
+        # utterance, skip the LLM entirely. `on_line_completed` already
+        # honours this gate, but the partial-fallback path above
+        # (`_last_partial_raw`) bypassed it — produced a phantom second
+        # tool call ("move forward" → drive handler → then LLM sees
+        # "Move forward." via the partial and calls drive a second time).
+        if command:
+            normalized = self._strip_punctuation(command).lower().strip()
+            normalized_handled = {
+                self._strip_punctuation(h).lower().strip()
+                for h in self._handled_utterances
+            }
+            if (
+                normalized in normalized_handled
+                or time.time() < self._intent_cooldown_until
+            ):
+                print(f"  ... '{command}' handled as intent — skipping LLM")
+                self._handled_utterances.clear()
+                return
         # Filter out Moonshine's filler-word hallucinations on silence/noise
         # without rejecting legitimate short follow-ups like "what?", "why?",
         # "okay", "stop", "yes", "no".
@@ -722,7 +1240,27 @@ class SpeechRouter(TranscriptEventListener):
             ):
                 print(f"  ... ignoring filler '{command}'")
                 return
+
+        # Follow-up-specific hallucination filter. In follow-up mode the mic
+        # is open without the user doing anything to announce intent, so
+        # Moonshine's noise transcripts ("Tutland,", "The asthma was set
+        # from.") land here. The wake-word path already had an explicit
+        # user action in front of it — the filter is less important there.
+        if (
+            self._follow_up_enabled
+            and command
+            and not self._is_plausible_followup(command)
+        ):
+            print(f"  ... ignoring implausible follow-up '{command}'")
+            return
         if command:
+            # Gate the mic BEFORE spawning the thread — otherwise Moonshine's
+            # partial/final callbacks can fire in the scheduling gap between
+            # `Thread.start()` and the thread body setting `_processing=True`,
+            # producing a false second LLM turn on top of the first.
+            self._processing = True
+            self._stop_requested.clear()
+            self._audio_active.set()
             threading.Thread(
                 target=self._handle_llm_query,
                 args=(command,),
@@ -732,13 +1270,43 @@ class SpeechRouter(TranscriptEventListener):
             print("  ... no command heard, going back to sleep.")
 
     def _is_stop_intent(self, text: str) -> bool:
+        """Match a stop intent without false-positiving on long utterances.
+
+        Two rules:
+          1. Exact match against `_stop_phrases` — bare "stop",
+             "shut up", "wall-e stop", etc.
+          2. Short utterance (≤ 2 tokens) containing a stop keyword —
+             lets "stop please", "okay stop", "stop talking" through
+             without matching a paragraph that happens to say "stop".
+
+        Substring matching was removed because TTS that coached the
+        user ("just say: stop wall-e") echoed back through the mic
+        and self-interrupted. A genuine barge-in is either one or
+        two words long anyway.
+        """
         normalized = self._strip_punctuation(text).lower().strip()
-        return normalized in self._stop_phrases
+        if not normalized:
+            return False
+        if normalized in self._stop_phrases:
+            return True
+        tokens = normalized.split()
+        if len(tokens) <= 2 and any(
+            t in {"stop", "cancel", "quiet"} for t in tokens
+        ):
+            return True
+        return False
 
     def _request_stop(self) -> None:
-        """Signal the active LLM/TTS turn to bail out as soon as possible."""
+        """Signal the active LLM/TTS turn to bail out as soon as possible.
+
+        Idempotent: returns silently if a stop is already in flight. Partial
+        transcripts for the same utterance would otherwise print
+        "✋ stop heard" 2-3 times in a row as Moonshine re-emits refinements.
+        """
+        if self._stop_requested.is_set():
+            return
         print("  ✋ stop heard — interrupting.")
-        self._stop_requested = True
+        self._stop_requested.set()
         try:
             self._tts.drain()
         except Exception:
@@ -748,11 +1316,40 @@ class SpeechRouter(TranscriptEventListener):
 
     def on_line_started(self, event):
         self._last_text_length = 0
+        self._partial_stop_hits = 0
 
     def on_line_text_changed(self, event):
-        if self._processing or self._speaking or self._is_echo(event.line.text):
-            return
         text = event.line.text
+        # Stamp *before* the gate check so the heartbeat shows a fresh
+        # age even while we're intentionally dropping transcripts — the
+        # goal is to tell "STT is silent" apart from "STT is gated".
+        self._last_partial_ts = time.time()
+        # Barge-in on partial transcripts too. Under heavy CPU load
+        # Moonshine often doesn't finalize a line while TTS is playing,
+        # so `on_line_completed` never fires — the stop intent would
+        # only be seen AFTER the response finished, which is too late.
+        #
+        # But require two consecutive partials that match stop-intent
+        # before firing: a single-frame "stop" hallucination while the
+        # LLM is mid-reply otherwise self-interrupts. Two consecutive
+        # partials within one Moonshine line mean the word was stable
+        # across endpointing refinements — a real utterance.
+        #
+        # If the dispatcher dropped partials between the previous
+        # delivered event and this one, the "consecutive" invariant is
+        # broken — reset the counter so a stop-match here can only fire
+        # if paired with a fresh follow-up match.
+        if getattr(event, "dispatcher_drops_since_last", 0):
+            self._partial_stop_hits = 0
+        if self._audio_active.is_set() and self._is_stop_intent(text):
+            self._partial_stop_hits += 1
+            if self._partial_stop_hits >= 2:
+                self._request_stop()
+                return
+        else:
+            self._partial_stop_hits = 0
+        if self._is_gated() or self._is_echo(text):
+            return
         if self._state == self.LISTENING:
             # Only reset the silence timer when the transcript actually GREW
             # with new content. Moonshine re-emits partial refinements even
@@ -766,10 +1363,14 @@ class SpeechRouter(TranscriptEventListener):
             display = f"  👂 {text}"
         else:
             display = f"  🎙  {text}"
-        print(f"\r{display}", end="", flush=True)
-        if len(display) < self._last_text_length:
-            print(" " * (self._last_text_length - len(display)), end="", flush=True)
-        self._last_text_length = len(display)
+        if sys.stdout.isatty():
+            print(f"\r{display}", end="", flush=True)
+            if len(display) < self._last_text_length:
+                print(" " * (self._last_text_length - len(display)), end="", flush=True)
+            self._last_text_length = len(display)
+        else:
+            print(display, flush=True)
+            self._last_text_length = 0
 
     def on_line_completed(self, event):
         text = event.line.text.strip()
@@ -779,18 +1380,28 @@ class SpeechRouter(TranscriptEventListener):
         # Suppress self-heard TTS and any stray transcripts while a turn
         # is in flight (LLM streaming + TTS + cooldown). Intents still fire
         # via IntentRecognizer, which is registered separately.
-        if self._processing or self._speaking or self._is_echo(text):
-            # Allow a literal stop-intent to still interrupt
-            if self._processing and self._is_stop_intent(text):
+        if self._is_gated() or self._is_echo(text):
+            # Allow a literal stop-intent to still interrupt — this is the
+            # only intentional barge-in channel.
+            if self._audio_active.is_set() and self._is_stop_intent(text):
                 self._request_stop()
             return
 
-        print(f"\r  🎙  {text}" + " " * max(0, self._last_text_length - len(text) - 6))
+        if sys.stdout.isatty():
+            print(f"\r  🎙  {text}" + " " * max(0, self._last_text_length - len(text) - 6))
+        else:
+            print(f"  🎙  {text}", flush=True)
         self._last_text_length = 0
 
-        # Skip lines already handled by IntentRecognizer
+        # Skip lines already handled by IntentRecognizer. Try exact
+        # match first (fast path), then fall back to the time-based
+        # cooldown set by `mark_handled` for cases where punctuation
+        # or whitespace diverged between what the handler received
+        # and what `on_line_completed` sees (observed in the field).
         if text in self._handled_utterances:
             self._handled_utterances.discard(text)
+            return
+        if time.time() < self._intent_cooldown_until:
             return
 
         # --- State machine ---
@@ -800,7 +1411,7 @@ class SpeechRouter(TranscriptEventListener):
             if tail is None:
                 return  # Not addressed to us — ignore background speech
             initial_command = tail.strip()
-            print("  👂 Yes, how can I help you?")
+            print("  👂 Yes, how can I help you?", flush=True)
             self._state = self.LISTENING
             self._command_text = initial_command
             self._last_stable_text = self._strip_punctuation(initial_command).lower().strip()
@@ -821,98 +1432,267 @@ class SpeechRouter(TranscriptEventListener):
     # -- LLM query on background thread --
 
     def _handle_llm_query(self, text: str) -> None:
-        self._processing = True
-        self._stop_requested = False
+        # `_processing` and `_audio_active` were set by `_on_timeout` before
+        # this thread was spawned, so callbacks are already gated. We just
+        # need to keep them gated through the whole LLM+TTS span and clear
+        # on exit.
+        #
+        # The chat loop streams SAY: / DO: lines and calls on_say / on_do
+        # as each line completes. Because the model emits one sentence per
+        # SAY line, we can enqueue each directly to TTS without a local
+        # sentence-splitter — the sentence-level pipelining happens because
+        # the LLM pauses at newlines. DO lines go to the hardware controller
+        # as Arduino CLI; volume commands go to the host-side executor.
         speaking_started = False
+        stop = self._stop_requested
+        say_accum: list[str] = []
+
+        def on_say(sentence: str) -> None:
+            nonlocal speaking_started
+            if stop.is_set() or not sentence:
+                return
+            say_accum.append(sentence)
+            print(f"  🤖 {sentence}")
+            if not speaking_started:
+                self._begin_speaking()
+                speaking_started = True
+            self._tts.enqueue(sentence)
+
+        def on_do(cli: str) -> None:
+            if stop.is_set() or not cli:
+                return
+            if self._do_dispatcher is None:
+                print(f"  🤖 DO (dropped — no dispatcher): {cli}")
+                return
+            reply = self._do_dispatcher.dispatch(cli)
+            if reply.startswith("ERR"):
+                print(f"  🤖 DO: {cli}  ⚠ {reply}")
+            else:
+                print(f"  🤖 DO: {cli}  → {reply}")
+
         full_response = ""
-        # Gate the mic for the entire LLM+TTS phase, not just once the
-        # first sentence is ready to speak. Ollama and onnxruntime both
-        # saturate the Jetson's CPU during generation; leaving Moonshine
-        # streaming in parallel causes PortAudio ring buffer overflows.
-        self._pause_mic()
         try:
-            self._conversation.append({"role": "user", "content": text})
-
             print(f"  🗣  You: {text}")
-            print("  🤖 ", end="", flush=True)
-
-            buf = ""
-            full_chunks: list[str] = []
-            for chunk in self._llm.stream_chat(self._conversation):
-                if self._stop_requested:
-                    break
-                print(chunk, end="", flush=True)
-                full_chunks.append(chunk)
-                buf += chunk
-                # Flush every completed sentence to the TTS worker so
-                # playback of sentence N overlaps with generation of N+1.
-                while True:
-                    idx = -1
-                    for ender in self._SENTENCE_ENDS:
-                        pos = buf.find(ender)
-                        if pos != -1 and (idx == -1 or pos < idx):
-                            idx = pos
-                    if idx < 0:
+            if self._chat_loop is not None:
+                self._chat_loop.run(text, on_say=on_say, on_do=on_do)
+            elif self._llm is not None:
+                # Backward-compat fallback for the standalone assistant.py
+                # main(). The LLM emits plain text; route it all to TTS.
+                buf = ""
+                for chunk in self._llm.stream_chat(
+                    [{"role": "user", "content": text}]
+                ):
+                    if stop.is_set():
                         break
-                    sentence, buf = buf[: idx + 1].strip(), buf[idx + 1 :]
-                    if sentence:
-                        if not speaking_started:
-                            self._begin_speaking()
-                            speaking_started = True
-                        self._tts.enqueue(sentence)
-            print()
-            # Flush the tail (any trailing text without a final punctuation).
-            tail = buf.strip()
-            if tail and not self._stop_requested:
-                if not speaking_started:
-                    self._begin_speaking()
-                    speaking_started = True
-                self._tts.enqueue(tail)
+                    buf += chunk
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        on_say(line.strip())
+                on_say(buf.strip())
+            else:
+                on_say("No LLM is wired up. Please pass --use-ollama or start walle-hwc.")
 
-            full_response = "".join(full_chunks)
-            self._conversation.append({"role": "assistant", "content": full_response})
+            full_response = " ".join(say_accum).strip()
 
-            # Trim conversation to rolling window to prevent unbounded memory growth
-            if len(self._conversation) > self._max_conversation_length:
-                self._conversation = self._conversation[
-                    -self._max_conversation_length :
-                ]
-
-            if self._stop_requested:
+            if stop.is_set():
                 self._tts.drain()
             elif speaking_started:
-                self._tts.wait_until_idle()
+                # Pass our stop flag so a mid-sentence "stop" utterance
+                # fires a prompt barge-in instead of waiting for the
+                # current sentence to finish playing.
+                self._tts.wait_until_idle(stop_flag=stop)
         except Exception as e:
             print(f"\n  ... LLM error: {e}", file=sys.stderr)
         finally:
             if speaking_started:
                 self._end_speaking(full_response)
-            else:
-                # No TTS happened (empty/error response) — still need to
-                # un-gate the mic we paused at the top of this method.
-                self._resume_mic()
+            # Post-turn time cooldown — mirrors box's 500 ms mic_gate_until
+            # after each LLM response. Absorbs any speaker echo still in
+            # PortAudio's buffer after TTS playback stops.
+            self._mic_gate_until = time.time() + self._POST_TURN_GATE
+            # Audible cue that the follow-up window is open. Fires inside
+            # the gate so it can't self-echo into the next transcript.
+            self._play_ready_beep()
+            self._audio_active.clear()
             self._processing = False
-            self._stop_requested = False
-            self._state = self.LISTENING
+            self._stop_requested.clear()
             self._command_text = ""
             self._last_stable_text = ""
             self._last_partial_raw = ""
-            self._listen_started_monotonic = time.monotonic()
-            self._start_timeout(self._post_speak_timeout)
-            print("  👂 Listening for follow-up... (or stay silent to end)")
+            if self._follow_up_enabled:
+                # Opt-in: keep listening for a short follow-up, but gate the
+                # commit path on _is_plausible_followup so Moonshine's noise
+                # hallucinations can't open a phantom LLM turn.
+                self._state = self.LISTENING
+                self._listen_started_monotonic = time.monotonic()
+                self._start_timeout(self._follow_up_timeout)
+                print(
+                    f"  👂 Listening for follow-up ({self._follow_up_timeout:.0f}s)..."
+                )
+            else:
+                # Default: go back to wake-word-gated IDLE. On a noisy robot,
+                # the alternative reliably fires bogus LLM turns on garbage
+                # transcripts like "Tutland," or "The asthma was set from."
+                self._state = self.IDLE
+                self._listen_started_monotonic = 0.0
+                self._cancel_timeout()
+                print(f'  💤 Back to wake word — say "{self._wake_word}" to speak again.')
 
 
 # ─────────────────────────────────────────────────────────────
 # Layer 4: Voice Assistant (Orchestrator)
 # ─────────────────────────────────────────────────────────────
 
+# Wake-word-free direct-action intents. Kept intentionally small: any
+# entry here must be semantically distinct from phrases the LLM will
+# handle differently. "turn left/right" was removed because it semantic-
+# matched "look left/right" — which is a head pan, not a body spin —
+# and fired drive(left) instead of routing through the LLM's head_pan
+# tool. For body rotation the user can still say "hey, turn left" and
+# the LLM will pick the right tool.
 ROBOT_INTENTS = {
     "move forward": "forward",
     "move backward": "backward",
-    "turn left": "left",
-    "turn right": "right",
     "stop moving": "stop",
 }
+
+# STT-direct map: phrase → Arduino CLI (or host command) sent directly to
+# the hardware controller. These bypass the LLM entirely — a spoken
+# "move forward" fires drive 100 2000 without waiting for a tool-call
+# round-trip. SpeechRouter.mark_handled + the 2 s intent cooldown
+# prevents the same utterance from also opening an LLM turn.
+#
+# The dispatcher routes by the first verb: 'drive', 'spin', 'head',
+# 'scan', 'stop' go to HWC; 'volume', 'mute', 'unmute' go to the host
+# VolumeToolExecutor. So the strings below look like verbatim CLI
+# because — to the dispatcher — they are.
+STT_DIRECT_CLI: dict[str, str] = {
+    # DC motors on this chassis don't overcome static friction below
+    # roughly 80% PWM — so all wheel commands use the firmware cap
+    # (SPEED=200). Under 200 the motors audibly hum but the robot
+    # doesn't move. Duration is short enough to stay safe indoors
+    # (~1.5 s forward, ~0.6 s spin ≈ 45° pivot).
+    #
+    # ORDER MATTERS. The matcher iterates in insertion order and
+    # returns the FIRST substring hit. Multi-word specific phrases
+    # must come BEFORE their bare-word generic variants — e.g.
+    # "face forward" before "forward", otherwise the bare "forward"
+    # would swallow "face forward" and fire drive instead of head.
+    # Python dicts preserve insertion order since 3.7, so this is
+    # stable in practice.
+
+    # ---- specific: scans (contain "look"/"around", different verb) ----
+    "scan around":      "scan",
+    "look around":      "scan",
+
+    # ---- specific: head positions (multi-word) ------------------------
+    "look left":        "head pos 0",
+    "face left":        "head pos 0",
+    "head left":        "head pos 0",
+    "look right":       "head pos 100",
+    "face right":       "head pos 100",
+    "head right":       "head pos 100",
+    "look center":      "head pos 50",
+    "look straight":    "head pos 50",
+    "face forward":     "head pos 50",
+    "head center":      "head pos 50",
+    "center head":      "head pos 50",
+
+    # ---- specific: body rotation (multi-word) -------------------------
+    "turn left":        "spin 200 600",
+    "spin left":        "spin 200 600",
+    "rotate left":      "spin 200 600",
+    "turn right":       "spin -200 600",
+    "spin right":       "spin -200 600",
+    "rotate right":     "spin -200 600",
+
+    # ---- specific: drive (multi-word) ---------------------------------
+    "move forward":     "drive 200 1500",
+    "drive forward":    "drive 200 1500",
+    "go forward":       "drive 200 1500",
+    "move backward":    "drive -200 1500",
+    "move back":        "drive -200 1500",
+    "drive backward":   "drive -200 1500",
+    "drive back":       "drive -200 1500",
+    "go backward":      "drive -200 1500",
+    "go back":          "drive -200 1500",
+
+    # ---- volume (multi-word) ------------------------------------------
+    "volume up":        "volume up",
+    "volume down":      "volume down",
+    "turn it up":       "volume up",
+    "turn it down":     "volume down",
+
+    # ---- stop ---------------------------------------------------------
+    "stop moving":      "stop",
+    "stop":             "stop",
+    "halt":             "stop",
+    "freeze":           "stop",
+
+    # ---- generic single-word fallbacks (MUST come last) ---------------
+    "forward":          "drive 200 1500",
+    "ahead":            "drive 200 1500",
+    "backward":         "drive -200 1500",
+    "backwards":        "drive -200 1500",
+    "reverse":          "drive -200 1500",
+    "back":             "drive -200 1500",
+    "louder":           "volume up",
+    "quieter":          "volume down",
+    "mute":             "mute",
+    "unmute":           "unmute",
+}
+
+
+class LiteralIntentRecognizer:
+    """Deterministic substring matcher — drop-in for moonshine_voice's
+    embedding-backed ``IntentRecognizer``.
+
+    On Jetson the embedding matcher takes 186-1069 ms per completed line
+    to decide whether any of three hard-coded phrases matched. That CPU
+    cost starved Moonshine's audio thread and contributed to PortAudio
+    input-overflow events under concurrent vision + TTS load. Substring
+    matching is sub-millisecond, so the matcher can run inline on the
+    dispatcher consumer thread without the cross-gating workarounds that
+    the embedding path required.
+
+    Exposes exactly the subset of IntentRecognizer used by VoiceAssistant:
+    ``register_intent(phrase, handler)``, ``on_line_completed(event)``,
+    ``close()``. The handler signature matches: (trigger, utterance,
+    similarity). Similarity is always 1.0 for a substring hit.
+    """
+
+    def __init__(self) -> None:
+        self._intents: list[tuple[str, str, Callable[[str, str, float], None]]] = []
+
+    def register_intent(
+        self,
+        phrase: str,
+        handler: Callable[[str, str, float], None],
+    ) -> None:
+        normalized = re.sub(r"[^\w\s]", "", phrase).lower().strip()
+        if normalized:
+            self._intents.append((phrase, normalized, handler))
+
+    def on_line_completed(self, event) -> None:
+        text = getattr(getattr(event, "line", None), "text", "") or ""
+        if not text:
+            return
+        normalized = re.sub(r"[^\w\s]", "", text).lower().strip()
+        if not normalized:
+            return
+        for original_phrase, needle, handler in self._intents:
+            if needle in normalized:
+                try:
+                    handler(original_phrase, text.strip(), 1.0)
+                except Exception:
+                    _log.exception(
+                        "LiteralIntentRecognizer handler '%s' raised",
+                        original_phrase,
+                    )
+                return
+
+    def close(self) -> None:
+        self._intents.clear()
 
 
 class VoiceAssistant:
@@ -920,9 +1700,11 @@ class VoiceAssistant:
 
     def __init__(
         self,
-        llm: LLMClient,
-        robot: BaseRobotController,
         tts: BaseTTSEngine,
+        chat_loop=None,
+        do_dispatcher=None,
+        llm: Optional[LLMClient] = None,
+        robot: Optional[BaseRobotController] = None,
         language: str = "en",
         stt_model_arch=None,
         embedding_model: str = "embeddinggemma-300m",
@@ -936,13 +1718,23 @@ class VoiceAssistant:
         wake_sounds_dir: Optional[str] = None,
         mic_device: Optional[int] = None,
         mic_channels: int = 1,
-        mic_blocksize: int = 2048,
+        mic_blocksize: int = 16384,
+        follow_up: bool = False,
+        follow_up_timeout: float = 3.0,
         system_prompt: str = (
             "You are a helpful voice assistant running on a Jetson-powered robot. "
             "Keep responses to 1-3 sentences — they will be spoken aloud via TTS."
         ),
     ):
+        # In the post-HWC architecture, STT-direct phrases and LLM DO:
+        # lines both go through `do_dispatcher`, which routes Arduino CLI
+        # to the hardware controller and volume commands to the local
+        # executor. `chat_loop` is the new LLM driver (streams SAY/DO).
+        # The legacy `llm` + `robot` args are kept so the standalone
+        # assistant.py main() can still run without the integrated stack.
         self._robot = robot
+        self._chat_loop = chat_loop
+        self._do_dispatcher = do_dispatcher
         self._tts = tts
 
         # Report which PortAudio device we're about to hand to Moonshine.
@@ -964,9 +1756,10 @@ class VoiceAssistant:
 
         mv = _moonshine()
         if stt_model_arch is None:
-            # Tiny is the realtime-safe default on Jetson CPU; medium causes
-            # input-overflow because ONNX inference lags the audio stream.
-            stt_model_arch = mv.ModelArch.TINY_STREAMING
+            # Small-streaming is the accuracy/CPU sweet spot on Jetson once
+            # blocksize is 16384. Tiny mishears short utterances; medium
+            # still lags the audio stream and causes input-overflow.
+            stt_model_arch = mv.ModelArch.SMALL_STREAMING
 
         # -- STT model --
         print("Loading STT model...", file=sys.stderr)
@@ -985,55 +1778,169 @@ class VoiceAssistant:
         self._mic = mv.MicTranscriber(**mic_kwargs)
 
         # -- Intent recognizer --
-        print("Loading embedding model for intent recognition...", file=sys.stderr)
-        emb_path, emb_arch = mv.get_embedding_model(
-            embedding_model, embedding_quantization
-        )
-        self._intent_recognizer = mv.IntentRecognizer(
-            model_path=emb_path,
-            model_arch=emb_arch,
-            model_variant=embedding_quantization,
-            threshold=intent_threshold,
-        )
+        # Literal substring matcher. The previous embedding-based
+        # IntentRecognizer spent 186-1069 ms per completed line on Jetson
+        # to decide whether one of three hard-coded phrases had been said.
+        # With a fixed phrase set we get identical semantics from a plain
+        # substring check at ~10 μs, and the embedding model is still
+        # warmed up at startup for FAISS-backed memory search.
+        del embedding_model, embedding_quantization, intent_threshold  # noqa: F841
+        self._intent_recognizer = LiteralIntentRecognizer()
 
         # -- Speech router (wake-word-gated LLM fallback) --
+        # No mic_pause/mic_resume callbacks: stopping the PortAudio stream
+        # during TTS kills echo bleed but also kills the stop-intent
+        # barge-in channel (line 895-900 in SpeechRouter). We keep the
+        # stream running and rely on the transcript-level `_is_gated()`
+        # check + content-based `_is_echo()` filter (echo window widened
+        # to 2.5 s to cover Piper's cleaner voice re-triggering STT).
         self._router = SpeechRouter(
-            llm=llm,
             tts=tts,
             system_prompt=system_prompt,
+            chat_loop=chat_loop,
+            do_dispatcher=do_dispatcher,
+            llm=llm,
             wake_word=wake_word,
             listen_timeout=listen_timeout,
             listen_timeout_long=listen_timeout_long,
             max_utterance=max_utterance,
             wake_sounds_dir=wake_sounds_dir,
-            mic_pause=self._mic.stop,
-            mic_resume=self._mic.start,
+            follow_up=follow_up,
+            follow_up_timeout=follow_up_timeout,
         )
 
-        # -- Register robot intents --
-        self._intents = intents or ROBOT_INTENTS
-        for phrase, action in self._intents.items():
-            self._intent_recognizer.register_intent(
-                phrase,
-                self._make_intent_handler(action),
-            )
+        # -- Register STT-direct phrases --
+        #
+        # Two paths:
+        #   1. do_dispatcher wired (integrated walle): phrases map to
+        #      Arduino CLI lines that go straight to HWC or volume exec.
+        #      No LLM call, no TTS echo.
+        #   2. robot fallback (standalone assistant.py main): phrases map
+        #      to action names the legacy SerialRobotController understands.
+        if do_dispatcher is not None:
+            self._intents = intents or STT_DIRECT_CLI
+            for phrase, cli in self._intents.items():
+                self._intent_recognizer.register_intent(
+                    phrase, self._make_cli_handler(cli)
+                )
+        elif robot is not None:
+            self._intents = intents or ROBOT_INTENTS
+            for phrase, action in self._intents.items():
+                self._intent_recognizer.register_intent(
+                    phrase, self._make_intent_handler(action)
+                )
+        else:
+            self._intents = {}
 
-        # Add listeners in order: intent recognizer first, then router
-        self._mic.add_listener(self._intent_recognizer)
-        self._mic.add_listener(self._router)
+        # Decouple listener callbacks from moonshine's audio thread. Both
+        # the IntentRecognizer (embedding similarity, ~20-100 ms on Jetson)
+        # and SpeechRouter (SSH prints, serial round-trips via intent
+        # handler, tts.drain on barge-in) would otherwise run synchronously
+        # on the thread that drains PortAudio, and the ring buffer
+        # overflows under LLM+TTS load. The dispatcher is the only listener
+        # moonshine sees; it forwards events to the real listeners via a
+        # bounded queue consumed by a dedicated thread, preserving the
+        # [intent_recognizer, router] ordering that `mark_handled` /
+        # `_handled_utterances` depends on.
+        from walle.voice.listener_dispatch import ListenerDispatcher
+
+        intent_recognizer_ref = self._intent_recognizer
+        router_ref = self._router
+
+        def _should_dispatch(listener, kind, _payload) -> bool:
+            # The embedding-backed intent matcher takes 500-2900 ms per
+            # completed line on Jetson. Running it while a turn is in
+            # flight (LLM streaming + TTS playback + echo cooldown) only
+            # matches TTS bleed — which is then discarded by the
+            # handler's own `_is_gated()` check — but the CPU cost
+            # starves Moonshine's audio thread and causes PortAudio
+            # input-overflow. Short-circuit here so the consumer stays
+            # responsive. SpeechRouter still gets every event because
+            # its handlers are cheap.
+            if listener is intent_recognizer_ref and kind == "line_completed":
+                if router_ref._is_gated() or router_ref._processing:
+                    return False
+            return True
+
+        self._dispatcher = ListenerDispatcher(
+            listeners=[self._intent_recognizer, self._router],
+            queue_size=32,
+            stop_intent_fn=self._router._is_stop_intent,
+            stop_active_fn=self._router._audio_active.is_set,
+            on_stop_intent=self._router._request_stop,
+            should_dispatch_fn=_should_dispatch,
+            logger=logging.getLogger("walle.voice.dispatcher"),
+        )
+        self._router.attach_dispatcher(self._dispatcher)
+        self._router.attach_mic(self._mic)
+        self._mic.add_listener(self._dispatcher)
+
+    def _make_cli_handler(self, cli: str):
+        """STT-direct handler that ships one Arduino CLI (or volume)
+        line through the DoDispatcher, skipping the LLM entirely.
+
+        Guarantees:
+          * does nothing while the router is gated (TTS busy / post-turn
+            cooldown), so our own TTS output can't self-match a phrase
+            and re-fire the command.
+          * declines the line if it actually starts with the wake word —
+            that case is for the LLM, not a direct-action match.
+          * calls ``mark_handled`` + arms the 2 s intent cooldown so
+            SpeechRouter.on_line_completed skips the same utterance
+            instead of spawning a phantom LLM turn on the delayed
+            finalization.
+        """
+        dispatcher = self._do_dispatcher
+
+        def handler(trigger: str, utterance: str, similarity: float):
+            if self._router._is_gated():
+                return
+            if self._router._detect_wake(utterance) is not None:
+                return
+            self._router.mark_handled(utterance)
+            # Fire-and-forget. The dispatcher's HWC call has a ~5 ms
+            # round-trip locally; doing it on a daemon thread keeps the
+            # dispatcher consumer thread free for the next event.
+            threading.Thread(
+                target=lambda: dispatcher.dispatch(cli),
+                daemon=True,
+                name=f"stt-direct-{trigger[:12]}",
+            ).start()
+
+        return handler
 
     def _make_intent_handler(self, action: str):
         """Create a closure that handles a matched intent.
+
+        Drops the match when the router is gated (TTS busy or post-turn
+        cooldown) — otherwise Piper's output echoes back, gets semantic-
+        matched to an intent, and the robot executes its own speech.
 
         If the utterance is actually the wake word, let the SpeechRouter
         handle it instead of executing a robot command.
         """
 
         def handler(trigger: str, utterance: str, similarity: float):
+            if self._router._is_gated():
+                return
             if self._router._detect_wake(utterance) is not None:
                 return
+            # mark_handled MUST stay inline — SpeechRouter.on_line_completed
+            # runs immediately after this on the dispatcher's consumer
+            # thread and reads `_handled_utterances` / `_intent_cooldown_until`.
             self._router.mark_handled(utterance)
-            self._robot.execute(action, utterance, similarity)
+            # robot.execute goes through the serial port (~20-100 ms round
+            # trip). That's now on the dispatcher consumer thread; keeping
+            # it inline would stall subsequent callbacks and refill the
+            # queue. Fire-and-forget on a short-lived daemon is acceptable
+            # because BaseRobotController.execute is semantically one-shot
+            # (the return value is only used for logging).
+            threading.Thread(
+                target=self._robot.execute,
+                args=(action, utterance, similarity),
+                daemon=True,
+                name="robot-exec",
+            ).start()
 
         return handler
 
@@ -1052,14 +1959,49 @@ class VoiceAssistant:
         print(f"{'=' * 60}", file=sys.stderr)
         print("  Press Ctrl+C to stop.\n", file=sys.stderr)
 
-        self._mic.start()
+        # Wrap mic.start() so a silent PortAudio failure (e.g. input
+        # device unavailable while vision is running) surfaces instead
+        # of just leaving the transcript pipeline dead forever.
+        _log.info("mic.start(): opening audio input stream")
+        try:
+            self._mic.start()
+        except Exception as e:
+            _log.exception("mic.start() failed: %s — STT will not work", e)
+        else:
+            running = None
+            try:
+                running = self._mic.is_running()
+            except Exception:
+                pass
+            _log.info("mic.start() returned (is_running=%s)", running)
+        # Spoken "ready" cue — the robot runs headless so the operator
+        # has no terminal/log to confirm startup finished. Non-fatal if
+        # TTS isn't connected (ConsoleTTSEngine just prints it).
+        ready_text = "At your command."
+        _log.info("tts.speak(): enqueuing ready announcement %r", ready_text)
+        try:
+            self._tts.speak(ready_text)
+            # PortAudio delivers the speaker tail back to the mic for
+            # ~500 ms after `speak()` returns. Arm the router's echo
+            # filter so that tail isn't transcribed as a user command.
+            self._router.prime_echo_guard(ready_text)
+            _log.info("tts.speak(): ready announcement completed")
+        except Exception as e:
+            _log.exception("tts.speak() failed: %s", e)
+            print(f"  ... ready announcement skipped: {e}", file=sys.stderr)
         try:
             while True:
                 time.sleep(0.1)
         except KeyboardInterrupt:
             print("\n\n  Shutting down...")
         finally:
+            # Order matters: stop the producer first so no new events arrive,
+            # then drain the dispatcher (with a bounded timeout — under SIGINT
+            # this finally never runs because startup.py:_halt calls
+            # os._exit(0), so this path is for normal-exit cleanup only),
+            # then close the STT model and downstream resources.
             self._mic.stop()
+            self._dispatcher.stop()
             self._mic.close()
             self._intent_recognizer.close()
             self._robot.close()
@@ -1192,9 +2134,10 @@ def parse_args():
     p.add_argument(
         "--mic-blocksize",
         type=int,
-        default=2048,
-        help="PortAudio blocksize in samples (default: 2048 = 128 ms @ 16 kHz). "
-             "Raise to 4096 if you still see 'MicTranscriber: input overflow'.",
+        default=16384,
+        help="PortAudio blocksize in samples (default: 16384 = 1024 ms @ 16 kHz). "
+             "Larger blocks reduce callback pressure when LLM+TTS+STT share CPU. "
+             "Drop to 8192 if endpointing feels laggy.",
     )
     p.add_argument(
         "--intent-threshold",
@@ -1210,14 +2153,31 @@ def parse_args():
         "--no-tts", action="store_true", help="Disable audio TTS (console-only)"
     )
     tts_group.add_argument(
+        "--tts-engine",
+        default="piper",
+        choices=["piper", "mimic3"],
+        help="TTS engine (default: piper — local, natural, no HTTP server)",
+    )
+    tts_group.add_argument(
+        "--piper-model",
+        default="voices/en_US-lessac-medium.onnx",
+        help="Path to Piper .onnx voice model (needs matching .onnx.json).",
+    )
+    tts_group.add_argument(
+        "--piper-speaker",
+        type=int,
+        default=None,
+        help="Piper speaker id for multi-speaker models (omit for single-speaker).",
+    )
+    tts_group.add_argument(
         "--tts-url",
         default="http://localhost:59125",
-        help="Mimic3 TTS server URL (default: http://localhost:59125)",
+        help="Mimic3 TTS server URL (only when --tts-engine=mimic3)",
     )
     tts_group.add_argument(
         "--tts-voice",
         default="en_US/vctk_low#p236",
-        help="TTS voice (default: en_US/vctk_low#p236)",
+        help="Mimic3 voice (only when --tts-engine=mimic3)",
     )
 
     robot_group = p.add_argument_group("Robot")
@@ -1296,6 +2256,11 @@ def main():
     if args.no_tts:
         tts = ConsoleTTSEngine()
         print("TTS: Console only (use without --no-tts for audio)", file=sys.stderr)
+    elif args.tts_engine == "piper":
+        tts = PiperTTSEngine(
+            model_path=args.piper_model, speaker_id=args.piper_speaker
+        )
+        print(f"TTS: Piper ({args.piper_model})", file=sys.stderr)
     else:
         tts = Mimic3TTSEngine(url=args.tts_url, voice=args.tts_voice)
         print(

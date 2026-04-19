@@ -12,34 +12,26 @@ import signal
 import sys
 
 from walle.chat_loop import ChatLoop, ChatSession, LLMStreamer
+from walle.health import (
+    format_banner,
+    probe_amixer,
+    probe_hwc_socket,
+    probe_mic_device,
+    probe_ollama,
+    probe_piper_model,
+    probe_speaker_device,
+    run_probes,
+)
+from walle.hw_client import DEFAULT_SOCKET_PATH, HardwareClient
 from walle.lifecycle import LifecycleManager
 from walle.memory.config import conf, setup_logging, validate_ollama
 from walle.memory.context_manager import ContextManager
 from walle.memory.embeddings import get_embedding_model
-from walle.memory.heartbeat import HeartbeatManager
 from walle.memory.memory_system import ArchivalMemory, Memory, RecallMemory
-from walle.serial_manager import SerialManager
-from walle.tools.communication import CommunicationExecutor
-from walle.tools.knowledge import KnowledgeToolExecutor
-from walle.tools.memory_tools import MemoryToolExecutor
-from walle.tools.personality import (
-    PersonalityEngine,
-    PersonalityToolExecutor,
-)
-from walle.tools.registry import (
-    CommunicationToolProvider,
-    RelevantMemoryProvider,
-    SchemaExecutorToolProvider,
-    SystemPromptBuilder,
-    ToolRegistry,
-    ToolSuiteFacade,
-)
-from walle.tools.robot.executor import RobotControlExecutor, get_robot_control_tools
-from walle.vision.service import (
-    CaptureImageExecutor,
-    VisionService,
-    get_capture_image_tools,
-)
+from walle.tools.audio import VolumeToolExecutor, restore_persisted_volume
+from walle.tools.personality import PersonalityEngine
+from walle.tools.registry import RelevantMemoryProvider, SystemPromptBuilder
+from walle.voice.do_dispatcher import DoDispatcher
 
 _log = logging.getLogger("walle.startup")
 _BASE = os.path.dirname(os.path.abspath(__file__))
@@ -51,54 +43,46 @@ _BASE = os.path.dirname(os.path.abspath(__file__))
 def build_app(args) -> tuple:
     """Create all subsystems and wire them together.
 
+    Post-HWC architecture — walle no longer owns the Arduino serial
+    port, vision, or head tracking. Those live in ``walle-hwc`` +
+    its supervised ``track_and_turn_head.py`` subprocess.
+
     Returns:
-        (orchestrator, lifecycle, context_manager, serial_manager,
-         vision_service, robot_exec)
+        (orchestrator, lifecycle, context_manager, chat_loop, hw_client,
+         do_dispatcher, volume_exec)
     """
     from openai import OpenAI
 
     lifecycle = LifecycleManager()
 
-    # -- Serial --
-    serial_mgr = SerialManager(port=args.serial_port, baud_rate=args.baud_rate)
-    lifecycle.register("serial", serial_mgr.close)
+    # -- Hardware client (walle's sole channel to the Arduino) --
+    socket_path = getattr(args, "hwc_socket", None) or DEFAULT_SOCKET_PATH
+    hw_client = HardwareClient(identity="llm", socket_path=socket_path)
+    lifecycle.register("hw-client", hw_client.close)
+
+    # -- Volume + DO dispatcher --
+    volume_exec = VolumeToolExecutor()
+    do_dispatcher = DoDispatcher(hw_client=hw_client, volume_exec=volume_exec)
 
     # -- Memory --
     get_embedding_model()  # warm up embeddings before REPL starts
     core_mem = Memory()
     recall_mem = RecallMemory(use_semantic=conf.USE_SEMANTIC_SEARCH)
     archival_mem = ArchivalMemory(use_semantic=conf.USE_SEMANTIC_SEARCH)
-    mem_exec = MemoryToolExecutor(core_mem, recall_mem, archival_mem)
 
-    # -- Personality --
+    # -- Personality (read-only in this build — the LLM has no tool for
+    #    self-editing blocks in the SAY/DO contract) --
     personality = PersonalityEngine.load()
-    personality_exec = PersonalityToolExecutor(personality)
     lifecycle.register("personality", personality.save)
 
-    # -- Robot --
-    robot_exec = RobotControlExecutor(serial_manager=serial_mgr)
-
-    # -- Other executors --
-    heartbeat = HeartbeatManager()
-    knowledge_exec = KnowledgeToolExecutor()
+    # -- Context manager (interaction + environment snapshots for the prompt) --
     context_manager = ContextManager()
-    comm_exec = CommunicationExecutor()
-
-    # -- Tool registry (Microkernel: each provider registers independently) --
-    # Memory / personality / knowledge tools are intentionally not registered
-    # with the LLM to keep the tool schema budget small on Jetson. The
-    # executors are kept alive — the memory loop still auto-injects relevant
-    # recall/archival hits via RelevantMemoryProvider without needing the
-    # LLM to self-edit blocks.
-    _ = mem_exec, personality_exec, knowledge_exec  # retained for future re-enable
-    registry = ToolRegistry()
-    registry.register(CommunicationToolProvider(comm_exec))
-    registry.register(SchemaExecutorToolProvider(get_robot_control_tools, robot_exec))
-    tool_suite = ToolSuiteFacade(registry)
 
     # -- LLM client --
     client = OpenAI(
-        base_url=f"{conf.OLLAMA_BASE_URL}/v1", api_key="ollama", timeout=120.0
+        base_url=f"{conf.OLLAMA_BASE_URL}/v1",
+        api_key=os.environ.get("OLLAMA_API_KEY", "ollama"),
+        timeout=120.0,
     )
     llm_streamer = LLMStreamer(client, conf.OLLAMA_MODEL, num_ctx=conf.OLLAMA_NUM_CTX)
 
@@ -113,70 +97,55 @@ def build_app(args) -> tuple:
         archival_memory=archival_mem,
     )
 
-    # -- Chat loop --
+    # -- Chat loop — streams SAY/DO lines to callbacks --
     session = ChatSession()
     chat_loop = ChatLoop(
         llm_streamer=llm_streamer,
-        tool_suite=tool_suite,
         session=session,
         prompt_builder=prompt_builder,
         memory_provider=memory_provider,
-        comm_exec=comm_exec,
         recall_mem=recall_mem,
         archival_mem=archival_mem,
-        heartbeat=heartbeat,
         context_manager=context_manager,
-        on_turn_start=None,
-        on_turn_end=None,
     )
 
-    # -- Register shutdown hooks --
-    # LifecycleManager executes in REVERSE order, so register in reverse
-    # of desired shutdown sequence:
-    #   api → vision → compression-wait → robot-neutral → faiss → embeddings → personality → serial
-    # Serial and personality are already registered above (first), so they run last.
-    # The remaining hooks from last-to-run to first-to-run:
+    # -- Shutdown hooks (lifecycle fires in REVERSE registration order) --
     lifecycle.register("embeddings", recall_mem.shutdown)
     lifecycle.register("faiss-save", lambda: _save_faiss(recall_mem, archival_mem))
-    lifecycle.register(
-        "robot-neutral", lambda: robot_exec.execute("reset_to_neutral", {})
-    )
-    lifecycle.register("memory-compression", chat_loop.wait_for_compression)
 
-    # -- Build orchestrator (thin facade) --
-    # Import here to avoid circular — walle_main imports from startup
+    # -- Orchestrator facade (for API server + text REPL) --
     from walle.orchestrator import WallEOrchestrator
 
     orchestrator = WallEOrchestrator(
         chat_loop=chat_loop,
-        comm_exec=comm_exec,
         recall_mem=recall_mem,
         context_manager=context_manager,
-        vision_service=None,
-        serial_manager=serial_mgr,
-        tool_suite=tool_suite,
     )
 
     _log.info("Orchestrator initialized: %s via Ollama", conf.OLLAMA_MODEL)
 
-    return orchestrator, lifecycle, context_manager, serial_mgr, robot_exec
-
-
-def attach_vision(orchestrator, context_manager, lifecycle, args, vision_fps: int = 2):
-    """Optionally create and attach VisionService."""
-    if args.no_vision:
-        return None
-    vision = VisionService(context_manager, camera_index=args.camera, fps=vision_fps)
-    capture_exec = CaptureImageExecutor(vision, conf.OLLAMA_BASE_URL)
-    orchestrator.set_vision_service(vision)
-    orchestrator.tool_suite.register(
-        SchemaExecutorToolProvider(
-            get_capture_image_tools, capture_exec, request_heartbeat_after=True
-        )
+    return (
+        orchestrator,
+        lifecycle,
+        context_manager,
+        chat_loop,
+        hw_client,
+        do_dispatcher,
+        volume_exec,
     )
-    vision.start()
-    lifecycle.register("vision", vision.stop)
-    return vision
+
+
+def attach_vision(*_args, **_kwargs):
+    """Kept as a no-op shim for backward compatibility — v1 of the HWC
+    refactor removes in-walle vision entirely. Camera + Coral TPU +
+    face tracking + head servo live inside ``walle-hwc``'s supervised
+    ``track_and_turn_head.py`` subprocess, which was already the
+    reference implementation.
+
+    v2 will reintroduce a read-only walle-side subscriber for face
+    events and frame-capture-on-demand; see the plan file for details.
+    """
+    return None
 
 
 def _save_faiss(recall_mem, archival_mem):
@@ -204,6 +173,16 @@ def _test_tts(url: str) -> bool:
         return r.status_code == 200
     except Exception:
         return False
+
+
+def _test_piper(model_path: str) -> bool:
+    """Verify a Piper voice is usable without actually loading the ONNX.
+
+    Loading takes a few hundred ms on Jetson, so we only check file
+    presence here — the engine constructor does the real load and will
+    raise if the model is corrupt.
+    """
+    return os.path.exists(model_path) and os.path.exists(model_path + ".json")
 
 
 def _parse_audio_device(value: str):
@@ -270,6 +249,13 @@ def parse_args(argv=None):
         "--no-vision", action="store_true", help="Disable vision processing"
     )
     parser.add_argument(
+        "--no-head-tracking",
+        dest="head_tracking",
+        action="store_false",
+        default=True,
+        help="Disable vision-driven head servo tracking (greeter still fires).",
+    )
+    parser.add_argument(
         "--camera", type=int, default=0, help="Camera index (default 0)"
     )
     parser.add_argument(
@@ -292,12 +278,52 @@ def parse_args(argv=None):
     # TTS
     parser.add_argument("--no-tts", action="store_true", help="Console TTS (no audio)")
     parser.add_argument(
-        "--tts-url", default="http://localhost:59125", help="Mimic3 TTS URL"
+        "--tts-engine",
+        default="piper",
+        choices=["piper", "mimic3"],
+        help="TTS engine (default: piper — local, natural, no HTTP server)",
     )
-    parser.add_argument("--tts-voice", default="en_UK/apope_low", help="Mimic3 voice")
+    parser.add_argument(
+        "--piper-model",
+        default="voices/en_US-lessac-medium.onnx",
+        help="Path to Piper .onnx voice (needs matching .onnx.json)",
+    )
+    parser.add_argument(
+        "--piper-speaker",
+        type=int,
+        default=None,
+        help="Piper speaker id for multi-speaker voices",
+    )
+    parser.add_argument(
+        "--tts-url",
+        default="http://localhost:59125",
+        help="Mimic3 TTS URL (only when --tts-engine=mimic3)",
+    )
+    parser.add_argument(
+        "--tts-voice",
+        default="en_UK/apope_low",
+        help="Mimic3 voice (only when --tts-engine=mimic3)",
+    )
 
     # Voice / STT
-    parser.add_argument("--wake-word", default="hey", help="Wake word phrase")
+    parser.add_argument(
+        "--wake-word",
+        default=(
+            "hey,hi,hello,okay,"
+            "walle,wall e,wall-e,wally,"
+            "robot,"
+            "whats up,what's up,sup,"
+            "yo"
+        ),
+        help=(
+            "Comma-separated wake phrases. Moonshine frequently substitutes "
+            "short single-phoneme wakes — it hears 'hey' as 'okay' / 'hi' / "
+            "'hello' on a substantial fraction of real utterances — so the "
+            "default accepts the common STT variants and a few casual "
+            "openers instead of gating on one fragile phrase. Pass a single "
+            "phrase (e.g. 'hey rocket') to override."
+        ),
+    )
     parser.add_argument(
         "--listen-timeout", type=float, default=3.0, help="Silence timeout (seconds)"
     )
@@ -312,6 +338,28 @@ def parse_args(argv=None):
         type=float,
         default=15.0,
         help="Hard upper bound on a single listen window in seconds",
+    )
+    parser.add_argument(
+        "--hwc-socket",
+        default=os.environ.get("WALLE_HW_SOCK", "/tmp/walle_hw.sock"),
+        help="Unix socket path for the hardware controller (default %(default)s)",
+    )
+    parser.add_argument(
+        "--follow-up",
+        action="store_true",
+        default=False,
+        help=(
+            "After answering, keep listening for a short follow-up without "
+            "requiring the wake word again. Default: off. On a noisy robot "
+            "this reliably triggers phantom LLM turns on Moonshine "
+            "hallucinations — leave off unless you're in a quiet room."
+        ),
+    )
+    parser.add_argument(
+        "--follow-up-timeout",
+        type=float,
+        default=3.0,
+        help="Follow-up window in seconds when --follow-up is set (default 3.0).",
     )
     parser.add_argument("--language", default="en", help="STT language")
     parser.add_argument(
@@ -352,8 +400,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--mic-blocksize",
         type=int,
-        default=2048,
-        help="PortAudio blocksize in samples (default: 2048)",
+        default=16384,
+        help="PortAudio blocksize in samples (default: 16384 = 1024 ms @ 16 kHz)",
     )
     parser.add_argument(
         "--speaker-device",
@@ -383,14 +431,33 @@ def parse_args(argv=None):
 
 def apply_runtime_overrides(args):
     if args.jetson:
-        conf.OLLAMA_MODEL = "qwen2.5:3b"
+        if not os.environ.get("WALLE_OLLAMA_MODEL"):
+            conf.OLLAMA_MODEL = "qwen2.5:3b"
         conf.EMBEDDING_DEVICE = "cpu"
         conf.EMBEDDING_BATCH_SIZE = 4
         conf.USE_FAISS = True
         conf.USE_SEMANTIC_SEARCH = True
-        conf.VISION_FPS = 1
+        # 10 FPS gives the head tracker near-real-time face position
+        # updates. The Coral subprocess caps effective throughput at
+        # whatever it can do (~5-8 FPS realistic) — setting the ceiling
+        # to 10 just means the loop won't artificially idle. Previous
+        # value of 1 meant ~1 s of lag between 'user moves' and 'head
+        # receives new target', which felt like the servo was slow even
+        # when it wasn't.
+        conf.VISION_FPS = 10
         if not getattr(args, "_explicit_stt_model", False):
-            args.stt_model = "tiny-streaming"
+            # Was "small-streaming" before — small's short-utterance
+            # accuracy ("hey" → "okay", "move forward" → "Forward.",
+            # silence hallucinations like "Tutland,") was the main
+            # reason the robot felt "deaf".
+            #
+            # The CPU budget freed by retiring the embedding-based
+            # IntentRecognizer (~500 ms/line) + MemGPT tool loop
+            # (per-turn reflection calls) means medium-streaming
+            # now fits on Jetson without input-overflow under load.
+            # Override with --stt-model tiny-streaming if you hit
+            # CPU pressure on a busy call.
+            args.stt_model = "medium-streaming"
         _log.info(
             "Jetson mode: model=%s, embedding=%s, fps=%s, stt=%s",
             conf.OLLAMA_MODEL,
@@ -429,6 +496,13 @@ def main():
         rate=args.speaker_rate,
         channels=args.speaker_channels,
     )
+    # Reapply the last volume the user asked for. Runs before any audio
+    # output so the "At your command." greeting is at the expected level,
+    # not whatever the ALSA default happens to be on this boot.
+    vol_status = restore_persisted_volume()
+    if vol_status:
+        _log.info("Audio volume: %s", vol_status)
+
     _log.info("Audio input: %s", args._mic_label)
     if args.speaker_rate is not None or args.speaker_channels is not None:
         extras = []
@@ -441,105 +515,72 @@ def main():
         _log.info("Audio output: %s", args._speaker_label)
 
     # --- Build the app ---
-    status_lines = []
+    _log.info("[1/5] Initializing memory + chat_loop + HWC client...")
+    (
+        orchestrator,
+        lifecycle,
+        context_manager,
+        chat_loop,
+        hw_client,
+        do_dispatcher,
+        volume_exec,
+    ) = build_app(args)
 
-    _log.info("[1/7] Initializing memory system...")
-    orchestrator, lifecycle, context_manager, serial_mgr, robot_exec = build_app(args)
-    mem_mode = "FAISS" if conf.USE_FAISS else "text"
-    status_lines.append(_status_line("Memory:", f"3-tier + {mem_mode}", True))
-
-    # Validate Ollama
-    _log.info("[2/7] Validating Ollama (%s)...", conf.OLLAMA_MODEL)
+    # Validate Ollama — required before anything else since the voice
+    # pipeline drives it live.
+    _log.info("[2/5] Validating Ollama (%s)...", conf.OLLAMA_MODEL)
     ollama_ok, ollama_proc = validate_ollama(conf)
-    status_lines.append(
-        _status_line("LLM:", f"{conf.OLLAMA_MODEL} via Ollama", ollama_ok)
-    )
     if ollama_proc:
         lifecycle.register("ollama", ollama_proc.terminate)
     if not ollama_ok:
         _log.error("Ollama not available. Cannot start without LLM.")
         return
 
-    # Vision
-    _log.info("[3/7] Setting up vision...")
-    vision = attach_vision(
-        orchestrator, context_manager, lifecycle, args, conf.VISION_FPS
-    )
-    if vision is not None:
-        status_lines.append(
-            _status_line(
-                "Vision:",
-                f"{vision.status_detail} (cam={args.camera})",
-                vision.is_active,
-            )
-        )
-    else:
-        status_lines.append(_status_line("Vision:", "disabled", False))
-
-    # Serial
-    _log.info("[4/7] Serial connection...")
-    status_lines.append(
-        _status_line(
-            "Arduino:", args.serial_port or "simulation", serial_mgr.is_connected()
-        )
-    )
-
-    # API server
-    _log.info("[5/7] API server...")
-    api_srv = None
+    # API server retired for the HWC v1 architecture. The REST surface
+    # depends on a SerialManager and a VisionService, neither of which
+    # lives in walle anymore. Set --web-port 0 explicitly (default) to
+    # silence this note; a v2 pass can rebuild it on top of the
+    # HardwareClient if the user needs the REST endpoints back.
     if args.web_port > 0:
-        from walle.api_server import APIServer
-
-        api_srv = APIServer(
-            serial_mgr,
-            llm_client=orchestrator,
-            vision_service=vision,
-            port=args.web_port,
+        _log.info(
+            "API server disabled in HWC v1 (--web-port=%d ignored; "
+            "see plan file for v2 restoration)",
+            args.web_port,
         )
-        api_srv.start()
-        lifecycle.register("api-server", api_srv.stop)
-        status_lines.append(
-            _status_line("API:", f"http://localhost:{args.web_port}", True)
-        )
-    else:
-        status_lines.append(_status_line("API:", "disabled", False))
 
-    # TTS
-    _log.info("[6/7] TTS engine...")
+    # TTS readiness — still validated here because a missing Piper voice
+    # flips us to console TTS and we want that in the banner.
+    _log.info("[4/5] TTS engine...")
     tts_ok = False
     if not args.no_tts:
-        tts_ok = _test_tts(args.tts_url)
-    tts_label = (
-        "Console" if args.no_tts else ("Mimic3" if tts_ok else "Console (fallback)")
-    )
+        if args.tts_engine == "piper":
+            tts_ok = _test_piper(args.piper_model)
+            if not tts_ok:
+                _log.warning(
+                    "Piper voice not found at %s — falling back to console TTS.",
+                    args.piper_model,
+                )
+        else:
+            tts_ok = _test_tts(args.tts_url)
     if not args.no_tts and not tts_ok:
         args.no_tts = True
-    tts_detail = tts_label if args.no_tts else f"{tts_label} -> {args._speaker_label}"
-    if not args.no_tts and (
-        args.speaker_rate is not None or args.speaker_channels is not None
-    ):
-        extras = []
-        if args.speaker_rate is not None:
-            extras.append(f"{args.speaker_rate}Hz")
-        if args.speaker_channels is not None:
-            extras.append(f"{args.speaker_channels}ch")
-        tts_detail += f" ({', '.join(extras)})"
-    status_lines.append(_status_line("TTS:", tts_detail, True))
 
-    # STT
-    if not args.text_mode:
-        _log.info("[7/7] Loading STT model...")
-        stt_label = f"Moonshine {args.stt_model} -> {args._mic_label}"
-        status_lines.append(_status_line("STT:", stt_label, True))
-    else:
-        status_lines.append(_status_line("STT:", "text mode (skipped)", False))
+    # STT banner
+    _log.info("[5/5] STT model...")
 
-    # Startup banner
-    banner = f"\n{'=' * 42}\n  WALL-E System Status\n{'=' * 42}"
-    for line in status_lines:
-        banner += f"\n{line}"
-    banner += f"\n{'=' * 42}"
-    _log.info(banner)
+    # -- One-shot health probe banner --
+    probes = [
+        ("hwc_socket", lambda: probe_hwc_socket(DEFAULT_SOCKET_PATH)),
+        ("ollama",     lambda: probe_ollama(conf.OLLAMA_BASE_URL)),
+        ("piper",      lambda: probe_piper_model(args.piper_model)),
+        ("amixer",     probe_amixer),
+        ("mic",        lambda: probe_mic_device(args.mic_device)),
+        ("speaker",    lambda: probe_speaker_device(args.speaker_device)),
+    ]
+    if args.text_mode:
+        probes = [p for p in probes if p[0] not in {"mic", "piper", "amixer", "speaker"}]
+    results = run_probes(probes)
+    _log.info(format_banner(results))
 
     # --- Run ---
     if args.text_mode:
@@ -562,20 +603,33 @@ def main():
     signal.signal(signal.SIGINT, _halt)
     signal.signal(signal.SIGTERM, _halt)
     print(f'  Say "{args.wake_word}" to begin!\n')
-    _run_voice_mode(orchestrator, robot_exec, args, lifecycle)
+    _run_voice_mode(
+        orchestrator=orchestrator,
+        chat_loop=chat_loop,
+        do_dispatcher=do_dispatcher,
+        args=args,
+        lifecycle=lifecycle,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Mode runners
 # ---------------------------------------------------------------------------
 def _text_mode_repl(orchestrator, args):
-    from walle.voice.assistant import ConsoleTTSEngine, Mimic3TTSEngine
-
-    tts = (
-        ConsoleTTSEngine()
-        if args.no_tts
-        else Mimic3TTSEngine(url=args.tts_url, voice=args.tts_voice)
+    from walle.voice.assistant import (
+        ConsoleTTSEngine,
+        Mimic3TTSEngine,
+        PiperTTSEngine,
     )
+
+    if args.no_tts:
+        tts = ConsoleTTSEngine()
+    elif args.tts_engine == "piper":
+        tts = PiperTTSEngine(
+            model_path=args.piper_model, speaker_id=args.piper_speaker
+        )
+    else:
+        tts = Mimic3TTSEngine(url=args.tts_url, voice=args.tts_voice)
 
     print(f"\n{'=' * 50}")
     print(f"  WALL-E Text Mode | {conf.OLLAMA_MODEL} via Ollama")
@@ -606,67 +660,30 @@ def _text_mode_repl(orchestrator, args):
         print("\n")
 
 
-class _RobotBridge:
-    """Maps voice intent actions to RobotControlExecutor tool calls.
-
-    Defined here (not in walle_main.py) because it needs BaseRobotController
-    from walle.voice.assistant which pulls heavy audio deps. This class is only
-    instantiated in voice mode after those deps are lazy-loaded.
-    """
-
-    # Voice intents map directly to the unified `drive` tool. The old
-    # wave/dance intents targeted arm/neck servos that no longer exist in
-    # the CLI firmware, so they're dropped rather than silently no-oped.
-    ACTION_MAP = {
-        "forward": (
-            "drive",
-            {"direction": "forward", "speed": 85, "duration_ms": 2000},
-        ),
-        "backward": (
-            "drive",
-            {"direction": "backward", "speed": 85, "duration_ms": 2000},
-        ),
-        "left": ("drive", {"direction": "left", "speed": 75, "duration_ms": 900}),
-        "right": ("drive", {"direction": "right", "speed": 75, "duration_ms": 900}),
-        "stop": ("stop_movement", {}),
-    }
-
-    def __init__(self, robot_exec):
-        self._robot = robot_exec
-
-    def execute(self, action: str, utterance: str, confidence: float) -> None:
-        mapping = self.ACTION_MAP.get(action)
-        if mapping:
-            tool_name, args = mapping
-            _log.debug(
-                "RobotBridge: %s -> %s (confidence=%.0f%%)",
-                action,
-                tool_name,
-                confidence * 100,
-            )
-            self._robot.execute(tool_name, args)
-        else:
-            _log.warning("RobotBridge: unknown action '%s'", action)
-
-    def close(self) -> None:
-        pass
-
-
-def _run_voice_mode(orchestrator, robot_exec, args, lifecycle: LifecycleManager):
+def _run_voice_mode(
+    *,
+    orchestrator,
+    chat_loop,
+    do_dispatcher,
+    args,
+    lifecycle: LifecycleManager,
+):
     from walle.voice.assistant import (
-        ROBOT_INTENTS,
         ConsoleTTSEngine,
         Mimic3TTSEngine,
+        PiperTTSEngine,
         VoiceAssistant,
         _stt_model_choices,
     )
 
-    robot_bridge = _RobotBridge(robot_exec)
-    tts = (
-        ConsoleTTSEngine()
-        if args.no_tts
-        else Mimic3TTSEngine(url=args.tts_url, voice=args.tts_voice)
-    )
+    if args.no_tts:
+        tts = ConsoleTTSEngine()
+    elif args.tts_engine == "piper":
+        tts = PiperTTSEngine(
+            model_path=args.piper_model, speaker_id=args.piper_speaker
+        )
+    else:
+        tts = Mimic3TTSEngine(url=args.tts_url, voice=args.tts_voice)
 
     # ModelArch is lazy-imported inside assistant.py to keep text-mode free
     # of the moonshine_voice dependency. Resolve the string choice here.
@@ -678,15 +695,14 @@ def _run_voice_mode(orchestrator, robot_exec, args, lifecycle: LifecycleManager)
         wake_sounds_dir = None
 
     assistant = VoiceAssistant(
-        llm=orchestrator,
-        robot=robot_bridge,
+        chat_loop=chat_loop,
+        do_dispatcher=do_dispatcher,
         tts=tts,
         language=args.language,
         stt_model_arch=stt_arch,
         embedding_model=args.embedding_model,
         embedding_quantization=args.embedding_quantization,
         intent_threshold=args.intent_threshold,
-        intents=ROBOT_INTENTS,
         wake_word=args.wake_word,
         listen_timeout=args.listen_timeout,
         listen_timeout_long=args.listen_timeout_long,
@@ -695,8 +711,16 @@ def _run_voice_mode(orchestrator, robot_exec, args, lifecycle: LifecycleManager)
         mic_device=args.mic_device,
         mic_channels=args.mic_channels,
         mic_blocksize=args.mic_blocksize,
+        follow_up=args.follow_up,
+        follow_up_timeout=args.follow_up_timeout,
         system_prompt="WALL-E voice mode active.",
     )
+
+    # v2: face greeter was wired here via VisionService. The HWC v1
+    # architecture moved vision into the tracker subprocess, so walle
+    # no longer has a VisionService. Greeter will come back when the
+    # tracker subprocess emits `EVENT face <name>` lines over the HWC
+    # socket and walle subscribes.
 
     try:
         assistant.run()

@@ -7,26 +7,148 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+# Load .env for local secrets (OLLAMA_API_KEY, OLLAMA_URL, OLLAMA_MODEL)
+[ -f .env ] && set -a && source .env && set +a
+
 # ---------- Configuration ----------
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-qwen2.5:3b}"
+# Bridge to walle Python config (reads WALLE_* prefixed env vars)
+export WALLE_OLLAMA_BASE_URL="$OLLAMA_URL"
+export WALLE_OLLAMA_MODEL="$OLLAMA_MODEL"
+# Vision model retired in the HWC v1 build — capture_image tool is
+# gone (moved to v2 once the tracker subprocess gains face + frame
+# events over the HWC socket). Leaving moondream on disk wastes ~2 GB
+# and, if Ollama keep_alive kicks in, can fragment UMA memory against
+# the chat model. Set to "moondream" explicitly to re-enable.
+OLLAMA_VISION_MODEL="${OLLAMA_VISION_MODEL:-}"
 MIMIC3_URL="${MIMIC3_URL:-http://localhost:59125}"
 UV_EXTRAS="${UV_EXTRAS:---extra jetson}"
-WALLE_ARGS="${WALLE_ARGS:-}"
+# Use an array so device names containing spaces (e.g. "ReSpeaker 4 Mic
+# Array") survive expansion into the final `uv run walle ...` command.
+# Back-compat: if a caller passed WALLE_ARGS as a string, re-split it
+# with the shell's normal word rules.
+if [[ -n "${WALLE_ARGS:-}" ]]; then
+    # shellcheck disable=SC2206  # we want word-splitting here
+    WALLE_ARGS_LIST=( $WALLE_ARGS )
+else
+    WALLE_ARGS_LIST=()
+fi
 CORAL39_PY="${WALLE_CORAL_PYTHON39:-$PROJECT_ROOT/.venv-coral39/bin/python}"
+
+# Hardware defaults for this deployment — the physical WALL-E Jetson setup.
+# Each is overridable by exporting the env var or passing the flag
+# explicitly; we only inject the default when the user didn't. This is
+# what turns `bash scripts/start.sh` into the working voice pipeline
+# without forcing operators to remember the long incantation every time.
+
+# Pick the first CH341USB* device that actually exists so we survive
+# USB re-enumeration (USB0 → USB1 when the Arduino was unplugged +
+# replugged while the old node was still held open). Fall back to USB0
+# literal as a last resort so the error message in walle-hwc is clear.
+if [[ -n "${WALLE_SERIAL_PORT:-}" ]]; then
+    DEFAULT_SERIAL_PORT="$WALLE_SERIAL_PORT"
+else
+    DEFAULT_SERIAL_PORT=""
+    for p in /dev/ttyCH341USB* /dev/ttyUSB* /dev/ttyACM*; do
+        if [[ -e "$p" ]]; then
+            DEFAULT_SERIAL_PORT="$p"
+            break
+        fi
+    done
+    DEFAULT_SERIAL_PORT="${DEFAULT_SERIAL_PORT:-/dev/ttyCH341USB0}"
+fi
+DEFAULT_MIC_DEVICE="${WALLE_MIC_DEVICE:-ReSpeaker 4 Mic Array}"
+DEFAULT_SPEAKER_DEVICE="${WALLE_SPEAKER_DEVICE:-UACDemoV1.0}"
+DEFAULT_SPEAKER_RATE="${WALLE_SPEAKER_RATE:-48000}"
+DEFAULT_SPEAKER_CHANNELS="${WALLE_SPEAKER_CHANNELS:-2}"
+
 # Quick mode: ./scripts/start.sh --llm-only  →  text REPL, no vision/tts
 if [[ " $* " == *" --llm-only "* ]]; then
-    WALLE_ARGS="$WALLE_ARGS --text-mode --no-vision --no-tts"
-    set -- $(echo "$@" | sed 's/--llm-only//')
+    WALLE_ARGS_LIST+=(--text-mode --no-vision --no-tts)
+    # Strip --llm-only from positional args without breaking quoting.
+    new_args=()
+    for a in "$@"; do
+        [[ "$a" == "--llm-only" ]] || new_args+=("$a")
+    done
+    set -- "${new_args[@]}"
+fi
+
+# The `--extra jetson` uv install implies this is a Jetson deployment;
+# pass --jetson to walle so the runtime overrides (model pin, FPS cap,
+# STT model, embedding device) actually apply. Skip if the operator is
+# already passing --jetson or opted into --no-jetson.
+_needs_jetson=1
+_needs_serial=1
+_needs_mic=1
+_needs_speaker=1
+_needs_speaker_rate=1
+_needs_speaker_channels=1
+_text_mode=0
+for a in "$@"; do
+    case "$a" in
+        --jetson|--jetson=*) _needs_jetson=0 ;;
+        --no-jetson) _needs_jetson=0 ;;
+        --serial-port|--serial-port=*) _needs_serial=0 ;;
+        --mic-device|--mic-device=*) _needs_mic=0 ;;
+        --speaker-device|--speaker-device=*) _needs_speaker=0 ;;
+        --speaker-rate|--speaker-rate=*) _needs_speaker_rate=0 ;;
+        --speaker-channels|--speaker-channels=*) _needs_speaker_channels=0 ;;
+        --text-mode) _text_mode=1 ;;
+    esac
+done
+# WALLE_ARGS_LIST entries count for flag-detection too.
+for a in "${WALLE_ARGS_LIST[@]}"; do
+    case "$a" in
+        --jetson|--jetson=*|--no-jetson) _needs_jetson=0 ;;
+        --serial-port|--serial-port=*) _needs_serial=0 ;;
+        --mic-device|--mic-device=*) _needs_mic=0 ;;
+        --speaker-device|--speaker-device=*) _needs_speaker=0 ;;
+        --speaker-rate|--speaker-rate=*) _needs_speaker_rate=0 ;;
+        --speaker-channels|--speaker-channels=*) _needs_speaker_channels=0 ;;
+        --text-mode) _text_mode=1 ;;
+    esac
+done
+
+if [[ "$_needs_jetson" == "1" ]]; then
+    WALLE_ARGS_LIST+=(--jetson)
+fi
+if [[ "$_text_mode" == "0" ]]; then
+    # Audio + serial defaults only apply to voice mode. Text mode has no
+    # mic/speaker and may be running on a workstation with no Arduino.
+    if [[ "$_needs_serial" == "1" && -e "$DEFAULT_SERIAL_PORT" ]]; then
+        WALLE_ARGS_LIST+=(--serial-port "$DEFAULT_SERIAL_PORT")
+    fi
+    if [[ "$_needs_mic" == "1" ]]; then
+        WALLE_ARGS_LIST+=(--mic-device "$DEFAULT_MIC_DEVICE")
+    fi
+    if [[ "$_needs_speaker" == "1" ]]; then
+        WALLE_ARGS_LIST+=(--speaker-device "$DEFAULT_SPEAKER_DEVICE")
+    fi
+    if [[ "$_needs_speaker_rate" == "1" ]]; then
+        WALLE_ARGS_LIST+=(--speaker-rate "$DEFAULT_SPEAKER_RATE")
+    fi
+    if [[ "$_needs_speaker_channels" == "1" ]]; then
+        WALLE_ARGS_LIST+=(--speaker-channels "$DEFAULT_SPEAKER_CHANNELS")
+    fi
 fi
 
 
 # Jetson UMA: keep model pinned on GPU and shrink KV cache so cudaMalloc
 # doesn't fragment once walle's Python stack loads alongside it.
+# Context dropped from 2048 → 1024 after OOM on real runs — Orin Nano
+# 8 GB UMA can't fit qwen2.5:3b KV@2048 alongside Moonshine-medium,
+# Piper, Coral worker, camera buffers, and the HWC + tracker python
+# processes. 1024 comfortably holds a multi-turn dialogue and frees
+# ~375 MB of GPU that was going to the unused tail of the KV cache.
 export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:-24h}"
-export OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-2048}"
+export OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-1024}"
 export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-1}"
 export OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-1}"
+# Flash attention on the KV cache trims another ~100 MB and is a
+# pure win on Turing / Ampere / Orin cuDNN paths. If this breaks on
+# any future Ollama release, set it back to 0.
+export OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-1}"
 
 # Free reclaimable page cache before Ollama tries to allocate on UMA.
 # Non-fatal if sudo is not available (running outside Jetson).
@@ -53,6 +175,9 @@ trap cleanup EXIT INT TERM
 
 # ---------- 1. Ollama ----------
 echo "=== Checking Ollama ==="
+if [[ "$OLLAMA_URL" == *"ollama.com"* ]]; then
+    echo "  Using Ollama Cloud ($OLLAMA_URL) — skipping local daemon + preload"
+else
 # Always kill any running ollama so it is restarted with our Jetson env vars
 # (OLLAMA_KEEP_ALIVE, OLLAMA_CONTEXT_LENGTH). An ollama started from a plain
 # shell won't have them, which causes UMA OOM when walle connects later.
@@ -84,12 +209,25 @@ if ! curl -sf "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
     exit 1
 fi
 
-# Check if model is pulled
+# Check if chat model is pulled
 if ollama list 2>/dev/null | grep -q "$OLLAMA_MODEL"; then
     echo "  Model '$OLLAMA_MODEL' available."
 else
     echo "  Model '$OLLAMA_MODEL' not found. Pulling..."
     ollama pull "$OLLAMA_MODEL"
+fi
+
+# Vision model pull is opt-in (OLLAMA_VISION_MODEL=moondream). Default
+# is empty — the HWC v1 build doesn't use capture_image, so pre-pulling
+# moondream just burned ~2 GB of disk + fragmented UMA memory.
+if [[ -n "$OLLAMA_VISION_MODEL" ]]; then
+    if ollama list 2>/dev/null | grep -q "$OLLAMA_VISION_MODEL"; then
+        echo "  Vision model '$OLLAMA_VISION_MODEL' available."
+    else
+        echo "  Vision model '$OLLAMA_VISION_MODEL' not found. Pulling..."
+        ollama pull "$OLLAMA_VISION_MODEL" \
+            || echo "  WARNING: vision model pull failed."
+    fi
 fi
 
 # Preload model onto GPU BEFORE walle's Python stack grabs RAM.
@@ -108,16 +246,63 @@ if curl -sf "$OLLAMA_URL/api/ps" 2>/dev/null | grep -q "$OLLAMA_MODEL"; then
 else
     echo "  WARNING: $OLLAMA_MODEL not found in /api/ps after preload."
 fi
+fi
 
-# ---------- 2. Mimic3 TTS ----------
-echo "=== Checking Mimic3 TTS ==="
-if curl -sf "$MIMIC3_URL" >/dev/null 2>&1; then
-    echo "  Mimic3 TTS is running."
+# ---------- 2. TTS ----------
+# Detect requested engine — default piper (local, natural). Users can opt
+# back into Mimic3 with --tts-engine mimic3 or --tts-engine=mimic3.
+TTS_ENGINE="piper"
+if [[ " $* " == *" --tts-engine mimic3 "* ]] || [[ " $* " == *" --tts-engine=mimic3 "* ]]; then
+    TTS_ENGINE="mimic3"
+fi
+
+if [[ "$TTS_ENGINE" == "piper" ]]; then
+    echo "=== Checking Piper TTS voice ==="
+    # Match the default --piper-model path in walle/startup.py. Override
+    # by exporting PIPER_MODEL=/path/to/voice.onnx before running.
+    PIPER_MODEL="${PIPER_MODEL:-$PROJECT_ROOT/voices/en_US-lessac-medium.onnx}"
+    PIPER_ONNX_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx"
+    PIPER_JSON_URL="${PIPER_ONNX_URL}.json"
+    if [[ -f "$PIPER_MODEL" && -f "$PIPER_MODEL.json" ]]; then
+        echo "  Piper voice ready: $PIPER_MODEL"
+    else
+        mkdir -p "$(dirname "$PIPER_MODEL")"
+        echo "  Piper voice not found — downloading en_US-lessac-medium (~63 MB)..."
+        if curl -fL --retry 3 -o "$PIPER_MODEL" "$PIPER_ONNX_URL" \
+        && curl -fL --retry 3 -o "$PIPER_MODEL.json" "$PIPER_JSON_URL"; then
+            echo "  Piper voice downloaded."
+        else
+            echo "  WARNING: Piper voice download failed. Console TTS fallback."
+            WALLE_ARGS="$WALLE_ARGS --no-tts"
+        fi
+    fi
 else
-    echo "  Mimic3 TTS not found at $MIMIC3_URL."
-    echo "  Start it manually: mimic3-server --port 59125"
-    echo "  Continuing without TTS (will use console fallback)..."
-    WALLE_ARGS="$WALLE_ARGS --no-tts"
+    echo "=== Checking Mimic3 TTS ==="
+    if curl -sf "$MIMIC3_URL" >/dev/null 2>&1; then
+        echo "  Existing Mimic3 detected — reusing."
+    else
+        if command -v mimic3-server >/dev/null 2>&1; then
+            echo "  Starting mimic3-server on $MIMIC3_URL..."
+            mimic3-server --port 59125 >/tmp/mimic3.log 2>&1 &
+            CHILD_PIDS+=($!)
+            for i in $(seq 1 30); do
+                if curl -sf "$MIMIC3_URL" >/dev/null 2>&1; then
+                    echo "  Mimic3 ready."
+                    break
+                fi
+                sleep 1
+            done
+            if ! curl -sf "$MIMIC3_URL" >/dev/null 2>&1; then
+                echo "  WARNING: Mimic3 failed to start within 30s. See /tmp/mimic3.log"
+                echo "  Continuing with console TTS fallback..."
+                WALLE_ARGS="$WALLE_ARGS --no-tts"
+            fi
+        else
+            echo "  mimic3-server not installed on PATH. Install it or pass --no-tts."
+            echo "  Continuing with console TTS fallback..."
+            WALLE_ARGS="$WALLE_ARGS --no-tts"
+        fi
+    fi
 fi
 
 # ---------- 3. Python project environment ----------
@@ -135,10 +320,65 @@ if [[ -x "$CORAL39_PY" ]]; then
     echo "  Coral worker: $WALLE_CORAL_PYTHON39"
 fi
 
-# ---------- 4. Launch WALL-E ----------
+# ---------- 4. Launch walle-hwc ----------
+# The hardware controller owns /dev/ttyCH341USB0 and supervises the
+# track_and_turn_head.py subprocess. We spawn it first, wait for the
+# UDS file to appear (meaning the server is listening), then launch
+# walle which connects as an `llm` / `stt` client.
+HWC_SOCKET="${WALLE_HW_SOCK:-/tmp/walle_hw.sock}"
+HWC_SERIAL_PORT="${WALLE_SERIAL_PORT:-$DEFAULT_SERIAL_PORT}"
+
+# Remove stale socket from a previous crashed run so our readiness
+# poll doesn't false-positive before walle-hwc has bound.
+rm -f "$HWC_SOCKET" 2>/dev/null || true
+
+echo "=== Launching walle-hwc ==="
+echo "  socket=$HWC_SOCKET  serial=$HWC_SERIAL_PORT"
+
+# Propagate WALLE_HW_ALLOW_SIM=1 so the operator can deliberately run
+# without hardware (CI, protocol debugging, bench test of voice stack
+# only). By default HWC aborts when the serial port isn't openable —
+# that's what turned "drive 200 1500 → OK but no motion" from an
+# invisible sim-mode trap into a loud failure at startup.
+HWC_EXTRA_ARGS=()
+if [[ "${WALLE_HW_ALLOW_SIM:-0}" == "1" ]]; then
+    HWC_EXTRA_ARGS+=(--allow-simulation)
+    echo "  (WALLE_HW_ALLOW_SIM=1 set — running in simulation mode)"
+fi
+
+# shellcheck disable=SC2086
+uv run $UV_EXTRAS walle-hwc \
+    --socket-path "$HWC_SOCKET" \
+    --serial-port "$HWC_SERIAL_PORT" \
+    "${HWC_EXTRA_ARGS[@]}" \
+    &
+HWC_PID=$!
+CHILD_PIDS+=($HWC_PID)
+
+# Wait up to 15 s for the socket file to appear. If walle-hwc crashed
+# immediately, bail early so start.sh doesn't wedge forever.
+for i in $(seq 1 30); do
+    if [[ -S "$HWC_SOCKET" ]]; then
+        echo "  walle-hwc ready (socket $HWC_SOCKET, ${i} x 0.5s)"
+        break
+    fi
+    if ! kill -0 "$HWC_PID" 2>/dev/null; then
+        echo "  ERROR: walle-hwc exited before creating the socket. See logs above."
+        exit 1
+    fi
+    sleep 0.5
+done
+if [[ ! -S "$HWC_SOCKET" ]]; then
+    echo "  ERROR: walle-hwc did not create $HWC_SOCKET within 15s."
+    exit 1
+fi
+export WALLE_HW_SOCK="$HWC_SOCKET"
+
+# ---------- 5. Launch WALL-E ----------
 echo ""
 echo "=== Launching WALL-E ==="
-echo "  Args: $WALLE_ARGS $*"
+echo "  Args:" "${WALLE_ARGS_LIST[@]}" "$@"
 echo ""
 
-uv run $UV_EXTRAS walle $WALLE_ARGS "$@"
+# shellcheck disable=SC2086  # UV_EXTRAS is intentionally word-split
+uv run $UV_EXTRAS walle "${WALLE_ARGS_LIST[@]}" "$@"

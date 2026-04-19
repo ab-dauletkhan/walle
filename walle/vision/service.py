@@ -7,11 +7,14 @@ Supports two backends: Google Coral TPU (preferred) and CPU (YOLOv8 + InsightFac
 import base64
 import logging
 import os
+import re
 import threading
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
+
+_LOC_RE = re.compile(r"\((-?\d+),\s*(-?\d+)\)-\((-?\d+),\s*(-?\d+)\)")
 
 import numpy as np
 from vision.camera_source import open_camera_source
@@ -148,6 +151,8 @@ class SubprocessCoralVisionBackend(VisionBackend):
     def __init__(self):
         self._worker = CoralWorkerClient(timeout_ms=conf.VISION_CORAL_WORKER_TIMEOUT_MS)
         self._restarts = 0
+        self._detector_input_w: Optional[int] = None
+        self._detector_input_h: Optional[int] = None
         try:
             self._health_check()
         except Exception as exc:
@@ -178,6 +183,29 @@ class SubprocessCoralVisionBackend(VisionBackend):
         self._worker.close()
         self._worker = CoralWorkerClient(timeout_ms=conf.VISION_CORAL_WORKER_TIMEOUT_MS)
         self._restarts += 1
+        # input-size cache invalidated on restart; detect_only callers
+        # will re-fetch via detector_input_size() on next use.
+        self._detector_input_w = None
+        self._detector_input_h = None
+
+    @property
+    def worker(self) -> CoralWorkerClient:
+        """Shared Coral worker client. FastFaceTracker sends its
+        detect_only ops through this same client so the Edge TPU stays
+        single-owner (the TPU rejects concurrent processes)."""
+        return self._worker
+
+    def detector_input_size(self) -> tuple[int, int]:
+        """Query and cache the worker's detector input size (W, H)."""
+        if (
+            self._detector_input_w is not None
+            and self._detector_input_h is not None
+        ):
+            return self._detector_input_w, self._detector_input_h
+        resp = self._worker.request({"op": "info"})
+        self._detector_input_w = int(resp["input_w"])
+        self._detector_input_h = int(resp["input_h"])
+        return self._detector_input_w, self._detector_input_h
 
     def process_frame(self, frame: np.ndarray) -> List[Dict]:
         import cv2
@@ -368,6 +396,21 @@ class VisionService:
 
     _STALE_FRAME_TIMEOUT_SEC = 5.0
     _FIRST_FRAME_TIMEOUT_SEC = 3.0
+    # Native camera rate requested from V4L2 — independent of the
+    # recognition-loop FPS. The FastFaceTracker reads fresh frames at
+    # ~30 Hz; the camera must be wide open to feed it. The processing
+    # loop subsamples via its own target_interval.
+    _CAMERA_NATIVE_FPS = 30
+
+    # Face greeter parameters. The vision loop runs at VISION_FPS (1-2 Hz),
+    # so a known face will be reported on consecutive frames. Greeting on
+    # every frame would spam the speaker. Instead:
+    #   - MIN_GREET_INTERVAL: no more than one greeting per ~this-many sec
+    #     across ALL names
+    #   - REAPPEAR_SEC: a specific name only re-greets after it has been
+    #     absent for this long (the person stepped out of frame, returned)
+    _FACE_MIN_GREET_INTERVAL_SEC = 12.0
+    _FACE_REAPPEAR_SEC = 45.0
 
     def __init__(
         self, context_manager: ContextManager, camera_index: int = 0, fps: int = 2
@@ -381,15 +424,55 @@ class VisionService:
         self._camera_source = None
         self._camera_backend_name = "none"
         self._thread: Optional[threading.Thread] = None
+        self._camera_thread: Optional[threading.Thread] = None
         self._running = False
         self._ready = False
         self._frame_lock = threading.Lock()
         self._latest_frame: Optional[np.ndarray] = None
+        self._frame_event = threading.Event()
         self._last_error: Optional[str] = None
         self._last_frame_at: Optional[datetime] = None
 
+        # Face greeter state (wired by set_face_callback()).
+        self._on_known_face: Optional[Callable[[str], None]] = None
+        self._face_last_seen: Dict[str, float] = {}
+        self._face_last_greeted: Dict[str, float] = {}
+        self._greeter_last_fire: float = 0.0
+
+        # Head tracker: optional HeadTracker instance driven by face
+        # bounding boxes (wired by set_head_tracker()).
+        self._head_tracker = None
+        # Frame width is needed to feed the tracker — captured from the
+        # most recent camera frame.
+        self._last_frame_width: int = 0
+
+        # Diagnostic log throttling — at VISION_FPS we'd otherwise emit
+        # one line per frame (60-120 log lines/min). Throttle the
+        # per-frame summary so operators can still see what the camera
+        # is reporting without drowning walle.log.
+        self._last_frame_log_at: float = 0.0
+        self._last_frame_log_signature: str = ""
+
         # Auto-detect backend
         self._backend = self._create_backend()
+
+    def set_head_tracker(self, head_tracker) -> None:
+        """Attach a HeadTracker; its update_from_face/on_no_face methods
+        are called from the vision thread on each processed frame."""
+        self._head_tracker = head_tracker
+
+    @property
+    def head_tracker(self):
+        return self._head_tracker
+
+    def set_face_callback(self, callback: Optional[Callable[[str], None]]) -> None:
+        """Register a callback fired once per known face reappearance.
+
+        The callback receives the recognized person's name and is invoked
+        from the vision thread. Implementations must return quickly
+        (enqueue the greeting to TTS rather than block on synthesis).
+        """
+        self._on_known_face = callback
 
     @property
     def is_active(self) -> bool:
@@ -402,6 +485,10 @@ class VisionService:
             return False
         age = (datetime.now() - self._last_frame_at).total_seconds()
         return age < max(self._STALE_FRAME_TIMEOUT_SEC, self._target_interval * 4)
+
+    @property
+    def backend(self) -> Optional[VisionBackend]:
+        return self._backend
 
     @property
     def backend_name(self) -> str:
@@ -453,7 +540,7 @@ class VisionService:
 
         opened = open_camera_source(
             self._camera_index,
-            fps=self._fps,
+            fps=self._CAMERA_NATIVE_FPS,
             first_frame_timeout_sec=self._FIRST_FRAME_TIMEOUT_SEC,
         )
         if opened.source is None or opened.first_frame is None:
@@ -473,6 +560,14 @@ class VisionService:
         self._last_error = None
         self._record_frame(opened.first_frame)
         self._running = True
+        # Camera reader thread runs at the camera's native rate so the
+        # FastFaceTracker (and any other consumer) always sees a fresh
+        # frame. The processing loop picks up frames at its own (slower)
+        # cadence and does recognition + greeter + context.
+        self._camera_thread = threading.Thread(
+            target=self._camera_reader_loop, daemon=True, name="vision-camera"
+        )
+        self._camera_thread.start()
         self._thread = threading.Thread(
             target=self._loop, daemon=True, name="vision-service"
         )
@@ -487,14 +582,23 @@ class VisionService:
     def stop(self) -> None:
         """Stop the background thread and release camera."""
         self._running = False
+        self._frame_event.set()  # wake the processing loop out of wait()
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
+        if self._camera_thread is not None:
+            self._camera_thread.join(timeout=5.0)
+            self._camera_thread = None
         if self._camera_source is not None:
             self._camera_source.release()
             self._camera_source = None
         if self._backend is not None:
             self._backend.close()
+        if self._head_tracker is not None:
+            try:
+                self._head_tracker.close()
+            except Exception:
+                _log.debug("head_tracker.close failed", exc_info=True)
         self._ready = False
         _log.info("Stopped")
 
@@ -507,28 +611,196 @@ class VisionService:
         with self._frame_lock:
             self._latest_frame = frame.copy()
         self._last_frame_at = datetime.now()
+        # frame.shape is (h, w, c); capture width for the head tracker.
+        try:
+            self._last_frame_width = int(frame.shape[1])
+        except Exception:
+            pass
+        # Signal consumers (processing loop, FastFaceTracker) that a
+        # fresh frame is available. set() is a no-op if already set.
+        self._frame_event.set()
 
     # Error backoff parameters
     _MAX_CONSECUTIVE_ERRORS = 5
     _BACKOFF_BASE = 0.5  # seconds, doubles each consecutive error
     _BACKOFF_MAX = 30.0  # cap
 
-    def _loop(self) -> None:
-        """Background loop: capture frame -> detect faces -> update context."""
-        consecutive_errors = 0
+    _FRAME_LOG_MIN_INTERVAL_SEC = 5.0
 
+    def _log_frame_faces(self, faces: List[Dict]) -> None:
+        """Emit at most one INFO line every 5 s.
+
+        Signature keyed on the *name set* only — confidence excluded
+        because the embedder jitters across its match threshold (e.g.
+        Miras@0.99 ↔ Miras@1.0) every few frames and that flooded the
+        terminal. Enforces a strict 5 s floor so even rapid Miras ↔
+        Unknown flicker collapses into a single line per window.
+        """
+        now = time.time()
+        if not faces:
+            signature = "none"
+        else:
+            names = sorted({(f.get("name") or "Unknown") for f in faces})
+            signature = ",".join(names)
+
+        if now - self._last_frame_log_at < self._FRAME_LOG_MIN_INTERVAL_SEC:
+            return
+        if signature == self._last_frame_log_signature:
+            return
+
+        self._last_frame_log_signature = signature
+        self._last_frame_log_at = now
+        if faces:
+            _log.info("faces: %s", signature)
+        else:
+            _log.info("faces: none in frame")
+
+    def _drive_head_tracker(self, faces: List[Dict]) -> None:
+        """Feed the strongest face detection into the head tracker.
+
+        Matches the standalone track_and_turn_head.py: the head follows
+        the highest-confidence *detection*, whether or not the embedder
+        matched it to a known person. Filtering by `name != "Unknown"`
+        made the head drop track every time the embedder's cosine
+        similarity dipped across the match threshold — at slow
+        recognition rates that flicker happens every few frames. The
+        existing score floor (VISION_FACE_RECOGNITION_MIN = 0.8) plus
+        HeadTracker's median/EMA/deadband smoothing already absorb the
+        occasional false positive this used to guard against.
+        """
+        tracker = self._head_tracker
+        if tracker is None:
+            return
+        frame_width = self._last_frame_width
+        if frame_width <= 0:
+            return
+
+        best_center: Optional[float] = None
+        best_conf = -1.0
+        for face in faces or []:
+            conf = float(face.get("confidence") or 0.0)
+            if conf <= best_conf:
+                continue
+            loc = face.get("location") or ""
+            m = _LOC_RE.search(loc)
+            if not m:
+                continue
+            x1, y1, x2, y2 = (int(v) for v in m.groups())
+            best_center = (x1 + x2) / 2.0
+            best_conf = conf
+
+        try:
+            if best_center is None:
+                tracker.on_no_face()
+            else:
+                tracker.update_from_face(best_center, frame_width)
+        except Exception:
+            _log.exception("head tracker update failed")
+
+    def _maybe_greet(self, faces: List[Dict]) -> None:
+        """Fire the face-greet callback for any known face that just reappeared.
+
+        Rules:
+          1. Ignore Unknown / missing-name entries.
+          2. A specific name is greetable only if it has been absent for
+             at least `_FACE_REAPPEAR_SEC` — prevents re-greeting the same
+             person every frame while they stand in front of the camera.
+          3. Across all names, enforce `_FACE_MIN_GREET_INTERVAL_SEC` so
+             a crowd of known faces in one frame doesn't turn into a wall
+             of greetings.
+        All state updates are done under no lock — the vision thread is
+        the single writer.
+        """
+        if self._on_known_face is None or not faces:
+            return
+        now = time.time()
+        for face in faces:
+            name = (face or {}).get("name")
+            if not name or name == "Unknown":
+                continue
+            last_seen = self._face_last_seen.get(name, 0.0)
+            last_greeted = self._face_last_greeted.get(name, 0.0)
+            # Update "last seen" so a person standing in front of the
+            # camera continuously resets the absence timer — we only
+            # re-greet once they've gone away and come back.
+            gap_since_seen = now - last_seen
+            self._face_last_seen[name] = now
+
+            # First time ever? Or absent long enough to count as a
+            # fresh appearance?
+            fresh_appearance = (
+                last_greeted == 0.0
+                or gap_since_seen >= self._FACE_REAPPEAR_SEC
+            )
+            if not fresh_appearance:
+                continue
+            if now - self._greeter_last_fire < self._FACE_MIN_GREET_INTERVAL_SEC:
+                _log.debug(
+                    "greeter: %s reappeared but rate-limited (%.1fs < %.1fs)",
+                    name,
+                    now - self._greeter_last_fire,
+                    self._FACE_MIN_GREET_INTERVAL_SEC,
+                )
+                continue
+
+            _log.info("greeter: firing callback for %s", name)
+            self._face_last_greeted[name] = now
+            self._greeter_last_fire = now
+            try:
+                self._on_known_face(name)
+            except Exception:
+                _log.exception("Face greeter callback failed for %s", name)
+            # Fire at most one greeting per frame — keeps output sane
+            # when multiple known faces are in view.
+            return
+
+    def _camera_reader_loop(self) -> None:
+        """Pull frames from the camera as fast as it delivers them.
+
+        Runs separately from the processing loop so the camera buffer
+        never backs up and `_latest_frame` stays fresh for high-rate
+        consumers like the FastFaceTracker. OpenCV's VideoCapture.read()
+        blocks until the next camera frame is ready, which provides
+        natural pacing at the camera's native FPS.
+        """
         while self._running:
-            loop_start = time.monotonic()
-
-            ret, frame = self._camera_source.read()
-            if not ret:
-                self._last_error = f"camera read failed via {self._camera_backend_name}"
+            try:
+                ret, frame = self._camera_source.read()
+            except Exception as exc:
+                self._last_error = f"camera read raised: {exc}"
+                time.sleep(0.1)
+                continue
+            if not ret or frame is None:
+                self._last_error = (
+                    f"camera read failed via {self._camera_backend_name}"
+                )
                 time.sleep(0.1)
                 continue
 
             self._ready = True
             self._last_error = None
             self._record_frame(frame)
+
+    def _loop(self) -> None:
+        """Background loop: sample latest frame -> recognize -> update context."""
+        consecutive_errors = 0
+
+        while self._running:
+            loop_start = time.monotonic()
+
+            # Wait for the camera reader to produce a fresh frame.
+            # _frame_event is cleared once we consume so we block here
+            # instead of busy-looping when the camera is slower than
+            # our target interval.
+            self._frame_event.wait(timeout=self._target_interval + 0.5)
+            if not self._running:
+                break
+            self._frame_event.clear()
+
+            frame = self.get_latest_frame()
+            if frame is None:
+                time.sleep(0.05)
+                continue
 
             if self._backend is None:
                 consecutive_errors = 0
@@ -545,6 +817,9 @@ class VisionService:
                     timestamp=datetime.now(),
                 )
                 self._context_manager.update_visual(visual)
+                self._log_frame_faces(faces)
+                self._maybe_greet(faces)
+                self._drive_head_tracker(faces)
                 consecutive_errors = 0  # reset on success
             except Exception as e:
                 consecutive_errors += 1
@@ -588,7 +863,15 @@ def get_capture_image_tools() -> list:
             "type": "function",
             "function": {
                 "name": "capture_image",
-                "description": "Capture a photo from the robot's camera and get a description of what is visible. Use when the user asks what you can see or you need visual information.",
+                "description": (
+                    "ALWAYS call this when the user asks about what is "
+                    "visible — e.g. 'what do you see?', 'can you see me?', "
+                    "'who's there?', 'what's in front of you?', 'describe "
+                    "the room', 'is anyone here?'. Returns a sentence "
+                    "describing the current camera view. Do NOT call "
+                    "scan_surroundings for a visual question — that only "
+                    "moves the head and does not return any description."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -606,7 +889,14 @@ def get_capture_image_tools() -> list:
 
 
 class CaptureImageExecutor:
-    """Handles the capture_image tool call: grabs a frame and describes it via a vision LLM."""
+    """Handles the capture_image tool call: grabs a frame and describes it via a vision LLM.
+
+    When the configured vision model isn't pulled (common failure mode on
+    Jetson if `ollama pull moondream` was skipped), we fall back to a
+    description synthesized from the already-running face-recognition
+    pipeline instead of returning an error string that the chat LLM
+    then paraphrases as "there was an issue capturing the image".
+    """
 
     def __init__(
         self,
@@ -617,6 +907,10 @@ class CaptureImageExecutor:
         self._vision_service = vision_service
         self._ollama_url = ollama_base_url
         self._vision_model = vision_model
+        # Tri-state: None = untested, True = present, False = confirmed missing.
+        # We cache a confirmed-missing result so repeated capture_image calls
+        # don't each round-trip Ollama just to rediscover the 404.
+        self._vision_model_available: Optional[bool] = None
 
     def execute(self, fn_name: str, args: dict) -> str:
         if fn_name != "capture_image":
@@ -635,10 +929,71 @@ class CaptureImageExecutor:
         }
         prompt = prompts.get(detail, prompts["general"])
 
+        if self._vision_model_available is False:
+            return self._fallback_description(detail)
+
         try:
             return self._describe_frame(frame, prompt)
         except Exception as e:
-            return f"Image capture failed: {e}"
+            # 404 / connection failure → cache and degrade for subsequent calls.
+            _log.warning(
+                "capture_image: vision LLM '%s' failed (%s); "
+                "falling back to face-recognition summary",
+                self._vision_model,
+                e,
+            )
+            self._vision_model_available = False
+            return self._fallback_description(detail)
+
+    def _fallback_description(self, detail: str) -> str:
+        """Describe the frame using face-recognition results only.
+
+        The VisionService is continuously populating ContextManager with
+        the latest detection set, so we already know how many people are
+        in frame and who they are (when matched). This is usually the
+        question the user was asking when they triggered capture_image
+        on a voice robot — "can you see me?", "who's here?" — so the
+        fallback is often just as useful as the moondream description.
+        """
+        visual = getattr(self._vision_service._context_manager, "visual", None)
+        faces: List[Dict] = []
+        if visual is not None:
+            faces = getattr(visual, "faces_detected", None) or []
+
+        if not faces:
+            return "I can see the camera feed, but there are no faces in view right now."
+
+        known = [f for f in faces if (f.get("name") or "Unknown") != "Unknown"]
+        unknown = [f for f in faces if (f.get("name") or "Unknown") == "Unknown"]
+
+        if detail == "objects":
+            # We don't run an object detector — be honest.
+            return (
+                "I only have a face-recognition model running, so I can't "
+                "list generic objects. "
+                + self._describe_people(known, unknown)
+            )
+
+        return self._describe_people(known, unknown)
+
+    @staticmethod
+    def _describe_people(known: List[Dict], unknown: List[Dict]) -> str:
+        parts: List[str] = []
+        if known:
+            names = sorted({(f.get("name") or "").strip() for f in known if f.get("name")})
+            if len(names) == 1:
+                parts.append(f"I can see {names[0]}.")
+            else:
+                parts.append("I can see " + ", ".join(names[:-1]) + f", and {names[-1]}.")
+        if unknown:
+            n = len(unknown)
+            if known:
+                parts.append(f"Plus {n} person I don't recognize." if n == 1
+                             else f"Plus {n} people I don't recognize.")
+            else:
+                parts.append(f"I can see {n} person I don't recognize." if n == 1
+                             else f"I can see {n} people, but I don't recognize any of them.")
+        return " ".join(parts) if parts else "I don't see anyone clearly right now."
 
     def _describe_frame(self, frame: np.ndarray, prompt: str) -> str:
         """Send frame to Ollama vision model for description."""
@@ -661,4 +1016,5 @@ class CaptureImageExecutor:
             timeout=30,
         )
         resp.raise_for_status()
+        self._vision_model_available = True
         return resp.json().get("response", "Could not describe the image.")

@@ -34,6 +34,32 @@ class CoralRecognizer:
             DEFAULT_DATA_DIR, required=False
         )
 
+    def detect_only(
+        self, rgb_resized: np.ndarray, frame_w: int, frame_h: int
+    ) -> list[dict]:
+        """Detection-only path for the 30 FPS head tracker.
+
+        Caller pre-resizes to (input_w, input_h) RGB on the main side
+        so this skips PIL/cv2 resize + colour convert inside the worker.
+        """
+        detections = detect_faces(
+            self._detector,
+            rgb_resized,
+            threshold=0.5,
+            frame_width=int(frame_w),
+            frame_height=int(frame_h),
+        )
+        return [
+            {
+                "score": round(float(d.score), 4),
+                "xmin": int(d.xmin),
+                "ymin": int(d.ymin),
+                "xmax": int(d.xmax),
+                "ymax": int(d.ymax),
+            }
+            for d in detections
+        ]
+
     def detect_and_recognize(self, frame_bgr: np.ndarray) -> list[dict]:
         image_rgb = self._Image.fromarray(
             self._cv2.cvtColor(frame_bgr, self._cv2.COLOR_BGR2RGB)
@@ -95,6 +121,18 @@ def decode_frame(payload: dict) -> np.ndarray:
     return frame
 
 
+def _decode_resized_rgb(payload: dict, input_w: int, input_h: int) -> np.ndarray:
+    b64 = payload["frame_rgb_b64"]
+    raw = base64.b64decode(b64)
+    expected = input_w * input_h * 3
+    if len(raw) != expected:
+        raise RuntimeError(
+            f"detect_only expected {expected} bytes ({input_w}x{input_h}x3), "
+            f"got {len(raw)}"
+        )
+    return np.frombuffer(raw, dtype=np.uint8).reshape(input_h, input_w, 3)
+
+
 def serve() -> int:
     recognizer = CoralRecognizer()
 
@@ -104,11 +142,33 @@ def serve() -> int:
         try:
             payload = json.loads(line)
             op = payload.get("op")
-            if op != "detect_recognize":
+            if op == "detect_recognize":
+                frame = decode_frame(payload)
+                faces = recognizer.detect_and_recognize(frame)
+                print(json.dumps({"ok": True, "faces": faces}), flush=True)
+            elif op == "detect_only":
+                rgb = _decode_resized_rgb(
+                    payload, recognizer._input_width, recognizer._input_height
+                )
+                detections = recognizer.detect_only(
+                    rgb, int(payload["frame_w"]), int(payload["frame_h"])
+                )
+                print(
+                    json.dumps({"ok": True, "detections": detections}), flush=True
+                )
+            elif op == "info":
+                print(
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "input_w": int(recognizer._input_width),
+                            "input_h": int(recognizer._input_height),
+                        }
+                    ),
+                    flush=True,
+                )
+            else:
                 raise RuntimeError(f"Unsupported op: {op}")
-            frame = decode_frame(payload)
-            faces = recognizer.detect_and_recognize(frame)
-            print(json.dumps({"ok": True, "faces": faces}), flush=True)
         except Exception as exc:
             print(json.dumps({"ok": False, "error": str(exc)}), flush=True)
     return 0

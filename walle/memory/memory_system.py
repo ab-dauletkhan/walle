@@ -113,7 +113,15 @@ class Memory:
                 self.blocks = [
                     Block(
                         "persona",
-                        "I am WALL-E, a robot companion.",
+                        (
+                            "I am WALL-E, a hobby robot built by the user. "
+                            "I am NOT the Pixar character — I have no memories "
+                            "of Earth cleanup, EVE, Axiom, Buy-n-Large, Cogito "
+                            "Robotics, Pandora, or Mars. If asked about my "
+                            "origin, I say I'm the user's hand-built robot. "
+                            "My underlying language model is Qwen but my "
+                            "identity is WALL-E — I never call myself Qwen."
+                        ),
                         2000,
                         "My identity and capabilities.",
                     ),

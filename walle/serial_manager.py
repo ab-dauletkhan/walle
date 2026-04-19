@@ -93,6 +93,52 @@ class SerialManager:
             results.append(self._send_line(line))
         return "; ".join(results)
 
+    def send_write_only(self, cmd: str) -> None:
+        """Write one line without waiting for any firmware reply.
+
+        Used by high-frequency callers like the vision head tracker
+        (30 Hz): waiting for the ack round-trip (10-50 ms each) would
+        cap the effective send rate at ~15 Hz and make the servo feel
+        sluggish. The firmware still processes the command — we just
+        don't block the caller for the response.
+
+        Even though we don't want the reply, we still drain the RX
+        buffer before/after writing. The firmware prints an "OK -> ..."
+        line for every command, and at 30 Hz those replies quickly
+        saturate the kernel tty buffer. Once the host-side buffer is
+        full, the USB endpoint NAKs, the CH341 backs up, and the
+        Arduino's Serial.print starts blocking — which stalls the
+        firmware's main loop and makes the LLM's subsequent commands
+        time out. Draining keeps the pipe flowing.
+
+        Returns silently in simulation mode. Thread-safe.
+        """
+        line = cmd.strip()
+        if not line:
+            return
+        with self._lock:
+            if self._simulation:
+                _log.debug("SIM (wo) >> %s", line)
+                return
+            if not (self._conn and self._conn.is_open):
+                return
+            try:
+                pending = self._conn.in_waiting
+                if pending:
+                    self._conn.read(pending)
+            except Exception:
+                pass
+            try:
+                self._conn.write(f"{line}\n".encode())
+                self._conn.flush()
+            except Exception as exc:
+                # Upgraded from DEBUG → WARNING. A silent write-only failure
+                # is the classic "head tracker keeps logging sends but the
+                # servo never moves" symptom. With this visible, a dead
+                # integrated tracker surfaces as a run of warnings instead
+                # of an invisible regression against the standalone.
+                _log.warning("send_write_only '%s' failed: %s", line, exc)
+
     def send_raw(self, cmd: str, timeout: Optional[float] = None) -> List[str]:
         """Send one command and return the full reply as a list of lines.
 

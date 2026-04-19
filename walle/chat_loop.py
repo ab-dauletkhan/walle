@@ -148,7 +148,14 @@ class LLMStreamer:
         Streams the response in real time, prints content as it arrives,
         and logs TTFT + tokens/sec in debug mode.
         """
-        debug = _log.isEnabledFor(logging.DEBUG)
+        # Voice mode runs setup_logging("test"), which keeps the root logger
+        # at DEBUG (so the file handler gets everything) but sets the console
+        # handler to INFO. _log.isEnabledFor(DEBUG) therefore returns True
+        # even in voice mode, and the raw `print(delta.content)` below would
+        # flood the operator's terminal with the same tokens the SpeechRouter
+        # is about to print word-by-word — the "duplicated output" that TTS
+        # never speaks. Gate on the explicit run mode instead.
+        debug = conf.RUN_MODE == "debug"
 
         if _DUMP_PROMPT:
             _dump_messages_debug(messages, tools)
@@ -292,6 +299,66 @@ class LLMStreamer:
             [],
         )
 
+    def stream_raw(self, messages, max_retries: int = 2):
+        """Stream plain text from the LLM — no tools, no tool_calls parsing.
+
+        Yields content deltas as they arrive. Callers wrap this in the
+        ``TaggedStreamParser`` to extract SAY: / DO: lines. Used by the
+        new ChatLoop, which replaced the MemGPT tool loop with the
+        prompt-only SAY/DO contract.
+
+        On OOM the Ollama model is unloaded once and the request is
+        retried. On repeated failure the generator yields a single
+        fallback sentence so the TTS still plays something rather than
+        silent-failing.
+        """
+        if _DUMP_PROMPT:
+            _dump_messages_debug(messages, None)
+
+        for attempt in range(max_retries):
+            try:
+                extra_body = (
+                    {"options": {"num_ctx": self._num_ctx}}
+                    if self._num_ctx
+                    else None
+                )
+                stream = self._client.chat.completions.create(
+                    model=self._model,
+                    messages=messages,
+                    stream=True,
+                    extra_body=extra_body,
+                )
+                for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        yield delta.content
+                return
+            except Exception as e:
+                if _is_oom_error(e):
+                    _log.warning(
+                        "LLM OOM (attempt %d/%d): %s — unloading model",
+                        attempt + 1,
+                        max_retries,
+                        e,
+                    )
+                    _force_unload_ollama_model(self._model)
+                    time.sleep(2)
+                else:
+                    _log.warning(
+                        "LLM error (attempt %d/%d): %s",
+                        attempt + 1,
+                        max_retries,
+                        e,
+                    )
+                    time.sleep(1)
+
+        _log.error("LLM failed after %d retries", max_retries)
+        # Single fallback sentence as a SAY: so the TTS pipeline still
+        # gets a user-audible message out of a broken turn.
+        yield "SAY: I'm having trouble reaching my brain right now. Check that Ollama is running.\n"
+
     def summarize(self, text: str) -> str:
         """Generate a concise summary for memory compression."""
         try:
@@ -311,39 +378,56 @@ class LLMStreamer:
 
 
 # ---------------------------------------------------------------------------
-# ChatLoop — the MemGPT-style tool-calling loop (Mediator)
+# ChatLoop — prompt-only streaming with SAY: / DO: line extraction
 # ---------------------------------------------------------------------------
+#
+# The old implementation ran a MemGPT-style tool-calling loop with the
+# OpenAI-compatible `tools=[...]` contract. On qwen2.5:3b that path was
+# fragile (misrouted tools, slow multi-turn reflection) and defeated
+# sentence-level TTS pipelining because it waited for the whole turn
+# before yielding content.
+#
+# The new contract: the LLM is prompted (see walle.tools.registry
+# SystemPromptBuilder) to emit only SAY: and DO: lines. We stream the
+# raw text through walle.voice.llm_parser.TaggedStreamParser which
+# fires on_say / on_do callbacks the instant a newline arrives. The
+# voice assistant wires on_say to its TTS queue and on_do to the
+# walle.voice.do_dispatcher.DoDispatcher.
+#
+# Memory, compression, and context updates stay. What's gone: the tool
+# suite, tool-call validation, tool-result message insertion, heartbeat
+# loop. All of that was scaffolding for tools we no longer use.
 class ChatLoop:
-    """Mediates between LLM streaming, tool execution, memory, and communication.
+    """One-pass streaming chat turn with SAY: / DO: routing callbacks.
 
-    All dependencies are injected — ChatLoop creates nothing.
+    All dependencies are injected — ChatLoop creates nothing. Callbacks
+    can be provided per-call (voice vs API vs REPL all want different
+    sinks) or wired once at construction.
     """
 
     def __init__(
         self,
         llm_streamer: LLMStreamer,
-        tool_suite,
         session: ChatSession,
         prompt_builder,
         memory_provider,
-        comm_exec,
         recall_mem,
         archival_mem,
-        heartbeat,
         context_manager,
+        on_say=None,
+        on_do=None,
         on_turn_start=None,
         on_turn_end=None,
     ):
         self._llm = llm_streamer
-        self._tool_suite = tool_suite
         self._session = session
         self._prompt_builder = prompt_builder
         self._memory_provider = memory_provider
-        self._comm_exec = comm_exec
         self._recall_mem = recall_mem
         self._archival_mem = archival_mem
-        self._heartbeat = heartbeat
         self._context_manager = context_manager
+        self._default_on_say = on_say
+        self._default_on_do = on_do
         self._on_turn_start = on_turn_start
         self._on_turn_end = on_turn_end
         self._compression_lock = threading.Lock()
@@ -352,14 +436,37 @@ class ChatLoop:
     def session(self) -> ChatSession:
         return self._session
 
-    def run(self, user_input: str) -> Optional[str]:
-        """Run one full MemGPT-style chat turn. Returns the message for the user."""
+    def set_callbacks(self, on_say=None, on_do=None) -> None:
+        """Set the default SAY/DO sinks used when ``run()`` is called without
+        per-turn callbacks. VoiceAssistant calls this once after construction
+        so the orchestrator's ``stream_chat`` path (used by the API server)
+        gets the same sinks as the voice path."""
+        if on_say is not None:
+            self._default_on_say = on_say
+        if on_do is not None:
+            self._default_on_do = on_do
+
+    def run(
+        self,
+        user_input: str,
+        on_say=None,
+        on_do=None,
+    ) -> Optional[str]:
+        """Run one streaming chat turn.
+
+        Yields no value directly; SAY/DO output goes to callbacks.
+        Returns the accumulated SAY text so callers with no callback of
+        their own (e.g. the text REPL) still get something to print.
+        """
         if self._on_turn_start:
             self._on_turn_start()
+        try:
+            return self._run_locked(user_input, on_say, on_do)
+        finally:
+            if self._on_turn_end:
+                self._on_turn_end()
 
-        # Drop any stale message from a prior interrupted turn
-        self._comm_exec.get_last_message()
-
+    def _run_locked(self, user_input: str, on_say, on_do) -> Optional[str]:
         # 1. Context update
         interaction_count = self._recall_mem.get_count()
         self._context_manager.update_interaction(
@@ -375,108 +482,44 @@ class ChatLoop:
                 )
             )
 
-        # 2. Retrieve relevant memories
+        # 2. Retrieve relevant memories (embeddings + FAISS recall)
         memory_context = self._memory_provider.build_context(user_input)
 
-        # 3. Insert user message (deferred embedding)
+        # 3. Insert user message; embedding deferred until background pass
         self._recall_mem.insert("user", user_input, defer_embedding=True)
         self._session.add("user", user_input)
-        self._heartbeat.reset()
 
         # 4. Compress old memories if needed (non-blocking)
         self._start_compression_if_needed()
 
-        # 5. Tool execution loop
-        result = self._tool_loop(memory_context)
+        # 5. Stream LLM response through the SAY/DO parser
+        say_sink = on_say or self._default_on_say or (lambda s: None)
+        do_sink = on_do or self._default_on_do or (lambda s: None)
+        say_chunks: list[str] = []
 
-        if self._on_turn_end:
-            self._on_turn_end()
+        def _capture_and_forward_say(text: str) -> None:
+            say_chunks.append(text)
+            say_sink(text)
 
-        return result
+        from walle.voice.llm_parser import TaggedStreamParser
+        parser = TaggedStreamParser(
+            on_say=_capture_and_forward_say, on_do=do_sink
+        )
 
-    _MAX_ITERATIONS = 20
+        system_prompt = self._prompt_builder.build(memory_context)
+        messages = self._session.get_messages(system_prompt)
+        for chunk in self._llm.stream_raw(messages):
+            parser.feed(chunk)
+        parser.flush()
 
-    def _tool_loop(self, memory_context: str) -> Optional[str]:
-        """Inner loop: call LLM → execute tools → repeat until send_message."""
-        iteration = 0
-        user_received_message = False
-
-        while iteration < self._MAX_ITERATIONS:
-            iteration += 1
-            tools = self._tool_suite.build_schemas()
-            system_prompt = self._prompt_builder.build(memory_context)
-
-            content, tool_calls = self._llm.stream(
-                self._session.get_messages(system_prompt), tools
-            )
-
-            if not tool_calls:
-                if content:
-                    self._session.add("assistant", content)
-                    if not user_received_message:
-                        # Small local models (qwen2.5:3b) often skip the
-                        # send_message tool and just emit plain text. Treat
-                        # that text as the reply instead of dropping it.
-                        self._comm_exec._send_message({"message": content})
-                        self._recall_mem.insert("assistant", content)
-                        user_received_message = True
-                break
-
-            # Validate all tool call arguments before committing to session
-            parsed_calls = []
-            valid = True
-            for tc in tool_calls:
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                    parsed_calls.append((tc, args))
-                except json.JSONDecodeError as e:
-                    _log.warning("Malformed tool call '%s': %s", tc.function.name, e)
-                    valid = False
-                    break
-
-            if not valid:
-                # Don't poison session history — discard and retry
-                continue
-
-            self._session.add("assistant", content or "", tool_calls)
-            hb_req = False
-
-            for tc, args in parsed_calls:
-                execution = self._tool_suite.execute_tool(
-                    name=tc.function.name,
-                    args=args,
-                    user_message_already_sent=user_received_message,
-                )
-
-                if execution.user_message and not user_received_message:
-                    _log.debug("send_message: %s", execution.user_message[:80])
-                    self._recall_mem.insert("assistant", execution.user_message)
-                    user_received_message = True
-
-                # Update robot context for movement tools
-                if tc.function.name in _MOTOR_TOOLS:
-                    self._context_manager.update_robot(
-                        command=tc.function.name,
-                        result=execution.tool_result,
-                        motors_active="continuous" in execution.tool_result,
-                    )
-
-                hb_req = hb_req or execution.heartbeat_requested
-                self._session.add_tool_result(
-                    tc.id, tc.function.name, execution.tool_result
-                )
-
-            if user_received_message:
-                break
-
-            if hb_req and self._heartbeat.can_heartbeat():
-                self._heartbeat.request_heartbeat()
-                _log.debug("Heartbeat — continuing...")
-                continue
-
-            _log.debug("Continuing for response...")
-
-        return self._comm_exec.get_last_message()
+        full_say = " ".join(s for s in say_chunks if s).strip()
+        if full_say:
+            # Session + recall memory both persist the spoken response so
+            # the next turn's prompt sees it. DO: lines aren't stored in
+            # history — they're actions, not dialogue.
+            self._session.add("assistant", full_say)
+            self._recall_mem.insert("assistant", full_say)
+        return full_say or None
 
     # -- Memory compression (background) --
 
