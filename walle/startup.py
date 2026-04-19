@@ -80,7 +80,9 @@ def build_app(args) -> tuple:
 
     # -- LLM client --
     client = OpenAI(
-        base_url=f"{conf.OLLAMA_BASE_URL}/v1", api_key="ollama", timeout=120.0
+        base_url=f"{conf.OLLAMA_BASE_URL}/v1",
+        api_key=os.environ.get("OLLAMA_API_KEY", "ollama"),
+        timeout=120.0,
     )
     llm_streamer = LLMStreamer(client, conf.OLLAMA_MODEL, num_ctx=conf.OLLAMA_NUM_CTX)
 
@@ -429,7 +431,8 @@ def parse_args(argv=None):
 
 def apply_runtime_overrides(args):
     if args.jetson:
-        conf.OLLAMA_MODEL = "qwen2.5:3b"
+        if not os.environ.get("WALLE_OLLAMA_MODEL"):
+            conf.OLLAMA_MODEL = "qwen2.5:3b"
         conf.EMBEDDING_DEVICE = "cpu"
         conf.EMBEDDING_BATCH_SIZE = 4
         conf.USE_FAISS = True

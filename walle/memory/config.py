@@ -124,6 +124,10 @@ def validate_ollama(config: "Config") -> tuple[bool, Optional[subprocess.Popen]]
     log = logging.getLogger("walle.config")
     process = None
 
+    if "ollama.com" in config.OLLAMA_BASE_URL:
+        log.info("Ollama Cloud mode (%s) — skipping local validation", config.OLLAMA_BASE_URL)
+        return True, None
+
     def _is_reachable() -> bool:
         try:
             return requests.get(config.OLLAMA_BASE_URL, timeout=3).ok

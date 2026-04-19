@@ -7,9 +7,15 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+# Load .env for local secrets (OLLAMA_API_KEY, OLLAMA_URL, OLLAMA_MODEL)
+[ -f .env ] && set -a && source .env && set +a
+
 # ---------- Configuration ----------
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-qwen2.5:3b}"
+# Bridge to walle Python config (reads WALLE_* prefixed env vars)
+export WALLE_OLLAMA_BASE_URL="$OLLAMA_URL"
+export WALLE_OLLAMA_MODEL="$OLLAMA_MODEL"
 # Vision model retired in the HWC v1 build — capture_image tool is
 # gone (moved to v2 once the tracker subprocess gains face + frame
 # events over the HWC socket). Leaving moondream on disk wastes ~2 GB
@@ -169,6 +175,9 @@ trap cleanup EXIT INT TERM
 
 # ---------- 1. Ollama ----------
 echo "=== Checking Ollama ==="
+if [[ "$OLLAMA_URL" == *"ollama.com"* ]]; then
+    echo "  Using Ollama Cloud ($OLLAMA_URL) — skipping local daemon + preload"
+else
 # Always kill any running ollama so it is restarted with our Jetson env vars
 # (OLLAMA_KEEP_ALIVE, OLLAMA_CONTEXT_LENGTH). An ollama started from a plain
 # shell won't have them, which causes UMA OOM when walle connects later.
@@ -236,6 +245,7 @@ if curl -sf "$OLLAMA_URL/api/ps" 2>/dev/null | grep -q "$OLLAMA_MODEL"; then
     echo "  Verified: $OLLAMA_MODEL is resident."
 else
     echo "  WARNING: $OLLAMA_MODEL not found in /api/ps after preload."
+fi
 fi
 
 # ---------- 2. TTS ----------
