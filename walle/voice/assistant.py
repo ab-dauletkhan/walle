@@ -1016,14 +1016,17 @@ class SpeechRouter(TranscriptEventListener):
         self._last_wake_play_time = now
         self._pause_mic()
 
+        chosen_wav = random.choice(wavs)
+        print(f"  🔊 wake sound: {os.path.basename(chosen_wav)}", flush=True)
+
         def _play():
             try:
                 with self._wake_play_lock:
-                    sr, audio = _wavfile().read(random.choice(wavs))
+                    sr, audio = _wavfile().read(chosen_wav)
                     _play_audio_stable(audio, sr)
                     time.sleep(self._ECHO_COOLDOWN)
             except Exception as e:
-                print(f"  Wake sound error: {e}", file=sys.stderr)
+                print(f"  Wake sound error: {e}", file=sys.stderr, flush=True)
             finally:
                 self._resume_mic()
                 self._speaking = False
@@ -1360,10 +1363,14 @@ class SpeechRouter(TranscriptEventListener):
             display = f"  👂 {text}"
         else:
             display = f"  🎙  {text}"
-        print(f"\r{display}", end="", flush=True)
-        if len(display) < self._last_text_length:
-            print(" " * (self._last_text_length - len(display)), end="", flush=True)
-        self._last_text_length = len(display)
+        if sys.stdout.isatty():
+            print(f"\r{display}", end="", flush=True)
+            if len(display) < self._last_text_length:
+                print(" " * (self._last_text_length - len(display)), end="", flush=True)
+            self._last_text_length = len(display)
+        else:
+            print(display, flush=True)
+            self._last_text_length = 0
 
     def on_line_completed(self, event):
         text = event.line.text.strip()
@@ -1380,7 +1387,10 @@ class SpeechRouter(TranscriptEventListener):
                 self._request_stop()
             return
 
-        print(f"\r  🎙  {text}" + " " * max(0, self._last_text_length - len(text) - 6))
+        if sys.stdout.isatty():
+            print(f"\r  🎙  {text}" + " " * max(0, self._last_text_length - len(text) - 6))
+        else:
+            print(f"  🎙  {text}", flush=True)
         self._last_text_length = 0
 
         # Skip lines already handled by IntentRecognizer. Try exact
@@ -1401,7 +1411,7 @@ class SpeechRouter(TranscriptEventListener):
             if tail is None:
                 return  # Not addressed to us — ignore background speech
             initial_command = tail.strip()
-            print("  👂 Yes, how can I help you?")
+            print("  👂 Yes, how can I help you?", flush=True)
             self._state = self.LISTENING
             self._command_text = initial_command
             self._last_stable_text = self._strip_punctuation(initial_command).lower().strip()
